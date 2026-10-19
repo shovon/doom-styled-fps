@@ -1,0 +1,556 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Runner</title>
+<style>
+body{margin:0;overflow:hidden}
+#ui{position:fixed;top:8px;left:8px;right:8px;color:#fff;font:13px sans-serif;text-shadow:0 1px 2px #000;pointer-events:none}
+#stats{margin-top:4px;font-family:ui-monospace,monospace}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://unpkg.com/three@0.170.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.170.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="ui"><div id="hud">WASD move · Shift walk · drag to orbit · C first person · B bounds · F freeze sprite · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · R distance LOD · H sprite shadows · = / - add/remove 10 demons</div>
+<div id="stats"></div></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
+
+// ---------------------------------------------------------------------------
+// SpriteImpostor: renders a model off-screen into a small texture and shows it
+// on a camera-facing card. Keep the impostor itself at the origin and move/rotate
+// `.model` in world coordinates.
+// ---------------------------------------------------------------------------
+const cardGeo = new THREE.PlaneGeometry(1, 1);
+const boundsLineMat = new THREE.LineBasicMaterial({ color: 0xff00ff });
+const boundsFillMat = new THREE.MeshBasicMaterial({ color: 0xff00ff, transparent: true, opacity: 0.2, depthWrite: false, side: THREE.DoubleSide });
+const edgesGeo = new THREE.EdgesGeometry(cardGeo);
+const blobMat = (() => { // soft round contact shadow, one texture shared by everyone
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d'), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, 'rgba(0,0,0,0.55)');
+  gr.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = gr;
+  g.fillRect(0, 0, 64, 64);
+  return new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false });
+})();
+const blobGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+const silhouetteMat = new THREE.MeshBasicMaterial({ color: 0x000000 }); // shadow sprites only need the outline
+const _cs = new THREE.Vector3(), _rc = new THREE.Vector3(), _toCam = new THREE.Vector3(), _facing = new THREE.Vector3(), _center = new THREE.Vector3();
+const _dir = new THREE.Vector3(), _look = new THREE.Vector3();
+const _frustum = new THREE.Frustum(), _vp = new THREE.Matrix4(), _sphere = new THREE.Sphere();
+
+class SpriteImpostor extends THREE.Group {
+  // opts is shared by reference, so flipping a field changes every impostor at once:
+  // { stage, resolution, snaps, pitchSnaps, distance, animFps, stepped, snap, lockDist, real, bounds,
+  //   spriteShadows, sun, flashLights, lod, lodNear, lodFalloff }  (sun: the shadow-casting DirectionalLight;
+  //   flashLights: point lights living in the stage, at world positions, that sprites should react to)
+  constructor(model, mixer, opts) {
+    super();
+    this.model = model; this.mixer = mixer; this.opts = opts;
+    this.animAcc = (1 + Math.random()) / opts.animFps; // pose on the first frame (no T-pose), then spread steps across frames
+    this.frozenAt = null;
+    this.hidden = false;        // e.g. your own character in first person: no card, but shadow stays
+    this.lastKey = undefined;   // view + pose of the last sprite render; undefined = must re-render
+    this.lastLights = 0;        // which flash lights were reaching it at the last render
+    this.shadowKey = undefined; // same, for the shadow sprite
+
+    // Render box from the bind pose (bone matrices start as zeros, so update them first)
+    model.updateMatrixWorld(true);
+    model.traverse((o) => o.isSkinnedMesh && o.skeleton.update());
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    this.r = (Math.max(size.x, size.y, size.z) / 2) * 1.2; // +20% so swinging limbs stay inside
+    this.centerY = box.getCenter(new THREE.Vector3()).y - model.position.y;
+
+    // Nearest filtering = chunky pixels; no MSAA so sprite edges stay hard
+    this.rt = new THREE.WebGLRenderTarget(opts.resolution, opts.resolution, {
+      type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
+    });
+    this.cam = new THREE.PerspectiveCamera(); // projection set by hand
+
+    this.card = new THREE.Mesh(cardGeo, new THREE.MeshBasicMaterial({
+      map: this.rt.texture, transparent: true, premultipliedAlpha: true, depthWrite: false, side: THREE.DoubleSide,
+    }));
+    this.bounds = new THREE.Group();
+    const fill = new THREE.Mesh(cardGeo, boundsFillMat);
+    fill.renderOrder = -1; // under the sprite texture
+    this.bounds.add(new THREE.LineSegments(edgesGeo, boundsLineMat), fill);
+    this.card.add(this.bounds);
+    this.blob = new THREE.Mesh(blobGeo, blobMat);
+    this.blob.renderOrder = -2;
+    this.blob.scale.setScalar(this.r);
+
+    // Shadow sprite: the silhouette as the sun sees it (orthographic, like a directional light), on an
+    // invisible card facing the sun. Only the shadow pass sees it; alphaTest cuts out the silhouette.
+    this.shadowRt = new THREE.WebGLRenderTarget(opts.resolution / 2, opts.resolution / 2, {
+      magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
+    });
+    this.shadowCam = new THREE.OrthographicCamera(-this.r, this.r, this.r, -this.r, 0.1, 20);
+    this.shadowCard = new THREE.Mesh(cardGeo, new THREE.MeshBasicMaterial({
+      map: this.shadowRt.texture, alphaTest: 0.5, colorWrite: false, depthWrite: false, side: THREE.DoubleSide,
+    }));
+    this.shadowCard.castShadow = true;
+    this.shadowCard.scale.setScalar(2 * this.r);
+    this.add(this.card, this.blob, this.shadowCard);
+  }
+
+  freeze() {
+    this.frozenAt = this.frozenAt ? null : this.model.position.clone();
+    this.lastKey = this.shadowKey = undefined;
+  }
+
+  setResolution(n) {
+    this.rt.setSize(n, n);
+    this.shadowRt.setSize(n / 2, n / 2);
+    this.lastKey = this.shadowKey = undefined;
+  }
+
+  // Distance LOD, logarithmic: full resolution up to lodNear, then each doubling of distance takes away
+  // lodFalloff × base (snapped to 16 px steps, min 16 px). Gentler than halving per doubling.
+  // ponytail: no hysteresis; a model pacing right on a step boundary reallocates its texture each crossing.
+  applyLod(camera, center) {
+    const o = this.opts;
+    let n = o.resolution;
+    if (o.lod) {
+      const doublings = Math.max(0, Math.log2(camera.position.distanceTo(center) / o.lodNear));
+      n = Math.max(Math.round((o.resolution * (1 - o.lodFalloff * doublings)) / 16) * 16, 16);
+    }
+    if (n !== this.rt.width) this.setResolution(n);
+  }
+
+  // Renders the model into rt from cam, in the shared lights-only stage
+  renderModel(renderer, rt, cam, overrideMaterial = null) {
+    const stage = this.opts.stage;
+    stage.overrideMaterial = overrideMaterial;
+    stage.add(this.model);
+    renderer.setRenderTarget(rt);
+    renderer.render(stage, cam);
+    renderer.setRenderTarget(null);
+    stage.remove(this.model);
+    stage.overrideMaterial = null;
+  }
+
+  // Returns how many off-screen renders it did this frame (for stats).
+  update(renderer, camera, dt) {
+    const o = this.opts, m = this.model;
+
+    // Stepped animation: hold each pose, then jump by the time banked since the last step
+    this.animAcc += dt;
+    const posed = !o.stepped || this.animAcc >= 1 / o.animFps;
+    if (posed) { this.mixer.update(this.animAcc); this.animAcc = 0; }
+
+    const at = this.frozenAt ?? m.position;
+    this.blob.position.set(at.x, 0.02, at.z);
+    this.bounds.visible = o.bounds;
+
+    if (o.real) { // plain 3D model in the main scene, for comparison (blob shadow)
+      if (m.parent !== this) this.add(m);
+      m.visible = !this.hidden;
+      this.card.visible = this.shadowCard.visible = false;
+      this.blob.visible = true;
+      this.lastKey = this.shadowKey = undefined;
+      return 0;
+    }
+    if (m.parent === this) this.remove(m);
+    m.visible = true; // needed for its own off-screen renders
+    this.card.visible = !this.hidden;
+    this.blob.visible = !o.spriteShadows;
+    this.shadowCard.visible = o.spriteShadows;
+
+    const center = _center.copy(at);
+    center.y += this.centerY;
+    this.applyLod(camera, center);
+    let renders = o.spriteShadows ? this.updateShadow(renderer, center, posed) : 0;
+    if (this.hidden) { this.lastKey = undefined; return renders; } // no card, no sprite render
+
+    // Card: parallel to the image plane, pulled toward the eye and shrunk by the same ratio, so it covers
+    // the same pixels but sits in front of the feet (the floor's depth test stops clipping them).
+    // ponytail: one depth for the whole card; write per-pixel depth from the RT if occlusion must be exact.
+    _cs.copy(center).applyMatrix4(camera.matrixWorldInverse);
+    // ...but never closer than 15 cm, or a model right in your face would put its card behind the near plane
+    // (behind the camera, d <= 0: s = 1, card stays put behind you instead of mirroring in front of you)
+    const d = -_cs.z;
+    const s = Math.max(d - this.r * 0.55, Math.min(0.15, d)) / d;
+    this.card.position.copy(center).sub(camera.position).multiplyScalar(s).add(camera.position);
+    this.card.scale.setScalar(2 * this.r * s);
+    this.card.quaternion.copy(camera.quaternion);
+    if (this.frozenAt) return renders; // frozen: same picture, still staring at you
+
+    // Off-screen: skip the texture render, the same saving real meshes get from frustum culling
+    _frustum.setFromProjectionMatrix(_vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
+    if (!_frustum.intersectsSphere(_sphere.set(center, this.r))) { this.lastKey = undefined; return renders; }
+
+    let key = null; // null = view changes continuously, always re-render
+    const cam = this.cam;
+    if (o.snap) {
+      // Doom-style: snap the RT camera to snaps × pitchSnaps views, measured from the model's facing
+      _toCam.subVectors(camera.position, center);
+      _facing.set(0, 0, 1).applyQuaternion(m.quaternion);
+      const yaw = Math.atan2(_facing.x, _facing.z), step = (2 * Math.PI) / o.snaps;
+      const azIdx = Math.round((Math.atan2(_toCam.x, _toCam.z) - yaw) / step);
+      const elStep = Math.PI / 2 / o.pitchSnaps; // rows from 0° up to (not including) 90°: straight down has no "up"
+      const elIdx = Math.min(Math.max(Math.round(Math.atan2(_toCam.y, Math.hypot(_toCam.x, _toCam.z)) / elStep), 0), o.pitchSnaps - 1);
+      const az = yaw + azIdx * step, el = elIdx * elStep;
+      const dist = o.lockDist ? o.distance : _toCam.length();
+      cam.position.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)).multiplyScalar(dist).add(center);
+      cam.lookAt(center);
+      // Locked distance + snapped view: the picture only changes when the snap or the pose changes.
+      if (o.lockDist) key = ((azIdx % o.snaps) + o.snaps) % o.snaps + o.snaps * elIdx;
+    } else {
+      if (o.lockDist) cam.position.copy(camera.position).sub(center).setLength(o.distance).add(center);
+      else cam.position.copy(camera.position);
+      cam.quaternion.copy(camera.quaternion);
+    }
+    const lights = this.lightMask(center);
+    if (!posed && key !== null && key === this.lastKey && lights === this.lastLights) return renders; // cached
+    this.lastKey = key;
+    this.lastLights = lights;
+
+    // Frame the ±r box from the RT camera's own distance: the whole model always fills the texture
+    cam.updateMatrixWorld();
+    _rc.copy(center).applyMatrix4(cam.matrixWorldInverse);
+    const near = 0.1, k = near / -_rc.z, r = this.r;
+    cam.projectionMatrix.makePerspective((_rc.x - r) * k, (_rc.x + r) * k, (_rc.y + r) * k, (_rc.y - r) * k, near, 200);
+    cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+    this.renderModel(renderer, this.rt, cam);
+    return renders + 1;
+  }
+
+  // Bitmask of the stage's flash lights that are on and close enough to light this model.
+  // A change means the cached sprite is lit wrong, so it re-renders when a flash starts and when it ends.
+  lightMask(center) {
+    const ls = this.opts.flashLights ?? [];
+    let mask = 0;
+    for (let i = 0; i < ls.length; i++) {
+      if (ls[i].intensity > 0 && ls[i].position.distanceTo(center) < ls[i].distance + this.r) mask |= 1 << i;
+    }
+    return mask;
+  }
+
+  // Shadow sprite: snapped to `snaps` angles around the model like the main sprite, but from the sun's side.
+  // The sun never moves, so it only re-renders when the snap or the pose changes.
+  updateShadow(renderer, center, posed) {
+    const o = this.opts;
+    _dir.copy(o.sun.position).sub(o.sun.target.position).normalize(); // toward the sun
+    _facing.set(0, 0, 1).applyQuaternion(this.model.quaternion);
+    const yaw = Math.atan2(_facing.x, _facing.z), step = (2 * Math.PI) / o.snaps;
+    const idx = Math.round((Math.atan2(_dir.x, _dir.z) - yaw) / step);
+    const az = yaw + idx * step, horiz = Math.hypot(_dir.x, _dir.z);
+    _dir.set(Math.sin(az) * horiz, _dir.y, Math.cos(az) * horiz); // snapped sun direction, same elevation
+
+    // Card faces the (snapped) sun; Object3D.lookAt points +Z at the target, matching the camera's view axis
+    this.shadowCard.position.copy(center);
+    this.shadowCard.lookAt(_look.copy(center).add(_dir));
+    if (this.frozenAt) return 0;
+
+    // Outside the sun's shadow box: nothing would show, skip
+    const sc = o.sun.shadow.camera;
+    _frustum.setFromProjectionMatrix(_vp.multiplyMatrices(sc.projectionMatrix, sc.matrixWorldInverse));
+    if (!_frustum.intersectsSphere(_sphere.set(center, this.r))) { this.shadowKey = undefined; return 0; }
+
+    const key = ((idx % o.snaps) + o.snaps) % o.snaps;
+    if (!posed && key === this.shadowKey) return 0; // cached
+    this.shadowKey = key;
+    this.shadowCam.position.copy(center).addScaledVector(_dir, 10);
+    this.shadowCam.lookAt(center);
+    this.shadowCam.updateMatrixWorld();
+    this.renderModel(renderer, this.shadowRt, this.shadowCam, silhouetteMat);
+    return 1;
+  }
+
+  dispose() {
+    this.removeFromParent();
+    this.rt.dispose();
+    this.shadowRt.dispose();
+    this.card.material.dispose();
+    this.shadowCard.material.dispose();
+    this.mixer.stopAllAction();
+    this.mixer.uncacheRoot(this.model);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Demo scene
+// ---------------------------------------------------------------------------
+const WALK = 1.8, RUN = 5;   // player m/s — tune to stop foot sliding
+const FACING = Math.PI;      // Soldier.glb faces -Z; use 0 for +Z-facing models
+const DEMON_WALK = 1.4;      // NPC demon m/s — tune to stop foot sliding
+const DEMON_FACING = 0;      // demon.glb facing offset (0 = faces +Z); set Math.PI if they walk backwards
+const RT_SIZES = [128, 256, 512, 64]; // sprite resolutions cycled with P (first is the default)
+let rtSizeIdx = 0;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.setClearColor(0x000000, 0); // transparent sprite backgrounds
+renderer.info.autoReset = false;     // count every render call in a frame, not just the last one
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xa8bccf);
+scene.fog = new THREE.Fog(0xa8bccf, 25, 90);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment()).texture;
+scene.environmentIntensity = 0.5;
+
+const sunOffset = new THREE.Vector3(8, 15, 6);
+const sun = new THREE.DirectionalLight(0xfff2e0, 2.5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -15, right: 15, top: 15, bottom: -15 });
+scene.add(sun, sun.target);
+
+// Stage = lighting for sprite renders: same sun direction and environment, no shadows, fog or background
+const stage = new THREE.Scene();
+stage.environment = scene.environment;
+stage.environmentIntensity = scene.environmentIntensity;
+const stageSun = new THREE.DirectionalLight(sun.color, sun.intensity);
+stageSun.position.copy(sunOffset); // direction only; target stays at the origin
+stage.add(stageSun);
+
+// Muzzle flashes: a fixed pool of point lights, each mirrored into the sprite stage at the same world
+// position. The stage works in world coordinates, so a copy at the same spot lights sprites correctly.
+// Fixed count = no shader recompiles; idle lights just sit at intensity 0.
+const FLASH_COLOR = 0xffa040, FLASH_INTENSITY = 30, FLASH_RANGE = 8, FLASH_TIME = 0.1;
+const flashes = Array.from({ length: 4 }, () => {
+  const world = new THREE.PointLight(FLASH_COLOR, 0, FLASH_RANGE, 2);
+  const sprite = world.clone();
+  scene.add(world);
+  stage.add(sprite);
+  return { world, sprite, ttl: 0 };
+});
+// ponytail: pool of 4; shots beyond 4 simultaneous flashes don't light anything. Raise it if that shows.
+function muzzleFlash(muzzle) {
+  const f = flashes.find((f) => f.ttl <= 0);
+  if (!f) return;
+  muzzle.getWorldPosition(f.world.position);
+  f.sprite.position.copy(f.world.position);
+  f.world.intensity = f.sprite.intensity = FLASH_INTENSITY;
+  f.ttl = FLASH_TIME;
+}
+
+// UE-ish prototype floor
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardMaterial({ color: 0x8a8a8a, roughness: 0.9 }));
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+const grid = new THREE.GridHelper(400, 400, 0x5a5a5a, 0x6e6e6e);
+grid.position.y = 0.01;
+scene.add(floor, grid);
+
+const boxMat = new THREE.MeshStandardMaterial({ color: 0xd9d9d9, roughness: 0.6 });
+for (let i = 0; i < 40; i++) {
+  const s = 1 + Math.random() * 3;
+  const b = new THREE.Mesh(new THREE.BoxGeometry(s, s, s), boxMat);
+  b.position.set((Math.random() - 0.5) * 80, s / 2, (Math.random() - 0.5) * 80);
+  b.castShadow = b.receiveShadow = true;
+  scene.add(b);
+}
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(0, 2.5, 5);
+const controls = new OrbitControls(camera, renderer.domElement);
+Object.assign(controls, { enablePan: false, enableDamping: true, minDistance: 2, maxDistance: 12, maxPolarAngle: Math.PI / 2 - 0.05 });
+
+// First person (C): mouse-look with pointer lock, eye at the player's head, own sprite hidden
+const EYE_HEIGHT = 1.6;
+const look = new PointerLockControls(camera, renderer.domElement);
+let firstPerson = false;
+renderer.domElement.addEventListener('click', () => { if (firstPerson && !look.isLocked) look.lock(); }); // re-grab after Esc
+function setFirstPerson(on) {
+  firstPerson = on;
+  player.hidden = on;
+  controls.enabled = !on;
+  camera.getWorldDirection(fwd).setY(0).normalize();
+  if (on) {
+    camera.rotation.set(0, Math.atan2(-fwd.x, -fwd.z), 0, 'YXZ'); // level gaze, same heading as the orbit camera
+    look.lock();
+  } else {
+    look.unlock();
+    camera.position.copy(player.model.position).addScaledVector(fwd, -5).y += 2.5; // back behind the player
+  }
+}
+
+const opts = {
+  stage, resolution: RT_SIZES[0], snaps: 16, pitchSnaps: 8, distance: 5, animFps: 12,
+  stepped: true, snap: true, lockDist: true, real: false, bounds: false, spriteShadows: false, lod: true, lodNear: 8, lodFalloff: 0.25, sun, flashLights: flashes.map((f) => f.sprite),
+};
+
+let demonGltf, player, playerActions, current;
+const npcs = []; // { imp, target }
+
+function makeCharacter(model) {
+  model.traverse((o) => { if (o.isMesh) o.castShadow = false; }); // blob shadows in both modes, so V compares fairly
+  const mixer = new THREE.AnimationMixer(model);
+  const imp = new SpriteImpostor(model, mixer, opts);
+  scene.add(imp);
+  return imp;
+}
+
+function addNpcs(n) {
+  for (let i = 0; i < n; i++) {
+    const model = cloneSkinned(demonGltf.scene);
+    model.position.set((Math.random() - 0.5) * 60, 0, (Math.random() - 0.5) * 60);
+    const imp = makeCharacter(model);
+    const clip = (name) => imp.mixer.clipAction(THREE.AnimationClip.findByName(demonGltf.animations, name));
+    const walk = clip('Walk'), fire = clip('Fire');
+    walk.play().time = Math.random() * walk.getClip().duration; // out of step with each other
+    const npc = {
+      imp, walk, fire, target: randomTarget(), muzzle: model.getObjectByName('muzzle'),
+      shooter: Math.random() < 0.5, firing: false, timer: nextVolley(),
+    };
+    imp.mixer.addEventListener('loop', (e) => { if (e.action === fire) muzzleFlash(npc.muzzle); }); // each shot
+    npcs.push(npc);
+  }
+}
+function removeNpcs(n) {
+  for (const { imp } of npcs.splice(-n)) imp.dispose();
+}
+const nextVolley = () => 3 + Math.random() * 5; // seconds of walking between volleys
+const randomTarget = () => new THREE.Vector3((Math.random() - 0.5) * 60, 0, (Math.random() - 0.5) * 60);
+
+const loader = new GLTFLoader();
+Promise.all([loader.loadAsync('models/Soldier.glb'), loader.loadAsync('models/demon.glb')]).then(([g, demon]) => {
+  demonGltf = demon;
+  player = makeCharacter(g.scene);
+  playerActions = Object.fromEntries(g.animations.map((c) => [c.name, player.mixer.clipAction(c)]));
+  play('Idle');
+  // Repeatable benchmark setups: ?n=100 spawns 100 demons, ?real starts in real-3D mode
+  const params = new URLSearchParams(location.search);
+  addNpcs(Number(params.get('n')) || 0);
+  opts.real = params.has('real');
+});
+
+function play(name) {
+  if (current === name) return;
+  playerActions[name].reset().fadeIn(0.2).play();
+  playerActions[current]?.fadeOut(0.2);
+  current = name;
+}
+
+const keys = {};
+const hud = document.getElementById('hud'), HUD = hud.textContent;
+addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (!player) return;
+  if (e.code === 'KeyB') opts.bounds = !opts.bounds;
+  if (e.code === 'KeyH') opts.spriteShadows = !opts.spriteShadows;
+  if (e.code === 'KeyF') player.freeze();
+  if (e.code === 'KeyC') setFirstPerson(!firstPerson);
+  if (e.code === 'KeyR') opts.lod = !opts.lod;
+  if (e.code === 'KeyV') opts.real = !opts.real;
+  if (e.code === 'KeyN') opts.stepped = !opts.stepped;
+  if (e.code === 'KeyL') opts.lockDist = !opts.lockDist;
+  if (e.code === 'KeyK') opts.snap = !opts.snap;
+  if (e.code === 'KeyP') {
+    rtSizeIdx = (rtSizeIdx + 1) % RT_SIZES.length;
+    opts.resolution = RT_SIZES[rtSizeIdx];
+    for (const imp of [player, ...npcs.map((n) => n.imp)]) imp.setResolution(opts.resolution);
+  }
+  if (e.code === 'Equal') addNpcs(10);
+  if (e.code === 'Minus') removeNpcs(10);
+  hud.textContent = HUD + `  |  ${firstPerson ? 'FIRST PERSON' : 'orbit'} · bounds ${opts.bounds ? 'ON' : 'off'} · frozen ${player.frozenAt ? 'ON' : 'off'} · showing ${opts.real ? 'REAL 3D' : 'sprites'} · anim ${opts.stepped ? opts.animFps + 'fps' : 'smooth'} · RT dolly ${opts.lockDist ? 'LOCKED' : 'follows'} · angles ${opts.snap ? opts.snaps + '×' + opts.pitchSnaps + ' snaps' : 'free'} · sprite ${opts.resolution}px${opts.lod ? ' (LOD)' : ''} · shadows ${opts.spriteShadows ? 'SPRITE' : 'blob'}`;
+});
+addEventListener('keyup', (e) => (keys[e.code] = false));
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// --- Benchmark stats: averaged over half-second windows ---
+const statsEl = document.getElementById('stats');
+let statFrames = 0, statCpu = 0, statSprites = 0, statStart = performance.now();
+function reportStats(cpuMs, sprites) {
+  statFrames++; statCpu += cpuMs; statSprites += sprites;
+  const now = performance.now();
+  if (now - statStart < 500) return;
+  const { calls, triangles } = renderer.info.render;
+  statsEl.textContent = `${npcs.length} demons + player (${opts.real ? 'REAL 3D' : 'sprites'}) · ` +
+    `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps · CPU ${(statCpu / statFrames).toFixed(2)} ms/frame · ` +
+    `${calls} draw calls · ${(triangles / 1000).toFixed(0)}k tris · ${(statSprites / statFrames).toFixed(1)} sprite renders/frame`;
+  statFrames = statCpu = statSprites = 0; statStart = now;
+}
+
+const UP = new THREE.Vector3(0, 1, 0), fwd = new THREE.Vector3(), right = new THREE.Vector3(), move = new THREE.Vector3(), q = new THREE.Quaternion();
+const clock = new THREE.Clock();
+
+function steer(model, dir, speed, dt, facing) { // dir: normalized XZ direction
+  model.quaternion.slerp(q.setFromAxisAngle(UP, Math.atan2(dir.x, dir.z) + facing), 1 - Math.exp(-12 * dt));
+  model.position.addScaledVector(dir, speed * dt);
+}
+
+renderer.setAnimationLoop(() => {
+  const t0 = performance.now();
+  const dt = Math.min(clock.getDelta(), 0.1);
+  renderer.info.reset();
+  let sprites = 0;
+
+  if (player) {
+    const m = player.model;
+    camera.getWorldDirection(fwd).setY(0).normalize();
+    right.crossVectors(fwd, UP);
+    move.set(0, 0, 0)
+      .addScaledVector(fwd, (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0))
+      .addScaledVector(right, (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0));
+    if (move.lengthSq() > 0) {
+      const walking = keys.ShiftLeft || keys.ShiftRight;
+      const before = m.position.clone();
+      steer(m, move.normalize(), walking ? WALK : RUN, dt, FACING);
+      camera.position.add(before.subVectors(m.position, before)); // camera rides along
+      play(walking ? 'Walk' : 'Run');
+    } else play('Idle');
+
+    for (const npc of npcs) {
+      // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on
+      npc.timer -= dt;
+      if (npc.firing) {
+        if (npc.timer > 0) continue; // stand still while firing
+        npc.firing = false;
+        npc.timer = nextVolley();
+        npc.fire.fadeOut(0.2);
+        npc.walk.reset().fadeIn(0.2).play();
+      } else if (npc.shooter && npc.timer <= 0) {
+        npc.firing = true;
+        npc.timer = (2 + Math.floor(Math.random() * 3)) * npc.fire.getClip().duration; // Fire loops, so N shots
+        npc.walk.fadeOut(0.2);
+        npc.fire.reset().fadeIn(0.2).play();
+        muzzleFlash(npc.muzzle); // first shot; later ones come from the loop event
+        continue;
+      }
+      const p = npc.imp.model.position;
+      if (p.distanceToSquared(npc.target) < 1) npc.target = randomTarget();
+      steer(npc.imp.model, move.subVectors(npc.target, p).setY(0).normalize(), DEMON_WALK, dt, DEMON_FACING);
+    }
+
+    if (firstPerson) {
+      m.quaternion.setFromAxisAngle(UP, Math.atan2(fwd.x, fwd.z) + FACING); // body (and shadow) turns with your view
+      camera.position.copy(m.position).y += EYE_HEIGHT;
+    } else controls.target.copy(m.position).y += 1.2;
+    sun.position.copy(m.position).add(sunOffset); // box shadows follow the player
+    sun.target.position.copy(m.position);
+  }
+  for (const f of flashes) if (f.ttl > 0 && (f.ttl -= dt) <= 0) f.world.intensity = f.sprite.intensity = 0;
+  if (!firstPerson) controls.update();
+  camera.updateMatrixWorld();
+
+  if (player) {
+    sprites += player.update(renderer, camera, dt);
+    for (const npc of npcs) sprites += npc.imp.update(renderer, camera, dt);
+  }
+  renderer.render(scene, camera);
+  reportStats(performance.now() - t0, sprites);
+});
+</script>
+</body>
+</html>
