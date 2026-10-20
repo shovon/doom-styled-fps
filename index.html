@@ -18,12 +18,12 @@ canvas{image-rendering:pixelated}
 </script>
 </head>
 <body>
-<div id="ui"><div id="hud">WASD move · Shift sprint · mouse look · click fire · R reload · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · = / - add/remove 10 demons</div>
+<div id="ui"><div id="hud">WASD move · Shift sprint · Space jump · mouse look · click fire · R reload · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · = / - add/remove 10 demons</div>
 <div id="stats"></div></div>
 <div id="start">Click to play</div>
 <div id="crosshair"></div>
 <div id="ammo"></div>
-<div id="credit">Weapon: "M4 - FPS Weapon Animations Pack (v.1)" by BarcodeGames (sketchfab.com/barcodegames), CC-BY-4.0</div>
+<div id="credit">Weapon: "M4 - FPS Weapon Animations Pack (v.1)" by BarcodeGames (sketchfab.com/barcodegames), CC-BY-4.0<br>Casing: "Bullet Case" by oscarherry3d (sketchfab.com/oscarherry3d), CC-BY-4.0</div>
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -59,6 +59,7 @@ const blobMat = (() => { // soft round contact shadow, one texture shared by eve
 const blobGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
 const silhouetteMat = new THREE.MeshBasicMaterial({ color: 0x000000 }); // shadow sprites only need the outline
 const _cs = new THREE.Vector3(), _rc = new THREE.Vector3(), _toCam = new THREE.Vector3(), _facing = new THREE.Vector3(), _center = new THREE.Vector3();
+const SPRITE_NEAR = 0.1, SPRITE_FAR = 200, SPRITE_DEPTH_BIAS = 0.1; // m: the RT camera's clip range; card depth pulled towards you
 const _dir = new THREE.Vector3(), _look = new THREE.Vector3();
 const _frustum = new THREE.Frustum(), _vp = new THREE.Matrix4(), _sphere = new THREE.Sphere();
 
@@ -89,11 +90,31 @@ class SpriteImpostor extends THREE.Group {
     this.rt = new THREE.WebGLRenderTarget(opts.resolution, opts.resolution, {
       type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
     });
+    this.rt.depthTexture = new THREE.DepthTexture(opts.resolution, opts.resolution);
     this.cam = new THREE.PerspectiveCamera(); // projection set by hand
 
-    this.card = new THREE.Mesh(cardGeo, new THREE.MeshBasicMaterial({
-      map: this.rt.texture, transparent: true, premultipliedAlpha: true, depthWrite: false, side: THREE.DoubleSide,
-    }));
+    // The card writes the model's own depth, per pixel: the RT's depth (how far behind or in front of the model's
+    // centre each pixel is, as the RT camera saw it) added to the centre's depth in your view. So blood and other
+    // things pass in front of and behind its limbs, not a flat cut at the card. Approximate under snapped angles (the
+    // RT camera looks from up to half a snap away), so it's biased SPRITE_DEPTH_BIAS towards you.
+    this.depthU = {
+      uSpriteDepth: { value: this.rt.depthTexture }, uProj: { value: new THREE.Matrix4() },
+      uDepthRef: { value: new THREE.Vector2() }, // the centre's depth: in your view, from the RT camera
+    };
+    const cardMat = new THREE.MeshBasicMaterial({
+      map: this.rt.texture, transparent: true, premultipliedAlpha: true, side: THREE.DoubleSide,
+    });
+    cardMat.onBeforeCompile = (sh) => {
+      Object.assign(sh.uniforms, this.depthU);
+      sh.fragmentShader = 'uniform sampler2D uSpriteDepth;\nuniform mat4 uProj;\nuniform vec2 uDepthRef;\n' +
+        sh.fragmentShader.replace('#include <dithering_fragment>', `#include <dithering_fragment>
+        float sd = texture2D(uSpriteDepth, vMapUv).r;
+        if (sd >= 1.0) discard; // nothing of the model here
+        float zs = ${SPRITE_NEAR.toFixed(2)} * ${SPRITE_FAR.toFixed(1)} / (${SPRITE_FAR.toFixed(1)} - sd * ${(SPRITE_FAR - SPRITE_NEAR).toFixed(2)});
+        vec4 c = uProj * vec4(0.0, 0.0, -(uDepthRef.x + zs - uDepthRef.y - ${SPRITE_DEPTH_BIAS.toFixed(2)}), 1.0);
+        gl_FragDepth = c.z / c.w * 0.5 + 0.5;`);
+    };
+    this.card = new THREE.Mesh(cardGeo, cardMat);
     this.bounds = new THREE.Group();
     const fill = new THREE.Mesh(cardGeo, boundsFillMat);
     fill.renderOrder = -1; // under the sprite texture
@@ -188,12 +209,13 @@ class SpriteImpostor extends THREE.Group {
 
     // Card: parallel to the image plane, pulled toward the eye and shrunk by the same ratio, so it covers
     // the same pixels but sits in front of the feet (the floor's depth test stops clipping them).
-    // ponytail: one depth for the whole card; write per-pixel depth from the RT if occlusion must be exact.
     _cs.copy(center).applyMatrix4(camera.matrixWorldInverse);
     // ...but never closer than 15 cm, or a model right in your face would put its card behind the near plane
     // (behind the camera, d <= 0: s = 1, card stays put behind you instead of mirroring in front of you)
     const d = -_cs.z;
     const s = Math.max(d - this.r * 0.55, Math.min(0.15, d)) / d;
+    this.depthU.uProj.value.copy(camera.projectionMatrix);
+    this.depthU.uDepthRef.value.x = d;
     this.card.position.copy(center).sub(camera.position).multiplyScalar(s).add(camera.position);
     this.card.scale.setScalar(2 * this.r * s);
     this.card.quaternion.copy(camera.quaternion);
@@ -232,8 +254,9 @@ class SpriteImpostor extends THREE.Group {
     // Frame the ±r box from the RT camera's own distance: the whole model always fills the texture
     cam.updateMatrixWorld();
     _rc.copy(center).applyMatrix4(cam.matrixWorldInverse);
-    const near = 0.1, k = near / -_rc.z, r = this.r;
-    cam.projectionMatrix.makePerspective((_rc.x - r) * k, (_rc.x + r) * k, (_rc.y + r) * k, (_rc.y - r) * k, near, 200);
+    const near = SPRITE_NEAR, k = near / -_rc.z, r = this.r;
+    cam.projectionMatrix.makePerspective((_rc.x - r) * k, (_rc.x + r) * k, (_rc.y + r) * k, (_rc.y - r) * k, near, SPRITE_FAR);
+    this.depthU.uDepthRef.value.y = -_rc.z;
     cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
     this.renderModel(renderer, this.rt, cam);
     return renders + 1;
@@ -298,6 +321,8 @@ class SpriteImpostor extends THREE.Group {
 // ---------------------------------------------------------------------------
 const MOVE = 4.5, SPRINT = 7.5;  // player m/s
 const EYE_HEIGHT = 1.6;
+const GRAVITY = 20, JUMP_HEIGHT = 1.0;     // m/s² (snappy, ~2× Earth), m: about 0.6 s in the air
+let jumpY = 0, jumpV = 0;                  // height above standing, vertical speed
 const DEMON_WALK = 1.33;     // NPC demon m/s: Orc Walk stride (1.65 m per 1.13 s cycle) × 0.91 leg scale
 const DEMON_FAST = 1.8;      // fast pace multiplier; speeds up the walk clip by the same factor, so feet still match
 const DEMON_FACING = 0;      // demon.glb facing offset (0 = faces +Z); set Math.PI if they walk backwards
@@ -317,13 +342,17 @@ renderer.info.autoReset = false;     // count every render call in a frame, not 
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-// Scary: no ambient. The room environment (the even fill light, and what metal reflects) is off, so only
-// the light strips and muzzle flashes light anything; the distance fades into black, not sky blue.
-// The sprite stage and the gun copy this intensity. Raise it a hair (say 0.02) for a sliver of fill.
-scene.background = new THREE.Color(0x000000);
-scene.fog = new THREE.Fog(0x000000, 25, 90);
+// Dim ambient: the room environment (the even fill light, and what metal reflects; a three.js AmbientLight
+// would skip metal, which has no diffuse) at a low 0.0075, so the arena reads while the ceiling lights, glowing strips
+// and muzzle flashes carry it. Tried: 0.1 too bright, 0.03 and 0.015 a little flat, 0 hides the demons in the dark. The sprite stage and the gun
+// copy this intensity.
+// Fog: thick and blood red. Fog isn't lit (it blends each pixel toward its colour by distance), so it's a
+// dark red that reads as murk, not a glow. Exponential-squared: ~half gone at 20 m, nearly solid by 40 m.
+const FOG_COLOR = 0x5c1010, FOG_DENSITY = 0.042;
+scene.background = new THREE.Color(FOG_COLOR);
+scene.fog = new THREE.FogExp2(FOG_COLOR, FOG_DENSITY);
 scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment()).texture;
-scene.environmentIntensity = 0;
+scene.environmentIntensity = 0.0075;
 
 const sunOffset = new THREE.Vector3(8, 15, 6);
 // The arena is roofed (ceiling below), so no sunlight gets in: intensity 0, and no shadow pass to pay for.
@@ -367,11 +396,22 @@ function muzzleFlash(position) {
 // Floor: 400 m square of 2 m steel tiles, each picked at random from FLOOR_TILES by weight. PBR sets authored by
 // tools/plate_textures.py; every map is point-sampled up close so highlights land per texel (the chunky
 // "realistic pixel art" look). One InstancedMesh per tile type = one draw call each.
-const FLOOR_TILES = { plain: 0.3, cover: 0.15, vent: 0.25, slits: 0.25, light: 0.05 }, TILE = 2, TILES = 200; // name: share of tiles (blank plates, bare or covered: 45%)
+// name: share of tiles. Blank plates (bare or covered) stay 45%; each type keeps most of its share for the plain
+// version, with a structural variant or two taking the rest
+const FLOOR_TILES = {
+  plain: 0.18, plain_bolted: 0.06, plain_welded: 0.06, cover: 0.1, cover_hatch: 0.05,
+  vent: 0.19, vent_patch: 0.06, slits: 0.19, slits_strapped: 0.06, light: 0.05,
+}, TILE = 2, TILES = 200;
 // Tiles that glow, and how hard: emissiveIntensity > 1 is brighter than white in the HDR buffer, before ACES
 // tone mapping. It glows in the dark and under a flash, but lights nothing else (that needs real lights).
 // 5 puts the lens centre at ~3× white (luminance): over BLOOM_THRESHOLD, still LED-blue rather than blown out.
-const TILE_GLOW = { light: 5 };
+// Wall fixture: its frosted, diffusing cover dims and spreads the tube (measured peak ≈ 0.33 × glow), so it needs ~2×
+// the others' glow to clear the bloom threshold: 10 puts the cover's peak at ~3.3, like the other strips' lens centres.
+const TILE_GLOW = { light: 5, slitlight: 5, sidelight: 5, sidelight_left: 5, walllight: 10 };
+// Fixture lighting. true: every static fixture baked into a light volume, read as one light per pixel (~3 ms/frame at
+// 1600×1000). false: real lights, pooled over the nearest, in the world as well as for the demon sprites and the
+// gun: points for the floor/wall strips and column slits, rect area lights for the ceiling strips.
+const BAKE_FIXTURES = false;
 const texLoader = new THREE.TextureLoader();
 const loadMap = (file, colorSpace = THREE.NoColorSpace) => {
   const t = texLoader.load(`textures/${file}.png`);
@@ -387,10 +427,17 @@ const tilePick = Array.from({ length: TILES * TILES }, () => {
   while (type < tileWeights.length - 1 && (r -= tileWeights[type]) > 0) type++;
   return type;
 });
+// Variation: every tile is laid at a random turn about its face, so one tile type's baked smudges and brush
+// direction don't sit the same way everywhere. Rotations only: a mirrored instance would turn inside out (culled).
+const ONE = new THREE.Vector3(1, 1, 1), AXIS_Y = new THREE.Vector3(0, 1, 0), AXIS_Z = new THREE.Vector3(0, 0, 1);
+const randomTurn = (axis, steps) => new THREE.Quaternion().setFromAxisAngle(axis, ((Math.random() * steps) | 0) * (2 * Math.PI / steps));
 const tilePos = (cell, y = 0) =>
   new THREE.Vector3(((cell % TILES) - TILES / 2 + 0.5) * TILE, y, (Math.floor(cell / TILES) - TILES / 2 + 0.5) * TILE);
-const tileMats = {}; // name → material, shared by the floor and the arena wall
-Object.keys(FLOOR_TILES).forEach((name, type) => {
+const tileMats = {}; // name → material, built on first use and shared by the floor, wall and ceiling
+// key: a separately tunable copy of a tile's material (e.g. a light colour); drip: for vertical surfaces, its grime is
+// the moisture streaks (see addGrime) instead of the scuff patches
+function tileMat(name, key = name, { drip = false } = {}) {
+  if (tileMats[key]) return tileMats[key];
   const orm = loadMap(`${name}_orm`);
   // Physical, not Standard, for the per-texel specular strength (ORM alpha): it zeroes the ~4% sheen every
   // non-metal has, so the black holes stay black even under a muzzle flash
@@ -405,21 +452,213 @@ Object.keys(FLOOR_TILES).forEach((name, type) => {
     ...(TILE_GLOW[name] && { emissive: 0xffffff, emissiveMap: loadMap(`${name}_e`, THREE.SRGBColorSpace), emissiveIntensity: TILE_GLOW[name] }),
     shadowSide: THREE.DoubleSide, // single-sided wall tiles still cast shadows whichever way they face the sun
   });
-  tileMats[name] = mat;
+  addGrime(mat, drip);
+  if (BAKE_FIXTURES) addBakedLight(mat);
+  return (tileMats[key] = mat);
+}
+
+// Scuff grime, per tile: the generator bakes only the dirt packed into cavities; the scuff patches live in one
+// shared texture (textures/grime.png, GRIME_N = 256 px) and each tile instance reads its own random 64 px window
+// of it (instance attribute grimeOffset, whole pixels so it stays on the tile's pixel grid). Composited like
+// the baked grime, a dielectric film: darker, rough, not metal, no brush streaks; only where the tile is bare
+// steel (its metalness), so holes, lenses and the light housing stay clean.
+// Walls, columns and the platform's sides instead get drip grime (textures/grime_drip.png): years of moisture
+// streaking down, read in world space (along the surface by its height, 32 px/m like the tiles, the texture 32 m
+// along × the 8 m wall), so the streaks always run down, whichever way a tile is turned, and carry on across rows.
+const GRIME_TILE = 64 / 256; // a tile's window, in grime-texture UVs
+const grimeMap = loadMap('grime'), dripMap = loadMap('grime_drip');
+grimeMap.wrapS = grimeMap.wrapT = dripMap.wrapS = THREE.RepeatWrapping;
+const DRIP_SIZE = new THREE.Vector2(32, 8); // m: the drip texture's span along a wall, and up it
+function addGrime(mat, drip = false) {
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.grimeMap = { value: drip ? dripMap : grimeMap };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute vec2 grimeOffset;\nvarying vec2 vGrimeUv;')
+      .replace(drip ? '#include <worldpos_vertex>' : '#include <uv_vertex>', drip ? `#include <worldpos_vertex>
+  { // world space: across the surface (horizontally) and up it
+    vec4 gp = vec4(transformed, 1.0);
+    vec3 gn = objectNormal;
+    #ifdef USE_INSTANCING
+      gp = instanceMatrix * gp;
+      gn = mat3(instanceMatrix) * gn;
+    #endif
+    vec3 gw = (modelMatrix * gp).xyz;
+    gn = normalize(mat3(modelMatrix) * gn);
+    vGrimeUv = vec2(dot(gw.xz, normalize(vec2(-gn.z, gn.x) + 1e-6)), gw.y) / vec2(${DRIP_SIZE.x.toFixed(1)}, ${DRIP_SIZE.y.toFixed(1)});
+  }` : `#include <uv_vertex>\n  vGrimeUv = uv * ${GRIME_TILE.toFixed(4)} + grimeOffset;`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform sampler2D grimeMap;\nvarying vec2 vGrimeUv;')
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+  float grimePatch = texture(grimeMap, vGrimeUv).r * metalnessFactor;
+  diffuseColor.rgb = mix(diffuseColor.rgb, ${drip ? 'vec3(0.07, 0.045, 0.03)' : 'vec3(0.05, 0.046, 0.042)'}, grimePatch); // GRIME, GRIME_ROUGH in the generator (drips: rustier)
+  roughnessFactor = mix(roughnessFactor, 0.85, grimePatch);
+  metalnessFactor *= 1.0 - grimePatch;`)
+      .replace('#include <lights_physical_fragment>', `#include <lights_physical_fragment>
+#ifdef USE_ANISOTROPY
+  material.anisotropy *= 1.0 - grimePatch; // grime hides the brush lines
+  material.alphaT = mix(pow2(material.roughness), 1.0, pow2(material.anisotropy));
+#endif`);
+  };
+}
+// Baked fixture light: every static fixture (floor, wall and ceiling strips, column slits) is summed at load into
+// one light volume over the arena (see the bake, after the light pools): per 0.5 m cell, the light arriving and its
+// dominant direction. Each tile shades it as a single virtual light from that direction, so the metal's highlights,
+// brush streaks and normal maps still respond, at the cost of one light instead of a pool of dozens.
+const bakedUniforms = {
+  bakedLight: { value: null }, bakedOrigin: { value: new THREE.Vector3() }, bakedSize: { value: new THREE.Vector3(1, 1, 1) },
+  bakedColor: { value: new THREE.Color() },
+};
+function addBakedLight(mat) {
+  const before = mat.onBeforeCompile;
+  mat.onBeforeCompile = (shader, renderer) => {
+    before(shader, renderer);
+    Object.assign(shader.uniforms, bakedUniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 bakedOrigin, bakedSize;\nvarying vec3 vBakedUvw;')
+      .replace('#include <worldpos_vertex>', `#include <worldpos_vertex>
+  { // world position, nudged 0.3 m off the surface so the volume is read on the lit side
+    vec4 bp = vec4(transformed, 1.0);
+    #ifdef USE_INSTANCING
+      bp = instanceMatrix * bp;
+    #endif
+    vec3 bn = normalize((vec4(transformedNormal, 0.0) * viewMatrix).xyz);
+    vBakedUvw = ((modelMatrix * bp).xyz + bn * 0.3 - bakedOrigin) / bakedSize;
+  }`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform highp sampler3D bakedLight;\nuniform vec3 bakedColor;\nvarying vec3 vBakedUvw;')
+      .replace('#include <lights_fragment_begin>', `#include <lights_fragment_begin>
+  { // the baked fixtures, as one light: rgb = direction × light (world space), a = total light arriving
+    vec4 bk = texture(bakedLight, vBakedUvw);
+    if (bk.a > 1e-4) {
+      IncidentLight baked;
+      vec3 d = dot(bk.xyz, bk.xyz) > 1e-8 ? bk.xyz : vec3(0.0, 1.0, 0.0);
+      baked.direction = normalize((viewMatrix * vec4(d, 0.0)).xyz);
+      baked.color = bakedColor * bk.a;
+      baked.visible = true;
+      RE_Direct(baked, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight);
+    }
+  }`);
+  };
+}
+
+// Each instanced tile mesh gets its own copy of the geometry, carrying a random grime window per instance
+const withGrimeOffsets = (geo, count) => geo.clone().setAttribute('grimeOffset', new THREE.InstancedBufferAttribute(
+  Float32Array.from({ length: count * 2 }, () => ((Math.random() * 256) | 0) / 256), 2));
+
+// Parallax mapping, pixel-art style: per pixel, march the eye ray down into a depth map through whole layers
+// and read every other map where it lands, so recessed parts slide behind the rim as you move (a normal map
+// only tilts the shading). three.js has none built in, so it's injected into the physical shader:
+// - the tangent frame comes from screen-space derivatives (no tangent attribute needed)
+// - the clearcoat keeps the surface UVs: it's a clear cover lying on top, not down in the recess
+// - lookups use the unshifted UVs' gradients for mip selection, since the shifted UVs jump at layer edges
+// depth: the depth map's full scale in UV units. coverOpacity: how milky the clearcoat cover is (0 = clear): over
+// its mask, what's seen through it blends that far toward frosted white and dims by as much, glow included.
+// The clearcoat map carries the cover: R = gloss, G = dirt (grime: dark, rough, blocks the glow), B = cover.
+// coverScatter: how much the cover diffuses what's behind it (0 = clear). Over the cover, 8 eye rays tilted by up
+// to that much (mostly across the ridges, the way a prismatic cover spreads light) are each marched into the
+// depth map and the colour and glow they land on averaged: deeper things blur more, like real frosted plastic.
+function addParallax(mat, depthFile, depth, { coverOpacity = 0, coverScatter = 0 } = {}) {
+  const depthMap = loadMap(depthFile);
+  depthMap.minFilter = THREE.NearestFilter; // read at full resolution only: crisp layers
+  depthMap.generateMipmaps = false;
+  mat.customProgramCacheKey = () => 'parallax';
+  const before = mat.onBeforeCompile; // the grime layer
+  mat.onBeforeCompile = (shader, renderer) => {
+    before(shader, renderer);
+    shader.uniforms.parallaxMap = { value: depthMap };
+    shader.uniforms.parallaxDepth = { value: depth };
+    shader.uniforms.coverOpacity = { value: coverOpacity };
+    shader.uniforms.coverScatter = { value: coverScatter };
+    const uvs = ['vMapUv', 'vAoMapUv', 'vRoughnessMapUv', 'vMetalnessMapUv', 'vEmissiveMapUv', 'vSpecularIntensityMapUv', 'vAnisotropyMapUv'];
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+uniform sampler2D parallaxMap;
+uniform float parallaxDepth;
+uniform float coverOpacity;
+uniform float coverScatter;
+vec2 parallaxUv(vec2 uv, vec3 v) { // v: toward the eye, tangent space
+  const float LAYERS = 24.0;
+  vec2 stepUv = v.xy / max(v.z, 0.25) * parallaxDepth / LAYERS;
+  float layer = 0.0, d = textureLod(parallaxMap, uv, 0.0).r;
+  for (int i = 0; i < 24; i++) {
+    if (layer >= d) break;
+    uv -= stepUv;
+    layer += 1.0 / LAYERS;
+    d = textureLod(parallaxMap, uv, 0.0).r;
+  }
+  return uv;
+}`)
+      .replace('void main() {', `void main() {
+  vec2 pomDx = dFdx(vMapUv), pomDy = dFdy(vMapUv);
+  vec3 pomN = normalize(vNormal), pomQ0 = dFdx(-vViewPosition), pomQ1 = dFdy(-vViewPosition);
+  vec3 pomT = cross(pomQ1, pomN) * pomDx.x + cross(pomN, pomQ0) * pomDy.x;
+  vec3 pomB = cross(pomQ1, pomN) * pomDx.y + cross(pomN, pomQ0) * pomDy.y;
+  float pomS = inversesqrt(max(max(dot(pomT, pomT), dot(pomB, pomB)), 1e-20));
+  vec3 pomV = normalize(vViewPosition);
+  vec3 pomVt = normalize(vec3(dot(pomT, pomV) * pomS, dot(pomB, pomV) * pomS, dot(pomN, pomV))); // eye, tangent space
+  vec2 pomUv0 = vMapUv; // the surface UV, kept for the cover's scattered rays
+  vec2 pomUv = parallaxUv(vMapUv, pomVt);
+  #undef texture2D
+  #define texture2D(s, c) textureGrad(s, c, pomDx, pomDy)
+${uvs.map((u) => `  #define ${u} pomUv`).join('\n')}`)
+      // after normal_fragment_begin, whose tangent frame needs the smooth UVs
+      .replace('#include <normal_fragment_maps>', '#define vNormalMapUv pomUv\n#include <normal_fragment_maps>')
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+#ifdef USE_CLEARCOATMAP
+  vec3 coverTexel = texture2D(clearcoatMap, vClearcoatMapUv).rgb; // the cover lies at the surface: unshifted UVs
+#if defined( USE_MAP ) && defined( USE_EMISSIVEMAP )
+  if (coverTexel.b > 0.5 && coverScatter > 0.0) { // diffusion: average what 8 scattered rays see behind the cover
+    vec3 alb = vec3(0.0), em = vec3(0.0);
+    for (int i = 0; i < 8; i++) {
+      float t = (float(i) + 0.5) / 4.0 - 1.0; // -0.875 .. 0.875
+      vec3 v = normalize(pomVt + coverScatter * vec3(0.25 * t * (i % 2 == 0 ? 1.0 : -1.0), t, 0.0));
+      vec2 uv = parallaxUv(pomUv0, v);
+      alb += textureGrad(map, uv, pomDx, pomDy).rgb;
+      em += textureGrad(emissiveMap, uv, pomDx, pomDy).rgb;
+    }
+    diffuseColor.rgb = alb / 8.0;
+    totalEmissiveRadiance = emissive * em / 8.0;
+  }
+#endif
+  float cover = coverTexel.b * coverOpacity, dirt = coverTexel.g;
+  diffuseColor.rgb = mix(mix(diffuseColor.rgb, vec3(0.8), cover), vec3(0.05, 0.046, 0.042), dirt); // GRIME (generator)
+  metalnessFactor *= (1.0 - cover) * (1.0 - dirt);
+  roughnessFactor = mix(roughnessFactor, 0.85, dirt);
+  totalEmissiveRadiance *= (1.0 - cover) * (1.0 - dirt);
+#endif`);
+  };
+}
+
+Object.keys(FLOOR_TILES).forEach((name, type) => {
+  const mat = tileMat(name);
   const cells = tilePick.flatMap((t, i) => (t === type ? [i] : []));
-  const mesh = new THREE.InstancedMesh(tileGeo, mat, cells.length);
+  const mesh = new THREE.InstancedMesh(withGrimeOffsets(tileGeo, cells.length), mat, cells.length);
   const m = new THREE.Matrix4();
-  cells.forEach((cell, i) => mesh.setMatrixAt(i, m.makeTranslation(tilePos(cell))));
+  cells.forEach((cell, i) => mesh.setMatrixAt(i, m.compose(tilePos(cell), randomTurn(AXIS_Y, 4), ONE))); // quarter turns
   mesh.receiveShadow = true;
   scene.add(mesh);
 });
 
 // Arena wall: a square ARENA m out each way, on the floor's tile seams, WALL_ROWS tiles high. The same 2 m
-// tiles as the floor, stood up facing inward in alternating columns of cover plates and lights. Single-sided:
-// you can't get out to see the back (the player is kept inside, below).
-const ARENA = 32, WALL_ROWS = 2;
-const WALL_TILES = ['cover', 'light']; // alternate along the wall, same all the way up
-const wallCells = Object.fromEntries(WALL_TILES.map((n) => [n, []]));
+// tiles as the floor, stood up facing inward, one kind of row per WALL_ROW_KINDS (bottom to top): two rows
+// alternating cover plates and light fixtures, panels with a vertical light slit at each side (pairing up at the seams
+// round the arena), cover plates on top. Single-sided: you can't get out to see the back (the player is kept inside).
+const ARENA = 32, WALL_ROWS = 4; // 8 m ceiling
+const WALL_ROW_KINDS = ['lights', 'lights', 'side', 'cover']; // light band at 0–4 m, side slits at 4–6 m
+const WALL_TILES = ['cover', 'walllight']; // alternate along the wall in the light rows
+// The wall's light fixture: a tube in a deep recess under a ridged clear cover, drawn with parallax mapping
+const WALL_LIGHT_DEPTH = 6 / 64; // UV units: the generator's PARALLAX_RANGE (px) over the 64 px tile
+{
+  const mat = tileMat('walllight', 'drip:walllight', { drip: true });
+  Object.assign(mat, {
+    clearcoat: 1, clearcoatMap: loadMap('walllight_ccm'), clearcoatNormalMap: loadMap('walllight_ccn'),
+    clearcoatRoughness: 0.08, // the clear cover: a glossy layer over the recess, its ridges in the normal map
+  });
+  addParallax(mat, 'walllight_depth', WALL_LIGHT_DEPTH, { coverOpacity: 0.2, coverScatter: 0.6 }); // a frosted cover
+}
+const wallCells = Object.fromEntries([...WALL_TILES, 'cover_hatch', 'sidelight_left'].map((n) => [n, []]));
+const HALF_TURN = new THREE.Quaternion().setFromAxisAngle(AXIS_Z, Math.PI); // in a wall tile's plane
+const wallCover = () => (Math.random() < 0.3 ? 'cover_hatch' : 'cover'); // some cover plates are access hatches
 const wallGeo = new THREE.PlaneGeometry(TILE, TILE); // faces +Z, texture X along the wall, Y up
 for (const [nx, nz] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) { // each wall's inward normal
   const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.atan2(nx, nz));
@@ -428,14 +667,18 @@ for (const [nx, nz] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) { // each wall's inwa
     const along = (k - count / 2 + 0.5) * TILE;
     for (let r = 0; r < WALL_ROWS; r++) {
       const pos = new THREE.Vector3(nx ? -nx * ARENA : along, (r + 0.5) * TILE, nz ? -nz * ARENA : along);
-      wallCells[WALL_TILES[k % 2]].push({ pos, q, normal: new THREE.Vector3(nx, 0, nz) });
+      const kind = WALL_ROW_KINDS[r];
+      const name = kind === 'side' ? 'sidelight_left' : kind === 'lights' ? WALL_TILES[k % 2] : 'cover';
+      // the side-slit row alternates a left slit and a right one (the same panel, half turned); others turn at random
+      const turn = kind === 'side' ? (k % 2 ? HALF_TURN : new THREE.Quaternion()) : randomTurn(AXIS_Z, 2);
+      wallCells[name === 'cover' ? wallCover() : name].push({ pos, q: q.clone().multiply(turn), normal: new THREE.Vector3(nx, 0, nz) });
     }
   }
 }
-for (const name of WALL_TILES) {
-  const cells = wallCells[name], one = new THREE.Vector3(1, 1, 1), m = new THREE.Matrix4();
-  const mesh = new THREE.InstancedMesh(wallGeo, tileMats[name], cells.length);
-  cells.forEach((c, i) => mesh.setMatrixAt(i, m.compose(c.pos, c.q, one)));
+for (const name of Object.keys(wallCells)) {
+  const cells = wallCells[name], m = new THREE.Matrix4();
+  const mesh = new THREE.InstancedMesh(withGrimeOffsets(wallGeo, cells.length), tileMat(name, `drip:${name}`, { drip: true }), cells.length);
+  cells.forEach((c, i) => mesh.setMatrixAt(i, m.compose(c.pos, c.q, ONE))); // c.q includes the tile's turn in its plane
   mesh.castShadow = mesh.receiveShadow = true;
   scene.add(mesh);
 }
@@ -444,19 +687,169 @@ for (const name of WALL_TILES) {
 // with a light tile every CEIL_LIGHT_EVERY tiles each way (in place of a vent)
 const CEILING_TILES = ['slits', 'plain', 'light'], CEIL_LIGHT_EVERY = 4;
 const ceilingGeo = new THREE.PlaneGeometry(TILE, TILE).rotateX(Math.PI / 2); // faces down
-const ceilLightTiles = []; // where the ceiling lights are, just under the ceiling
+const ceilLightTiles = []; // where the ceiling lights are, just under the ceiling, each with its .color
+// Ceiling light colours come in sections, not light by light: the lights fall in 16 m blocks of 2 × 2, and each
+// block takes the colour of its nearest colour seed (7 scattered at random, every colour used at least once), so
+// the colours form a few irregular, contiguous regions. All four are scaled to the original blue LED's luminance,
+// so they read equally bright and all still clear the bloom threshold (which goes by luminance).
+const CEIL_COLORS = { green: [0.15, 1, 0.25], blue: [0.2, 0.45, 1], red: [1, 0.12, 0.08], white: [1, 1, 1] }; // linear hues
+const CEIL_SECTION = 16, CEIL_COLOR_SEEDS = 7; // m: a colour block; seeds
+const LED = new THREE.Color(0x96d2ff); // the light tile's baked LED colour (LIGHT in the generator), linear
+const luminance = (c) => 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+const ceilColors = Object.fromEntries(Object.entries(CEIL_COLORS).map(([k, v]) => {
+  const c = new THREE.Color().setRGB(...v);
+  return [k, c.multiplyScalar(luminance(LED) / luminance(c))];
+}));
 {
+  const names = Object.keys(ceilColors);
+  const seeds = Array.from({ length: CEIL_COLOR_SEEDS }, (_, i) => ({
+    x: (Math.random() - 0.5) * 2 * ARENA, z: (Math.random() - 0.5) * 2 * ARENA, color: names[i % names.length] }));
+  const sectionColor = (x, z) => { // the seed nearest the centre of the 16 m block this point is in
+    const cx = (Math.floor((x + ARENA) / CEIL_SECTION) + 0.5) * CEIL_SECTION - ARENA;
+    const cz = (Math.floor((z + ARENA) / CEIL_SECTION) + 0.5) * CEIL_SECTION - ARENA;
+    return seeds.reduce((a, b) => (Math.hypot(b.x - cx, b.z - cz) < Math.hypot(a.x - cx, a.z - cz) ? b : a)).color;
+  };
   const count = (2 * ARENA) / TILE, cells = Object.fromEntries(CEILING_TILES.map((n) => [n, []]));
   for (let i = 0; i < count; i++) for (let j = 0; j < count; j++) {
     const p = new THREE.Vector3((i - count / 2 + 0.5) * TILE, WALL_ROWS * TILE, (j - count / 2 + 0.5) * TILE);
     const lit = i % CEIL_LIGHT_EVERY === CEIL_LIGHT_EVERY / 2 && j % CEIL_LIGHT_EVERY === CEIL_LIGHT_EVERY / 2;
-    cells[lit ? 'light' : CEILING_TILES[(i + j) % 2]].push(p);
-    if (lit) ceilLightTiles.push(p.clone().setY(p.y - 0.02));
+    const key = lit ? `light:${sectionColor(p.x, p.z)}` : CEILING_TILES[(i + j) % 2];
+    (cells[key] ??= []).push(p);
+    if (lit) ceilLightTiles.push(Object.assign(p.clone().setY(p.y - 0.02), { color: ceilColors[key.split(':')[1]] }));
   }
-  for (const name of CEILING_TILES) {
-    const mesh = new THREE.InstancedMesh(ceilingGeo, tileMats[name], cells[name].length), m = new THREE.Matrix4();
-    cells[name].forEach((p, i) => mesh.setMatrixAt(i, m.makeTranslation(p)));
+  for (const [key, ps] of Object.entries(cells)) {
+    if (!ps.length) continue;
+    const [name, colour] = key.split(':'), m = new THREE.Matrix4();
+    const mat = tileMat(name, key);
+    // the lens's glow texture is the blue LED; this factor turns it into the section's colour
+    if (colour) mat.emissive.setRGB(ceilColors[colour].r / LED.r, ceilColors[colour].g / LED.g, ceilColors[colour].b / LED.b);
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(ceilingGeo, ps.length), mat, ps.length);
+    ps.forEach((p, i) => mesh.setMatrixAt(i, m.compose(p, randomTurn(AXIS_Y, 4), ONE))); // quarter turns
     scene.add(mesh);
+  }
+}
+
+// Columns: regular octagons (all sides equal), floor to ceiling, on a centred square lattice: one towards each
+// corner (the middle has the platform, below). Each face is one 2 m tile wide (~4.8 m across), the same panels as the floor,
+// walls and ceiling: a whole plate per 2 m × 2 m, every panel with its own grime window. The top and bottom panels
+// carry thin light slits, alternating round the column between the ceiling and floor edges, each with a spot light
+// aimed away from it (see the spot pool).
+const COLUMN_SIDE = TILE, COLUMN_SPACING = 16; // m: face width; lattice step out from the centre
+const COLUMNS = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([i, j]) => new THREE.Vector2(i, j).multiplyScalar(COLUMN_SPACING));
+const COLUMN_APOTHEM = COLUMN_SIDE / 2 / Math.tan(Math.PI / 8);          // centre → middle of a face
+const COLUMN_REACH = COLUMN_APOTHEM / Math.cos(Math.PI / 8) + 0.4;       // centre → corner, plus the player's body
+const slitTiles = []; // the columns' light slits: positions, each with .aim (where its spot points, relative)
+{
+  const panel = new THREE.PlaneGeometry(COLUMN_SIDE, TILE); // faces +Z
+  const uv = panel.attributes.uv;
+  for (let i = 0; i < uv.count; i++) uv.setX(i, (uv.getX(i) * COLUMN_SIDE) / TILE); // a face narrower than a tile shows part of a plate, not a squashed one
+  const panels = { plain: [], slitlight: [] }, m = new THREE.Matrix4();
+  const upsideDown = new THREE.Quaternion().setFromAxisAngle(AXIS_Z, Math.PI); // in the panel's plane
+  for (const c of COLUMNS) for (let k = 0; k < 8; k++) {
+    const a = (k * Math.PI) / 4, q = new THREE.Quaternion().setFromAxisAngle(AXIS_Y, a); // face k looks out at angle a
+    const out = new THREE.Vector3(Math.sin(a), 0, Math.cos(a));
+    for (let r = 0; r < WALL_ROWS; r++) {
+      // 8 slits a column, alternating round it: even faces have one along the top panel's top edge (under the
+      // ceiling), spot aimed down; odd faces one along the bottom panel's bottom edge (the same panel upside
+      // down), spot aimed up. Each slit sits 0.25 m from its edge; its spot hangs just off the face, tilted a
+      // little outward, washing the column face and lighting the floor (or the ceiling) around it.
+      const top = r === WALL_ROWS - 1 && k % 2 === 0, bottom = r === 0 && k % 2 === 1, slit = top || bottom;
+      panels[slit ? 'slitlight' : 'plain'].push(m.clone().compose(
+        new THREE.Vector3(c.x, (r + 0.5) * TILE, c.y).addScaledVector(out, COLUMN_APOTHEM), bottom ? q.clone().multiply(upsideDown) : q, ONE));
+      if (slit) slitTiles.push(Object.assign(
+        new THREE.Vector3(c.x, top ? (r + 1) * TILE - 0.25 : 0.25, c.y).addScaledVector(out, COLUMN_APOTHEM + 0.15),
+        { aim: out.clone().multiplyScalar(1.5).setY(top ? -6 : 6) }));
+    }
+  }
+  for (const [name, mats] of Object.entries(panels)) {
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(panel, mats.length), tileMat(name, `drip:${name}`, { drip: true }), mats.length);
+    mats.forEach((mm, i) => mesh.setMatrixAt(i, mm));
+    scene.add(mesh);
+  }
+}
+
+// The centre platform: a regular octagon, two panels to a side (4 m sides, ~9.7 m across), half a panel (1 m) tall. Its sides are steel panels cut to half height (each shows half a plate); its top is plates on the 2 m
+// floor grid, each clipped to the octagon. You can jump up onto it (your jump just clears it); otherwise it's solid,
+// to you, the demons, shots and blood.
+const PLATFORM_SIDE = 2 * TILE, PLATFORM_H = TILE / 2, PLATFORM_STEP = 0.15; // m; m; how far short of the top still lands you on it
+const PLATFORM_APOTHEM = PLATFORM_SIDE / 2 / Math.tan(Math.PI / 8); // centre → middle of a side
+const PLATFORM_FACES = Array.from({ length: 8 }, (_, k) => new THREE.Vector2(Math.sin(k * Math.PI / 4), Math.cos(k * Math.PI / 4))); // side k's outward normal (x, z)
+const PLATFORM_TILES = { plain: 0.6, plain_bolted: 0.2, plain_welded: 0.2 };
+// How far out from the centre a point is, measured across the nearest side (< PLATFORM_APOTHEM: over the platform);
+// the side's normal in _pf
+const _pf = new THREE.Vector2();
+function platformDist(x, z) {
+  let best = -Infinity;
+  for (const n of PLATFORM_FACES) { const d = n.x * x + n.y * z; if (d > best) { best = d; _pf.copy(n); } }
+  return best;
+}
+function pushOutOfPlatform(p, pad) { // p: a position (x, z used), kept pad metres off the platform's sides
+  const d = platformDist(p.x, p.z);
+  if (d < PLATFORM_APOTHEM + pad) { p.x += _pf.x * (PLATFORM_APOTHEM + pad - d); p.z += _pf.y * (PLATFORM_APOTHEM + pad - d); }
+}
+// Where a ray (origin o, direction dir) enters the platform's solid octagonal prism: its distance, or Infinity
+function rayPlatform(o, dir) {
+  let tIn = -Infinity, tOut = Infinity;
+  const clip = (den, num) => { // the half-space n·(o + t dir) ≤ k, with den = n·dir, num = k − n·o
+    if (Math.abs(den) < 1e-9) { if (num < 0) tIn = Infinity; } else if (den > 0) tOut = Math.min(tOut, num / den); else tIn = Math.max(tIn, num / den);
+  };
+  for (const n of PLATFORM_FACES) clip(n.x * dir.x + n.y * dir.z, PLATFORM_APOTHEM - (n.x * o.x + n.y * o.z));
+  clip(dir.y, PLATFORM_H - o.y); clip(-dir.y, o.y);
+  return tIn <= tOut && tOut > 0 ? Math.max(tIn, 0) : Infinity;
+}
+{
+  const pick = (weights) => { let r = Math.random(); for (const [n, w] of Object.entries(weights)) if ((r -= w) <= 0) return n; return Object.keys(weights)[0]; };
+  // sides: 8 × 2 panels, the lower half of a plate each (half turned at random, to show either half)
+  const side = new THREE.PlaneGeometry(TILE, PLATFORM_H); // faces +Z
+  const suv = side.attributes.uv;
+  for (let i = 0; i < suv.count; i++) suv.setY(i, suv.getY(i) * PLATFORM_H / TILE);
+  const sides = {}, m = new THREE.Matrix4();
+  PLATFORM_FACES.forEach((n, k) => {
+    const q = new THREE.Quaternion().setFromAxisAngle(AXIS_Y, k * Math.PI / 4), along = new THREE.Vector3(n.y, 0, -n.x);
+    for (const s of [-0.5, 0.5]) {
+      const at = new THREE.Vector3(n.x * PLATFORM_APOTHEM, PLATFORM_H / 2, n.y * PLATFORM_APOTHEM).addScaledVector(along, s * TILE);
+      (sides[pick(PLATFORM_TILES)] ??= []).push(m.clone().compose(at, q.clone().multiply(randomTurn(AXIS_Z, 2)), ONE));
+    }
+  });
+  for (const [name, mats] of Object.entries(sides)) {
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(side, mats.length), tileMat(name, `drip:${name}`, { drip: true }), mats.length);
+    mats.forEach((mm, i) => mesh.setMatrixAt(i, mm));
+    scene.add(mesh);
+  }
+  // top: each 2 m floor-grid cell the octagon covers, clipped to it (Sutherland–Hodgman), keeping the cell's uv
+  const tops = {};
+  const n = Math.ceil(PLATFORM_APOTHEM / Math.cos(Math.PI / 8) / TILE); // cells out to the corners
+  for (let i = -n; i < n; i++) for (let j = -n; j < n; j++) {
+    const x0 = i * TILE, z0 = j * TILE;
+    let poly = [[x0, z0], [x0 + TILE, z0], [x0 + TILE, z0 + TILE], [x0, z0 + TILE]];
+    for (const f of PLATFORM_FACES) {
+      const inside = ([x, z]) => f.x * x + f.y * z <= PLATFORM_APOTHEM + 1e-6, out = [];
+      poly.forEach((a, k) => {
+        const b = poly[(k + 1) % poly.length], ia = inside(a), ib = inside(b);
+        if (ia) out.push(a);
+        if (ia !== ib) {
+          const da = f.x * a[0] + f.y * a[1] - PLATFORM_APOTHEM, db = f.x * b[0] + f.y * b[1] - PLATFORM_APOTHEM, t = da / (da - db);
+          out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+        }
+      });
+      poly = out;
+    }
+    if (poly.length < 3) continue;
+    const g = (tops[pick(PLATFORM_TILES)] ??= { pos: [], uv: [], grime: [] });
+    const grime = [((Math.random() * 256) | 0) / 256, ((Math.random() * 256) | 0) / 256];
+    for (let k = 1; k < poly.length - 1; k++) for (const [x, z] of [poly[0], poly[k + 1], poly[k]]) { // a fan, facing up
+      g.pos.push(x, PLATFORM_H, z);
+      g.uv.push((x - x0) / TILE, (z0 + TILE - z) / TILE);
+      g.grime.push(...grime);
+    }
+  }
+  for (const [name, g] of Object.entries(tops)) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(g.pos, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(g.pos.map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(g.uv, 2));
+    geo.setAttribute('grimeOffset', new THREE.Float32BufferAttribute(g.grime, 2)); // per vertex: one window per plate
+    scene.add(new THREE.Mesh(geo, tileMat(name)));
   }
 }
 
@@ -465,16 +858,20 @@ const ceilLightTiles = []; // where the ceiling lights are, just under the ceili
 // stage like the flashes. Each fades out toward the pool's edge (the next-nearest tile left out, or
 // STRIP_REACH), so a light handing over to another tile is already at zero: no popping.
 const STRIP_POOL = 8, STRIP_REACH = 14, STRIP_FADE = 4; // lights, metres, metres
+// Trying: the floor/wall strips light nothing in the world, only glow (emissive + bloom). Their pool still lights
+// the demon sprites and the gun.
+const STRIP_LIGHTS_IN_WORLD = false;
 const STRIP_COLOR = 0x96d2ff, STRIP_INTENSITY = 2, STRIP_RANGE = 5, STRIP_HEIGHT = 0.25; // match LIGHT in the generator
+const WALL_STRIP_OFFSET = 0.6; // m off the wall: further out than the floor's, so it doesn't hot-spot its own fixture
 const lightType = Object.keys(FLOOR_TILES).indexOf('light');
 const stripTiles = [
   ...tilePick.flatMap((t, cell) => (t === lightType ? [tilePos(cell, STRIP_HEIGHT)] : [])),
-  ...wallCells.light.map((c) => c.pos.clone().addScaledVector(c.normal, STRIP_HEIGHT)), // just off the wall
+  ...wallCells.walllight.map((c) => c.pos.clone().addScaledVector(c.normal, WALL_STRIP_OFFSET)),
 ];
 const stripLights = Array.from({ length: STRIP_POOL }, () => {
   const world = new THREE.PointLight(STRIP_COLOR, 0, STRIP_RANGE, 2);
   const sprite = world.clone();
-  scene.add(world);
+  if (!BAKE_FIXTURES && STRIP_LIGHTS_IN_WORLD) scene.add(world); // otherwise it only places the gun's copy
   stage.add(sprite);
   return { world, sprite };
 });
@@ -491,6 +888,8 @@ function updatePool(tiles, lights, reach, fade, intensity) {
   lights.forEach(({ world, sprite }, i) => {
     const n = near[i];
     if (n) { world.position.copy(n.p); sprite.position.copy(n.p); }
+    if (n && n.p.color) { world.color.copy(n.p.color); sprite.color.copy(n.p.color); } // e.g. a ceiling section's
+    if (n && world.isSpotLight) { world.target.position.copy(n.p).add(n.p.aim); sprite.target.position.copy(world.target.position); }
     world.intensity = sprite.intensity = n ? intensity * THREE.MathUtils.clamp((edge - n.d) / fade, 0, 1) : 0;
   });
 }
@@ -499,28 +898,94 @@ function updatePool(tiles, lights, reach, fade, intensity) {
 // only: soft, shaped highlights instead of a point's pinprick. Pricier per pixel than a point light and no
 // shadows, so again a pool over the nearest; not in the sprites' light mask (no `distance`), so a demon's
 // sprite picks up changes on its next pose step.
-const CEIL_POOL = 8, CEIL_REACH = 20, CEIL_FADE = 6, CEIL_INTENSITY = 60;
+// Intensity scales with the ceiling height squared to keep the floor as lit: 120 at 4 m, so 480 at 8 m
+const CEIL_POOL = 8, CEIL_REACH = 20, CEIL_FADE = 6, CEIL_INTENSITY = 120 * (WALL_ROWS * TILE / 4) ** 2;
+const ceilLight = () => {
+  const l = new THREE.RectAreaLight(STRIP_COLOR, 0, 1.6, 0.2);
+  l.rotation.x = -Math.PI / 2; // it emits along its -Z: straight down, long side along X like the tile
+  return l;
+};
 const ceilLights = Array.from({ length: CEIL_POOL }, () => {
-  const world = new THREE.RectAreaLight(STRIP_COLOR, 0, 1.6, 0.2);
-  world.rotation.x = -Math.PI / 2; // it emits along its -Z: straight down, long side along X like the tile
-  const sprite = world.clone();
-  scene.add(world);
+  const world = ceilLight(), sprite = ceilLight();
+  if (!BAKE_FIXTURES) scene.add(world); // baked: only placing the gun's copy
   stage.add(sprite);
   return { world, sprite };
 });
 
-const boxMat = new THREE.MeshStandardMaterial({ color: 0xd9d9d9, roughness: 0.6 });
-for (let i = 0; i < 40; i++) {
-  const s = 1 + Math.random() * 3;
-  const b = new THREE.Mesh(new THREE.BoxGeometry(s, s, s), boxMat);
-  b.position.set((Math.random() - 0.5) * 2 * (ARENA - 4), s / 2, (Math.random() - 0.5) * 2 * (ARENA - 4)); // inside the wall
-  b.castShadow = b.receiveShadow = true;
-  scene.add(b);
+// Column slit lights: spot lights (a cone, like a downlight or uplight) at the columns' slits, aimed down from the
+// ceiling slits and up from the floor ones, a little outward. 40 slits, so again a pool over the nearest, mirrored
+// into the sprite stage (and the gun). Each spot costs ~1.8 ms/frame at 1600×1000, hence 8: one column's set.
+const SPOT_POOL = 8, SPOT_REACH = 24, SPOT_FADE = 6, SPOT_INTENSITY = 40; // lights (a whole column's 8 slits), m, m, candela
+// Like the floor/wall strips: the column slits light nothing in the world, only glow (emissive + bloom); their pool
+// still lights the demon sprites and the gun.
+const SLIT_LIGHTS_IN_WORLD = false;
+// Point mode: a point light 0.45 m further out from the face instead of an aimed cone
+const spotLight = () => (BAKE_FIXTURES
+  ? new THREE.SpotLight(STRIP_COLOR, 0, 14, Math.PI / 5, 0.6, 2) // range 14 m, 36° cone, soft edge
+  : new THREE.PointLight(STRIP_COLOR, 0, 14, 2));
+const spotPoolTiles = BAKE_FIXTURES ? slitTiles
+  : slitTiles.map((p) => p.clone().addScaledVector(new THREE.Vector3(p.aim.x, 0, p.aim.z).normalize(), 0.45));
+const spotLights = Array.from({ length: SPOT_POOL }, () => {
+  const world = spotLight(), sprite = spotLight();
+  if (!BAKE_FIXTURES && SLIT_LIGHTS_IN_WORLD) scene.add(world); // otherwise it only places the gun's copy
+  stage.add(sprite);
+  if (sprite.target) stage.add(sprite.target); // a spot's target must be in the scene to follow its position
+  return { world, sprite };
+});
+
+// The bake (see addBakedLight): every static fixture's light summed into a 64 × 8 × 64 m volume in 0.5 m cells, with
+// the same falloff three.js uses (1/d², windowed to zero at the range), spot cones, and the ceiling's area lights
+// as small down-facing (cosine) emitters along each strip. Per cell: rgb = Σ light × direction to it, a = Σ light.
+// Done at load, since the floor's light tiles are placed at random. Each source only touches cells within its reach.
+// No occlusion: light passes through the columns. The main scene keeps only the muzzle flashes as real lights; the
+// pools above stay for the sprite stage and the gun, which are drawn small and cheap.
+if (BAKE_FIXTURES) {
+  const CELL = 0.5, W = (2 * ARENA) / CELL, H = (WALL_ROWS * TILE) / CELL, D = W;
+  const origin = new THREE.Vector3(-ARENA, 0, -ARENA), acc = new Float32Array(W * H * D * 4);
+  const sources = [
+    ...stripTiles.filter((p) => Math.abs(p.x) < ARENA && Math.abs(p.z) < ARENA) // floor (inside the arena) and wall strips
+      .map((p) => ({ p, I: STRIP_INTENSITY, range: STRIP_RANGE })),
+    ...ceilLightTiles.flatMap((p) => [-0.6, 0, 0.6].map((o) => ({ // 1.6 × 0.2 m at CEIL_INTENSITY nits, in 3 pieces
+      p: p.clone().setX(p.x + o), I: (CEIL_INTENSITY * 1.6 * 0.2) / 3, range: 16, axis: new THREE.Vector3(0, -1, 0), lambert: true }))),
+    ...slitTiles.map((p) => ({ p, I: SPOT_INTENSITY, range: 14, axis: p.aim.clone().normalize(),
+      cone: [Math.cos(Math.PI / 5), Math.cos((Math.PI / 5) * (1 - 0.6))] })), // the spotLight() cone and penumbra
+  ];
+  const t0 = performance.now(), L = new THREE.Vector3();
+  for (const { p, I, range, axis, lambert, cone } of sources) {
+    const lo = (v, o) => Math.max(Math.floor((v - range - o) / CELL), 0), hi = (v, o, n) => Math.min(Math.ceil((v + range - o) / CELL), n - 1);
+    for (let z = lo(p.z, origin.z); z <= hi(p.z, origin.z, D); z++)
+      for (let y = lo(p.y, 0); y <= hi(p.y, 0, H); y++)
+        for (let x = lo(p.x, origin.x); x <= hi(p.x, origin.x, W); x++) {
+          L.set(p.x - (origin.x + (x + 0.5) * CELL), p.y - (y + 0.5) * CELL, p.z - (origin.z + (z + 0.5) * CELL));
+          const d = L.length();
+          if (d >= range) continue;
+          L.divideScalar(d); // cell → light
+          let e = (I / Math.max(d * d, 0.12)) * (1 - (d / range) ** 4) ** 2; // floor of ~0.35 m: no pinprick hot cells
+          if (axis) {
+            const c = -L.dot(axis); // cosine between the light's aim and the cell
+            if (lambert) e *= Math.max(c, 0);
+            if (cone) e *= THREE.MathUtils.smoothstep(c, cone[0], cone[1]);
+          }
+          if (e <= 0) continue;
+          const i = 4 * (x + W * (y + H * z));
+          acc[i] += e * L.x; acc[i + 1] += e * L.y; acc[i + 2] += e * L.z; acc[i + 3] += e;
+        }
+  }
+  const half = new Uint16Array(acc.length);
+  for (let i = 0; i < acc.length; i++) half[i] = THREE.DataUtils.toHalfFloat(acc[i]);
+  const tex = new THREE.Data3DTexture(half, W, H, D);
+  Object.assign(tex, { format: THREE.RGBAFormat, type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    unpackAlignment: 1, needsUpdate: true });
+  bakedUniforms.bakedLight.value = tex;
+  bakedUniforms.bakedOrigin.value.copy(origin);
+  bakedUniforms.bakedSize.value.set(2 * ARENA, WALL_ROWS * TILE, 2 * ARENA);
+  bakedUniforms.bakedColor.value.set(STRIP_COLOR);
+  console.info(`baked ${sources.length} fixture lights into ${W}×${H}×${D} cells in ${(performance.now() - t0).toFixed(0)} ms`);
 }
 
 // First-person camera: click to capture the mouse
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 200);
-camera.position.set(0, EYE_HEIGHT, 0);
+camera.position.set(0, EYE_HEIGHT, 8); // in front of the centre platform, which you face
 
 // Post: the world renders into an HDR buffer, anything brighter than BLOOM_THRESHOLD (emissive strips, hot
 // metal glints) bleeds a glow, then OutputPass applies the renderer's ACES tone mapping and sRGB.
@@ -547,7 +1012,7 @@ look.addEventListener('unlock', () => { startEl.style.display = ''; trigger = fa
 const opts = {
   stage, resolution: RT_SIZES[0], snaps: 16, pitchSnaps: 8, distance: 5, animFps: 12,
   stepped: true, snap: true, lockDist: true, real: false, bounds: false, spriteShadows: false,
-  lod: true, lodNear: 8, lodFalloff: 0.25, sun, flashLights: [...flashes, ...stripLights].map((l) => l.sprite),
+  lod: true, lodNear: 8, lodFalloff: 0.25, sun, flashLights: [...flashes, ...stripLights, ...spotLights].map((l) => l.sprite),
 };
 
 // ---------------------------------------------------------------------------
@@ -571,6 +1036,7 @@ const gunFlashes = flashes.map((f) => { const l = f.world.clone(); gunScene.add(
 // update when the weapon re-renders (stepped), not every frame.
 const gunStrips = stripLights.map((s) => { const l = s.world.clone(); gunScene.add(l); return l; });
 const gunCeil = ceilLights.map((c) => { const l = c.world.clone(); gunScene.add(l); return l; });
+const gunSpots = spotLights.map(() => { const l = spotLight(); gunScene.add(l); if (l.target) gunScene.add(l.target); return l; });
 const gunCam = new THREE.PerspectiveCamera(GUN_FOV, 1, 0.01, 10);
 const gunRT = new THREE.WebGLRenderTarget(1, 1, {
   type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
@@ -588,24 +1054,23 @@ function sizeGun() {
   if (gun) gun.dirty = true;
 }
 
-const muzzleSprite = new THREE.Mesh(new THREE.PlaneGeometry(0.22, 0.22), new THREE.MeshBasicMaterial({
-  map: (() => {
-    const c = document.createElement('canvas');
-    c.width = c.height = 64;
-    const g = c.getContext('2d'), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
-    gr.addColorStop(0, 'rgba(255,255,220,1)');
-    gr.addColorStop(0.3, 'rgba(255,190,80,0.9)');
-    gr.addColorStop(1, 'rgba(255,90,0,0)');
-    g.fillStyle = gr;
-    g.fillRect(0, 0, 64, 64);
-    return new THREE.CanvasTexture(c);
-  })(),
+// The muzzle flash: textures/muzzle_flash.png (the generator's muzzle_flash), FLASH_VARIANTS shapes across, two
+// frames down (the bang, then the next instant). Each shot picks a shape (mirrored half the time) and plays the bang
+// for GUN_BANG_TIME (about a frame), then the second frame to GUN_FLASH_TIME: short, so at full auto it reads as
+// separate bangs with gaps, not a shape hanging off the barrel. Drawn into the gun's own render, so it's pixelated
+// with it; additive, screen-aligned so the flash hider's prongs point up.
+const GUN_FLASH_TIME = 0.045, GUN_BANG_TIME = 0.017, FLASH_VARIANTS = 4; // s; s; shapes in the sheet
+const flashSheet = loadMap('muzzle_flash', THREE.SRGBColorSpace);
+Object.assign(flashSheet, { minFilter: THREE.NearestFilter, generateMipmaps: false });
+flashSheet.repeat.set(1 / FLASH_VARIANTS, 1 / 2);
+const muzzleSprite = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.3), new THREE.MeshBasicMaterial({
+  map: flashSheet, color: new THREE.Color(1.6, 1.6, 1.6), // brighter than white: it's a flash
   transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
 }));
 muzzleSprite.visible = false;
 gunScene.add(muzzleSprite);
 
-let gun = null;      // { root, mixer, actions, joint, muzzle, ammo, busy, cooldown, animAcc, lastLights, dirty, flashUntil }
+let gun = null;      // { root, mixer, actions, joint, muzzle, ammo, busy, cooldown, animAcc, lastLights, dirty, flashUntil, flashVariant, flashMirror, flashFrame }
 let trigger = false; // left mouse held
 const _toGun = new THREE.Matrix4(), _gs = new THREE.Vector3(), _mw = new THREE.Vector3();
 const _tgp = new THREE.Vector3(), _tgq = new THREE.Quaternion();
@@ -647,6 +1112,7 @@ function setupGun(g) {
   gun = {
     root, mixer, actions, muzzle, joint: root.getObjectByName('FPS_Camera_j_01'),
     ammo: MAG, busy: true, cooldown: 0, animAcc: 1 / opts.animFps, lastLights: -1, dirty: true, flashUntil: 0,
+    flashVariant: 0, flashMirror: false, flashFrame: -1,
   };
   mixer.addEventListener('finished', (e) => {
     if (e.action === actions.Reload || e.action === actions.Reload_Empty) gun.ammo = MAG;
@@ -664,6 +1130,1262 @@ function playGun(name) {
   gun.actions[name].reset().play();
 }
 
+// Camera shake on firing: a recoil kick (each shot snaps the view up a little, springing back) plus trauma
+// shake (each shot adds trauma, which decays; the shake is proportional to it, and one shot adds most of the
+// way to full, so it rattles hard from the first shot and a sustained burst only tops it up a little), on smooth
+// noise so it rattles rather than jitters. Applied to the
+// camera only for the render and undone straight after, so the mouse look never inherits it.
+const KICK_PER_SHOT = 0.006, KICK_RETURN = 14;                       // rad, 1/s spring back
+const TRAUMA_PER_SHOT = 0.8, TRAUMA_DECAY = 2.2, SHAKE_ANGLE = 0.012; // 0..1, per s, rad at full trauma
+let shakeKick = 0, shakeTrauma = 0;
+const _shakeE = new THREE.Euler(0, 0, 0, 'YXZ'), _shakeQ = new THREE.Quaternion(), _camQ = new THREE.Quaternion();
+const wobble = (t, seed) => 0.6 * Math.sin(t * 37 + seed) + 0.4 * Math.sin(t * 61 + seed * 2.3); // smooth, ~-1..1
+function shakeCamera(dt, now) { // returns false when there's nothing to apply
+  shakeKick *= Math.exp(-KICK_RETURN * dt);
+  shakeTrauma = Math.max(shakeTrauma - TRAUMA_DECAY * dt, 0);
+  const s = SHAKE_ANGLE * shakeTrauma;
+  if (shakeKick < 1e-5 && s < 1e-5) return false;
+  _camQ.copy(camera.quaternion);
+  _shakeE.set(shakeKick + s * wobble(now, 1), s * wobble(now, 2), 0.5 * s * wobble(now, 3)); // pitch (up), yaw, roll
+  camera.quaternion.multiply(_shakeQ.setFromEuler(_shakeE));
+  camera.updateMatrixWorld();
+  return true;
+}
+
+// Stains: where a blob of thrown blood lands (some of each stream's), it leaves a splat. The pattern is a single
+// drop's impact: a wobbly round body, streaks breaking off
+// its rim (the crown's fingers), a droplet on each tip and satellites flung beyond, drawn as a signed-distance
+// shape on the floor's pixel grid (32 px/m). Faster impacts spread wider; a slanted one on the floor stretches along
+// its travel (width / length = sin(impact angle)) with a tail out the leading end. It spreads in DECAL_SPREAD s,
+// then dries over DECAL_DRY s, wet red to dark brown-red with the rim darkening first (the coffee-ring effect). On
+// a wall or column the stain runs: a drip grows down, fast then slowing, ending in a bead. Multiply-blended, so a
+// stain tints what's under it and is lit by whatever lights that: deep red under a light, unseen in the dark.
+const DECAL_MAX = 1536, DECAL_SPREAD = 0.06, DECAL_DRY = 8, DECAL_LIFE = 40; // decals (~10 s of full-auto), s, s, s
+const decalAttrs = { aSeed: 1, aBirth: 1, aStretch: 1, aKind: 1, aPixels: 2 };
+const decalGeo = new THREE.PlaneGeometry(2, 2); // faces +Z; per-instance scale makes it the stain's size
+for (const [name, n] of Object.entries(decalAttrs))
+  decalGeo.setAttribute(name, new THREE.InstancedBufferAttribute(new Float32Array(DECAL_MAX * n).fill(name === 'aBirth' ? -1 : 0), n).setUsage(THREE.DynamicDrawUsage));
+// The stain's shape: a wobbly round body, streaks breaking off its rim (the crown's fingers), a droplet on each tip
+// and satellites flung beyond, as a signed distance (< 0 inside) over −1…1. Costly (nine fingers, each a capsule and
+// two circles, blended), and it never changes, so DECAL_SHAPES variants are baked once into shapeRT (a
+// DECAL_SHAPE_GRID² grid of DECAL_SHAPE_RES px tiles) and each stain looks its shape up: the per-pixel work that's
+// left is its growth, a slanted impact's tail, a wall stain's drips and the drying.
+const DECAL_SHAPE_GRID = 4, DECAL_SHAPES = DECAL_SHAPE_GRID * DECAL_SHAPE_GRID, DECAL_SHAPE_RES = 128;
+const SPLAT_SDF = `
+    float hash1(float n) { return fract(sin(n) * 43758.5453); }
+    float smin(float a, float b, float k) { float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0); return mix(b, a, h) - k * h * (1.0 - h); }
+    float sdCapsule(vec2 p, vec2 a, vec2 b, float ra, float rb) {
+      vec2 pa = p - a, ba = b - a;
+      float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+      return length(pa - ba * h) - mix(ra, rb, h);
+    }
+    float splatShape(vec2 p, float seed) {
+      float ang = atan(p.y, p.x);
+      float d = length(p) - 0.25 * (1.0 + 0.15 * sin(ang * 3.0 + seed) + 0.1 * sin(ang * 7.0 + seed * 2.0));
+      for (int i = 0; i < 9; i++) {
+        float fi = float(i) + seed * 10.0;
+        float a = hash1(fi) * 6.283, len = 0.3 + 0.3 * hash1(fi + 1.0);
+        vec2 dir = vec2(cos(a), sin(a)), tip = dir * len;
+        d = smin(d, sdCapsule(p, vec2(0.0), tip, 0.08, 0.015), 0.05);
+        d = smin(d, length(p - tip) - 0.03 - 0.02 * hash1(fi + 2.0), 0.03);
+        d = min(d, length(p - dir * (len + 0.08 + 0.15 * hash1(fi + 3.0))) - 0.01 - 0.015 * hash1(fi + 4.0));
+      }
+      return d;
+    }`;
+const shapeRT = new THREE.WebGLRenderTarget(DECAL_SHAPE_GRID * DECAL_SHAPE_RES, DECAL_SHAPE_GRID * DECAL_SHAPE_RES, {
+  type: THREE.HalfFloatType, depthBuffer: false, // linear filtering: a distance field interpolates cleanly
+});
+{
+  const bake = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+    vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: SPLAT_SDF + `
+    void main() {
+      vec2 t = gl_FragCoord.xy / ${DECAL_SHAPE_RES}.0, tile = floor(t);
+      float k = tile.x + tile.y * ${DECAL_SHAPE_GRID}.0;
+      gl_FragColor = vec4(splatShape(fract(t) * 2.0 - 1.0, k * 6.13 + 1.7), 0.0, 0.0, 1.0);
+    }`,
+  }));
+  renderer.setRenderTarget(shapeRT);
+  renderer.render(bake, new THREE.Camera());
+  renderer.setRenderTarget(null);
+  bake.geometry.dispose(); bake.material.dispose();
+}
+const decalMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.MultiplyBlending, premultipliedAlpha: true,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4, // sits on the surface without fighting it
+  uniforms: { uTime: { value: 0 }, fogDensity: { value: 0 }, uShapes: { value: shapeRT.texture } },
+  vertexShader: `
+    attribute float aSeed, aBirth, aStretch, aKind;
+    attribute vec2 aPixels;
+    varying vec2 vUv, vPixels;
+    varying float vSeed, vBirth, vStretch, vKind, vDepth;
+    void main() {
+      vUv = uv; vPixels = aPixels; vSeed = aSeed; vBirth = aBirth; vStretch = aStretch; vKind = aKind;
+      vec4 mv = modelViewMatrix * instanceMatrix * vec4(position, 1.0);
+      vDepth = -mv.z;
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: SPLAT_SDF + `
+    uniform float uTime, fogDensity;
+    varying vec2 vUv, vPixels;
+    varying float vSeed, vBirth, vStretch, vKind, vDepth;
+    uniform sampler2D uShapes;
+    // the splat's distance field, baked (see shapeRT): variant floor(seed), mirrored by its fraction; far outside 1
+    float splat(vec2 p, float seed) {
+      if (max(abs(p.x), abs(p.y)) > 0.98) return 1.0;
+      float k = floor(seed);
+      if (fract(seed) > 0.5) p.x = -p.x;
+      vec2 uv = (vec2(mod(k, ${DECAL_SHAPE_GRID}.0), floor(k / ${DECAL_SHAPE_GRID}.0)) + p * 0.5 + 0.5) / ${DECAL_SHAPE_GRID}.0;
+      return texture2D(uShapes, uv).r;
+    }
+    void main() {
+      float age = max(uTime - vBirth, 0.0); // uTime is held between blood ticks, so a new stain can be younger
+      if (vBirth < 0.0 || age > ${DECAL_LIFE.toFixed(1)}) discard;
+      vec2 q = (floor(vUv * vPixels) + 0.5) / vPixels * 2.0 - 1.0;         // whole pixels, -1..1 over the quad
+      vec2 p = vKind > 0.5 ? vec2(q.x, (q.y - 2.0 / 3.0) * 3.0) : q;        // walls: a tall quad, the splat in its top third
+      float grow = 0.3 + 0.7 * smoothstep(0.0, ${DECAL_SPREAD.toFixed(3)}, age);
+      vec2 ps = p / grow;
+      float d = splat(ps, vSeed);
+      if (vStretch > 1.3) d = smin(d, sdCapsule(ps, vec2(0.0), vec2(0.85, 0.0), 0.12, 0.03), 0.06); // slanted impact's tail
+      if (vKind > 0.5) { // runs: a drip or two, growing down and slowing, a bead at the tip
+        for (int j = 0; j < 2; j++) {
+          float s = vSeed + float(j) * 7.0, x = (hash1(s) - 0.5) * 0.35, len = (0.5 + 1.3 * hash1(s + 1.0)) * (1.0 - exp(-age / (0.5 + hash1(s + 2.0)))); // up to ~1.8 splat radii
+          d = smin(d, sdCapsule(p, vec2(x, -0.1), vec2(x, -0.1 - len), 0.07, 0.035), 0.05);
+          d = min(d, length(p - vec2(x, -0.12 - len)) - 0.065);
+        }
+      }
+      if (d > 0.0) discard;
+      float dry = smoothstep(0.5, ${DECAL_DRY.toFixed(1)}, age);
+      vec3 tint = mix(vec3(0.62, 0.04, 0.06), vec3(0.28, 0.035, 0.035), dry);      // wet red → dried brown-red
+      tint *= step(-0.035, d) > 0.5 ? mix(0.85, 0.55, dry) : 1.0;                  // coffee ring: the rim darkens as it dries
+      float keep = (1.0 - smoothstep(${(DECAL_LIFE - 5).toFixed(1)}, ${DECAL_LIFE.toFixed(1)}, age)) * exp(-fogDensity * fogDensity * vDepth * vDepth);
+      gl_FragColor = vec4(mix(vec3(1.0), tint, keep), 1.0);                         // multiply: 1 = no change
+    }`,
+});
+const decals = new THREE.InstancedMesh(decalGeo, decalMat, DECAL_MAX);
+decals.frustumCulled = false;
+scene.add(decals);
+let decalNext = 0, bloodTime = 0;
+const _dm = new THREE.Matrix4(), _dq = new THREE.Quaternion(), _dq2 = new THREE.Quaternion(), _ds = new THREE.Vector3(), _dp = new THREE.Vector3();
+const DECAL_FLAT = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+// at: where it landed; normal: the wall's or column's outward face normal (null: the floor); v: its velocity
+// size (optional): the stain's radius outright, instead of from the drop's size and speed
+function spawnDecal(at, normal, v, dropSize, size = THREE.MathUtils.clamp(dropSize * (1.5 + 0.6 * v.length()), 0.06, 0.45)) {
+  const i = decalNext++ % DECAL_MAX, speed = v.length(); // size: m, harder impacts spread wider
+  let stretch = 1, kind = 0;
+  if (normal) { // a wall or column: round, with a drip; the tall quad's centre sits two splat radii below the splat
+    kind = 1;
+    _dq.setFromAxisAngle(AXIS_Y, Math.atan2(normal.x, normal.z));
+    _dp.copy(at).addScaledVector(normal, 0.01).setY(at.y - 2 * size);
+    _ds.set(size, 3 * size, 1);
+  } else { // the floor: stretched along its travel by 1 / sin(impact angle)
+    const h = Math.hypot(v.x, v.z);
+    stretch = THREE.MathUtils.clamp(speed / Math.max(Math.abs(v.y), 1e-3), 1, 3);
+    _dq.setFromAxisAngle(AXIS_Y, Math.atan2(-v.z, v.x)).multiply(DECAL_FLAT); // local X along the travel
+    if (h < 1e-3) _dq.copy(DECAL_FLAT);
+    _dp.copy(at).setY(at.y + 0.004); // the floor, or the platform's top
+    _ds.set(size * stretch, size, 1);
+  }
+  decals.setMatrixAt(i, _dm.compose(_dp, _dq, _ds));
+  decals.instanceMatrix.needsUpdate = true;
+  const set = (name, ...vals) => { const at_ = decalGeo.attributes[name]; at_.array.set(vals, i * at_.itemSize); at_.needsUpdate = true; };
+  set('aSeed', Math.floor(Math.random() * DECAL_SHAPES) + Math.random() * 0.999); // shape variant; fraction: mirror, drips
+  set('aBirth', bloodTime);
+  set('aStretch', stretch);
+  set('aKind', kind);
+  const px = Math.max(Math.round(2 * size * 32), 6); // the floor's pixel scale
+  set('aPixels', px * stretch, kind ? px * 3 : px);
+}
+
+// Blood, thrown like paint: a hit bursts FL_GOBS gobs up and out of the demon, fanned all round the wound,
+// simulated as a fluid with Position Based Fluids (Macklin & Müller 2013). A gob is a packet of particles at rest spacing FL_SPACING, launched front faster than back, so it stretches
+// as it flies. Each step, every particle's density (from its neighbours within FL_H) is pushed towards the rest
+// density both ways: crowded particles push apart, and ones at a thinning surface pull back in, which holds the
+// liquid together in gobs and ropes (cohesion standing in for surface tension) until a rope stretches past the
+// kernel's reach and snaps. XSPH viscosity pulls each particle's velocity towards its neighbours', so it moves as
+// thick paint, not water. Gravity arcs it down; a particle that touches the floor, a wall or a column is gone, and
+// some leave a stain.
+// Drawn as screen-space metaballs: each particle is splatted as a soft blob into a low-res field (one texel per
+// GOO_PIXEL screen px), summing weight, depth and a sphere normal; then a full-screen pass in the world draws liquid
+// wherever the summed weight passes GOO_THRESHOLD, so neighbouring particles merge into one surface and necks
+// vanish as they thin. It's shaded smoothly from the blended normal and writes the liquid's depth, so walls
+// and demons in front hide it. Lit like the demons (see bloodLight), fogged like the world.
+const FL_MAX = 4096, FL_SPACING = 0.018, FL_H = 2.2 * FL_SPACING, FL_NB = 48; // particles, m rest spacing, m kernel reach, neighbours kept
+const FL_STEP = 1 / 60, FL_ITERS = 3, FL_GRAVITY = 12, FL_LIFE = 2;  // s, solver passes per step, m/s², s
+const FL_GOB_START = 0.15, FL_WOUND_OUT = 0.15, FL_TOWARDS_YOU = 0.6; // m out from the wound each gob starts; m the
+// wound is pulled out of the body towards you (the hit sphere is rough); how much the burst leans towards you
+const FL_ELEVATION = [0.5, 1.2]; // rad, how steeply each gob is thrown up (from, to)
+const FL_MAX_MOVE = 0.1 * FL_SPACING; // m, most a particle's moved per solver pass
+const FL_VISCOSITY = 0.3, FL_COHESION = 0.4, FL_EPS = 50 * (0.065 / FL_H) ** 2; // XSPH share per step; most density deficit pulled
+// in; relaxation (the constraint gradients grow as 1/reach², so it does too: tuned at a 0.065 m reach)
+const FL_GOBS = 6, FL_GOB_R = 0.025, FL_GOB_LEN = 0.15, FL_SPREAD = 0.35, FL_DECAL_EVERY = 60; // per hit, m, m, back slower by, 1 in
+// Stains: where a gob's splat lands, one big stain about its size: the stain's body is a quarter of its size (its
+// fingers reach ~0.6), so STAIN_SHARE of the drawn splat's half-size makes the body as wide as the splat's solid
+// centre (SHEET_CORE) and the fingers reach its arms; every FL_DECAL_EVERY'th stray particle leaves a small satellite
+// drop (FL_DROP m)
+const STAIN_SHARE = 1.0, STAIN_MAX = 1.0, FL_DROP = 0.02; // a landed rope is long, so most reach STAIN_MAX
+const GOO_PIXEL = 4, GOO_SPLAT = 3 * FL_SPACING, GOO_THRESHOLD = 1.2; // screen px per field texel; m splat radius; liquid weight
+const BLOOD_METABALLS = false; // trying: the web billboards alone (the particles still fly, carrying them)
+const GOO_MIN_SPLAT = 1.5; // field texels: a far splat is drawn at least this big, or it'd fall between texels and flicker
+const FL_H2 = FL_H * FL_H, POLY6 = 315 / (64 * Math.PI * FL_H ** 9), SPIKY = -45 / (Math.PI * FL_H ** 6);
+const poly6 = (r2) => (r2 < FL_H2 ? POLY6 * (FL_H2 - r2) ** 3 : 0);
+let FL_RHO0 = 0; // rest density: a particle's neighbourhood packed at FL_SPACING
+for (let x = -3; x <= 3; x++) for (let y = -3; y <= 3; y++) for (let z = -3; z <= 3; z++) FL_RHO0 += poly6((x * x + y * y + z * z) * FL_SPACING ** 2);
+const SCORR_W = poly6((0.2 * FL_H) ** 2); // artificial pressure (keeps particles from clumping in pairs)
+const scorr = (r2) => -0.02 * (poly6(r2) / SCORR_W) ** 4;
+
+const flP = new Float32Array(FL_MAX * 3), flX = new Float32Array(FL_MAX * 3), flV = new Float32Array(FL_MAX * 3);
+const flSerial = new Uint32Array(FL_MAX); // which particle holds a slot (slots are reused): sheets check theirs is still there
+const flSheet = new Int32Array(FL_MAX).fill(-1); // the sheet a particle carries (as one of its ends), or -1
+let flSerialNext = 1;
+const flD = new Float32Array(FL_MAX * 3), flLam = new Float32Array(FL_MAX), flLife = new Float32Array(FL_MAX);
+const flAlive = new Uint8Array(FL_MAX), flAct = new Int32Array(FL_MAX);
+const flNb = new Int32Array(FL_MAX * FL_NB), flNbN = new Int32Array(FL_MAX);
+let flHead = 0, flN = 0, flAccum = 0;
+// neighbour search: a spatial hash of FL_H cells, counting-sorted each step
+const FL_CELLS = 8192, cellStart = new Int32Array(FL_CELLS + 1), cellOf = new Int32Array(FL_MAX), cellSorted = new Int32Array(FL_MAX);
+const cellFill = new Int32Array(FL_CELLS);
+const cellKey = (x, y, z) => (Math.imul(x, 73856093) ^ Math.imul(y, 19349663) ^ Math.imul(z, 83492791)) & (FL_CELLS - 1);
+const _seen = new Int32Array(27);
+function flNeighbours() {
+  cellStart.fill(0);
+  for (let a = 0; a < flN; a++) {
+    const i = flAct[a], k = i * 3;
+    cellStart[(cellOf[i] = cellKey(Math.floor(flX[k] / FL_H), Math.floor(flX[k + 1] / FL_H), Math.floor(flX[k + 2] / FL_H))) + 1]++;
+  }
+  for (let c = 1; c <= FL_CELLS; c++) cellStart[c] += cellStart[c - 1]; // cell c's particles: cellStart[c] … cellStart[c + 1]
+  cellFill.set(cellStart.subarray(0, FL_CELLS));
+  for (let a = 0; a < flN; a++) { const i = flAct[a]; cellSorted[cellFill[cellOf[i]]++] = i; }
+  for (let a = 0; a < flN; a++) {
+    const i = flAct[a], k = i * 3, x = flX[k], y = flX[k + 1], z = flX[k + 2];
+    const cx = Math.floor(x / FL_H), cy = Math.floor(y / FL_H), cz = Math.floor(z / FL_H);
+    let n = 0, seen = 0;
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+      const c = cellKey(cx + dx, cy + dy, cz + dz);
+      let dup = false;
+      for (let s = 0; s < seen; s++) if (_seen[s] === c) dup = true;
+      if (dup) continue; // two cells hashed to one bucket: it's already been searched
+      _seen[seen++] = c;
+      for (let s = cellStart[c], e = cellStart[c + 1]; s < e && n < FL_NB; s++) {
+        const j = cellSorted[s], m = j * 3;
+        if (j === i) continue;
+        const ex = x - flX[m], ey = y - flX[m + 1], ez = z - flX[m + 2];
+        if (ex * ex + ey * ey + ez * ez < FL_H2) flNb[i * FL_NB + n++] = j;
+      }
+    }
+    flNbN[i] = n;
+  }
+}
+function flStep(dt) {
+  flN = 0; // predict: gravity, then where each particle would go
+  for (let i = 0; i < FL_MAX; i++) {
+    if (!flAlive[i]) continue;
+    if ((flLife[i] -= dt) <= 0) { flAlive[i] = 0; continue; }
+    const k = i * 3;
+    flV[k + 1] -= FL_GRAVITY * dt;
+    for (let c = 0; c < 3; c++) flX[k + c] = flP[k + c] + flV[k + c] * dt;
+    flAct[flN++] = i;
+  }
+  if (!flN) return;
+  flNeighbours();
+  for (let it = 0; it < FL_ITERS; it++) {
+    for (let a = 0; a < flN; a++) { // each particle's density error, and how far that moves it per unit λ
+      const i = flAct[a], k = i * 3, nb = i * FL_NB;
+      let rho = poly6(0), gx = 0, gy = 0, gz = 0, g2 = 0;
+      for (let b = 0; b < flNbN[i]; b++) {
+        const m = flNb[nb + b] * 3, ex = flX[k] - flX[m], ey = flX[k + 1] - flX[m + 1], ez = flX[k + 2] - flX[m + 2];
+        const r2 = ex * ex + ey * ey + ez * ez, r = Math.sqrt(r2);
+        if (r >= FL_H || r < 1e-7) continue;
+        rho += poly6(r2);
+        const g = SPIKY * (FL_H - r) ** 2 / (r * FL_RHO0);
+        gx += g * ex; gy += g * ey; gz += g * ez; g2 += g * g * r2;
+      }
+      const C = Math.max(rho / FL_RHO0 - 1, -FL_COHESION); // > 0 crowded: push apart; < 0 sparse: pull together
+      flLam[i] = -C / (g2 + gx * gx + gy * gy + gz * gz + FL_EPS);
+    }
+    for (let a = 0; a < flN; a++) { // move each particle to cancel its and its neighbours' errors
+      const i = flAct[a], k = i * 3, nb = i * FL_NB;
+      let dx = 0, dy = 0, dz = 0;
+      for (let b = 0; b < flNbN[i]; b++) {
+        const j = flNb[nb + b], m = j * 3, ex = flX[k] - flX[m], ey = flX[k + 1] - flX[m + 1], ez = flX[k + 2] - flX[m + 2];
+        const r2 = ex * ex + ey * ey + ez * ez, r = Math.sqrt(r2);
+        if (r >= FL_H || r < 1e-7) continue;
+        const s = (flLam[i] + flLam[j] + scorr(r2)) * SPIKY * (FL_H - r) ** 2 / (r * FL_RHO0);
+        dx += s * ex; dy += s * ey; dz += s * ez;
+      }
+      const len = Math.hypot(dx, dy, dz), cap = Math.min(1, FL_MAX_MOVE / Math.max(len, 1e-9)); // overlapping gobs part gently
+      flD[k] = dx * cap; flD[k + 1] = dy * cap; flD[k + 2] = dz * cap;
+    }
+    for (let a = 0; a < flN; a++) { const k = flAct[a] * 3; flX[k] += flD[k]; flX[k + 1] += flD[k + 1]; flX[k + 2] += flD[k + 2]; }
+  }
+  for (let a = 0; a < flN; a++) { // velocity from how far it actually went
+    const k = flAct[a] * 3;
+    for (let c = 0; c < 3; c++) flV[k + c] = (flX[k + c] - flP[k + c]) / dt;
+  }
+  for (let a = 0; a < flN; a++) { // XSPH viscosity: towards the neighbourhood's (weighted) mean velocity
+    const i = flAct[a], k = i * 3, nb = i * FL_NB;
+    let w0 = poly6(0), vx = 0, vy = 0, vz = 0;
+    for (let b = 0; b < flNbN[i]; b++) {
+      const m = flNb[nb + b] * 3, ex = flX[k] - flX[m], ey = flX[k + 1] - flX[m + 1], ez = flX[k + 2] - flX[m + 2];
+      const w = poly6(ex * ex + ey * ey + ez * ez);
+      w0 += w; vx += w * (flV[m] - flV[k]); vy += w * (flV[m + 1] - flV[k + 1]); vz += w * (flV[m + 2] - flV[k + 2]);
+    }
+    flD[k] = FL_VISCOSITY * vx / w0; flD[k + 1] = FL_VISCOSITY * vy / w0; flD[k + 2] = FL_VISCOSITY * vz / w0;
+  }
+  for (let a = 0; a < flN; a++) {
+    const i = flAct[a], k = i * 3;
+    for (let c = 0; c < 3; c++) { flV[k + c] += flD[k + c]; flP[k + c] = flX[k + c]; }
+    _bp.fromArray(flP, k);
+    const surface = gooSurface();
+    if (!surface) continue;
+    const normal = surface === 'floor' ? null : _bn;
+    if (flSheet[i] >= 0) landSheet(flSheet[i], i, normal);
+    else if (i % FL_DECAL_EVERY === 0) spawnDecal(_bp, normal, _bv.fromArray(flV, k), FL_DROP);
+    flAlive[i] = 0; // it's on the surface now
+  }
+}
+
+const _t1 = new THREE.Vector3(), _t2 = new THREE.Vector3(), _gobDir = new THREE.Vector3(), _gobFrom = new THREE.Vector3();
+// A hit bursts up and out of the wound: FL_GOBS gobs fanned evenly round it (with a little jitter), each tipped up by
+// FL_ELEVATION, out of the entry wound and leaning back towards the shooter (so it's in front of the demon, not
+// hidden behind its body)
+function burstBlood({ entry, exit, dir }) {
+  bloodFresh = true; // show it now, not at the next tick
+  const s = FL_SPACING, from = _gobFrom.copy(entry).addScaledVector(dir, -FL_WOUND_OUT), turn = Math.random() * 2 * Math.PI;
+  for (let g = 0; g < FL_GOBS; g++) {
+    const az = turn + (g + 0.6 * (Math.random() - 0.5)) * 2 * Math.PI / FL_GOBS;
+    const el = THREE.MathUtils.lerp(FL_ELEVATION[0], FL_ELEVATION[1], Math.random());
+    const d = _gobDir.set(Math.cos(az) * Math.cos(el), Math.sin(el), Math.sin(az) * Math.cos(el)).addScaledVector(dir, -FL_TOWARDS_YOU).normalize();
+    const speed = 3.5 + Math.random() * 2.5, R = FL_GOB_R * (0.7 + 0.6 * Math.random()), L = FL_GOB_LEN, U = L + 2 * R;
+    _t1.set(0, 1, 0).cross(d).normalize(); _t2.copy(d).cross(_t1);
+    let front = -1, back = -1; // its first and last particles: a web sheet spans them
+    // a capsule of particles on the rest lattice along d, its back FL_GOB_START out from the wound (so the gobs
+    // start apart: launched touching, cohesion would fuse them into one lump)
+    for (let u = 0; u <= U; u += s) for (let a = -R; a <= R; a += s) for (let b = -R; b <= R; b += s) {
+      const along = Math.max(Math.abs(u - U / 2) - L / 2, 0);
+      if (along * along + a * a + b * b > R * R) continue;
+      const i = flHead++ % FL_MAX, k = i * 3, sp = speed * (1 - FL_SPREAD * u / U); // the back lags: it stretches
+      for (let c = 0; c < 3; c++) {
+        const e = c === 0 ? 'x' : c === 1 ? 'y' : 'z';
+        flP[k + c] = from[e] + d[e] * (FL_GOB_START + U - u) + _t1[e] * a + _t2[e] * b + (Math.random() - 0.5) * 0.002;
+        flV[k + c] = d[e] * sp + (Math.random() - 0.5) * 0.3;
+      }
+      flSerial[i] = flSerialNext++;
+      flSheet[i] = -1;
+      if (front < 0) front = i;
+      back = i;
+      flLife[i] = FL_LIFE;
+      flAlive[i] = 1;
+    }
+    if (front >= 0) addSheet(front, back);
+  }
+}
+const _bv = new THREE.Vector3(), _bp = new THREE.Vector3(), _bn = new THREE.Vector3();
+// What a blob at _bp hit: the floor, a wall (the arena's square) or a column (inside its face distance: snapped onto
+// that face, its normal in _bn); null if nothing
+function gooSurface() {
+  if (_bp.y <= 0.01) { _bp.y = 0; return 'floor'; }
+  const pd = platformDist(_bp.x, _bp.z);
+  if (pd < PLATFORM_APOTHEM && _bp.y <= PLATFORM_H) { // the platform: its top or a side, whichever it's nearer
+    if (PLATFORM_H - _bp.y < PLATFORM_APOTHEM - pd) { _bp.y = PLATFORM_H; return 'floor'; }
+    _bn.set(_pf.x, 0, _pf.y);
+    _bp.addScaledVector(_bn, PLATFORM_APOTHEM - pd);
+    return 'wall';
+  }
+  if (Math.abs(_bp.x) >= ARENA - 0.01 || Math.abs(_bp.z) >= ARENA - 0.01) {
+    const xWall = Math.abs(_bp.x) > Math.abs(_bp.z);
+    if (xWall) _bn.set(-Math.sign(_bp.x), 0, 0); else _bn.set(0, 0, -Math.sign(_bp.z));
+    _bp.addScaledVector(_bn, (xWall ? Math.abs(_bp.x) : Math.abs(_bp.z)) - ARENA);
+    return 'wall';
+  }
+  for (const c of COLUMNS) {
+    const dx = _bp.x - c.x, dz = _bp.z - c.y;
+    if (dx * dx + dz * dz < COLUMN_APOTHEM * COLUMN_APOTHEM) {
+      const a = Math.round(Math.atan2(dx, dz) / (Math.PI / 4)) * (Math.PI / 4);
+      _bn.set(Math.sin(a), 0, Math.cos(a));
+      _bp.addScaledVector(_bn, COLUMN_APOTHEM - (dx * _bn.x + dz * _bn.z));
+      return 'column';
+    }
+  }
+  return null;
+}
+
+// the field: one splat per live particle, summed (additive) into half-float targets: weight, weight × view depth,
+// weight × the splat's sphere normal (x, y in view space); and, in a second pass, weight × the light on it
+const fieldOpts = { type: THREE.HalfFloatType, depthBuffer: false, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter };
+const fieldRT = new THREE.WebGLRenderTarget(1, 1, fieldOpts), lightRT = new THREE.WebGLRenderTarget(1, 1, fieldOpts);
+const fieldScene = new THREE.Scene();
+const splatGeo = new THREE.InstancedBufferGeometry();
+splatGeo.setAttribute('corner', new THREE.Float32BufferAttribute([-1, -1, 1, -1, 1, 1, -1, 1], 2));
+splatGeo.setIndex([0, 1, 2, 0, 2, 3]);
+const splatPos = new THREE.InstancedBufferAttribute(new Float32Array(FL_MAX * 3), 3).setUsage(THREE.DynamicDrawUsage);
+const splatLight = new THREE.InstancedBufferAttribute(new Float32Array(FL_MAX * 3), 3).setUsage(THREE.DynamicDrawUsage);
+splatGeo.setAttribute('aPos', splatPos);
+splatGeo.setAttribute('aLight', splatLight);
+splatGeo.instanceCount = 0;
+const splats = new THREE.Mesh(splatGeo, new THREE.ShaderMaterial({
+  uniforms: { uRadius: { value: GOO_SPLAT }, uMinPerZ: { value: 0 } }, // uMinPerZ: GOO_MIN_SPLAT texels, in m per m away
+  vertexShader: `
+    attribute vec2 corner;
+    attribute vec3 aPos, aLight;
+    uniform float uRadius, uMinPerZ;
+    varying vec2 vQ;
+    varying float vZ;
+    varying vec3 vLight;
+    void main() {
+      vec4 c = viewMatrix * vec4(aPos, 1.0);
+      vQ = corner; vZ = -c.z; vLight = aLight;
+      gl_Position = projectionMatrix * (c + vec4(corner * max(uRadius, uMinPerZ * vZ), 0.0, 0.0)); // a billboard
+    }`,
+  fragmentShader: `
+    varying vec2 vQ;
+    varying float vZ;
+    varying vec3 vLight;
+    void main() {
+      float r2 = dot(vQ, vQ);
+      if (r2 > 1.0) discard;
+      float w = (1.0 - r2) * (1.0 - r2);
+    #ifdef LIGHT
+      gl_FragColor = vec4(w * vLight, 0.0);
+    #else
+      gl_FragColor = vec4(w, w * vZ, w * vQ);
+    #endif
+    }`,
+  blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+  depthTest: false, depthWrite: false, transparent: true,
+}));
+splats.frustumCulled = false;
+fieldScene.add(splats);
+const splatMat = splats.material, splatLightMat = splatMat.clone();
+splatLightMat.uniforms = splatMat.uniforms;
+splatLightMat.defines = { LIGHT: '' };
+// the liquid: a full-screen pass in the world, drawn wherever the field is over the threshold, at the field's depth
+const srgb = (r, g, b) => new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace);
+const gooMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uField: { value: fieldRT.texture }, uLight: { value: lightRT.texture }, uProj: { value: camera.projectionMatrix }, uRes: { value: new THREE.Vector2(1, 1) }, uThreshold: { value: GOO_THRESHOLD },
+    uBody: { value: srgb(0.6, 0.02, 0.05) }, // albedo
+    uFogColor: { value: new THREE.Color() }, uFogDensity: { value: 0 },
+  },
+  vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D uField, uLight;
+    uniform mat4 uProj;
+    uniform vec2 uRes;
+    uniform float uThreshold, uFogDensity;
+    uniform vec3 uBody, uFogColor;
+    void main() {
+      ivec2 size = textureSize(uField, 0);
+      vec4 f = texelFetch(uField, ivec2(gl_FragCoord.xy / uRes * vec2(size)), 0);
+      if (f.r < uThreshold) discard;
+      float z = f.g / f.r; // the liquid's view depth here (its splats', weighted)
+      ivec2 at = ivec2(gl_FragCoord.xy / uRes * vec2(size));
+      vec2 nxy = f.ba / f.r * 1.6;
+      vec3 n = vec3(nxy, sqrt(max(1.0 - dot(nxy, nxy), 0.0)));
+      vec3 light = texelFetch(uLight, at, 0).rgb / f.r; // what the demon's lights put on it (see bloodLight)
+      // smooth shading, lit like the demon: a soft diffuse falloff from above, plus what a wet surface reflects (the
+      // light itself: a tight highlight towards a key light above and to the left; at the grazing edges Fresnel mostly
+      // mirrors the dark room, so only a trace of the light)
+      vec3 nn = normalize(n), key = normalize(vec3(-0.4, 0.6, 0.7));
+      float diffuse = 0.45 + 0.55 * max(dot(nn, key), 0.0);
+      float fresnel = 0.04 + 0.96 * pow(1.0 - nn.z, 5.0);
+      float spec = pow(max(dot(nn, normalize(key + vec3(0.0, 0.0, 1.0))), 0.0), 60.0);
+      vec3 col = uBody * light * diffuse * (1.0 - fresnel) + light * (0.03 * fresnel + 0.5 * spec);
+      vec4 c = uProj * vec4(0.0, 0.0, -z, 1.0);
+      gl_FragDepth = c.z / c.w * 0.5 + 0.5;
+      gl_FragColor = vec4(mix(col, uFogColor, 1.0 - exp(-uFogDensity * uFogDensity * z * z)), 1.0);
+    }`,
+});
+const gooQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), gooMat);
+gooQuad.frustumCulled = false;
+gooQuad.visible = false;
+scene.add(gooQuad);
+
+// Webs: a hybrid of the metaballs and billboards. Each gob also carries a flat sheet of paint, a billboard pinned to
+// its first and last particles (so it spans the rope and stretches as it does), patterned with a cellular-noise web:
+// Worley F2 − F1 (second-nearest feature point's distance minus the nearest's) is zero on the borders between cells,
+// so its ridges are one connected network of filaments round empty pockets; F3 − F1 is small where three cells meet,
+// which knots the filaments with fat blobs; and a solid patch sits at the centre (which drains into them, below). The web
+// thins towards the sheet's rim and as it ages, so the film tears into webbing and vanishes. Its uv
+// stretches with the sheet, so the web does too. Drawn on the blood's pixel grid, lit like the metaballs.
+const SHEET_MAX = 128, SHEET_LIFE = 0.6, SHEET_WIDTH = 0.8, SHEET_PAD = 0.05; // sheets, s, width / length, m beyond the ends
+const SHEET_SCALE = 4;
+const SHEET_LIGHT_MAX = 4; // the most light a sheet takes: generous (its dark red stays out of bloom), only stops extremes // how much bigger than its rope a sheet is drawn
+const SHEET_CURL = 1.2, SHEET_CUP = 1.2; // the splat opens like a flower: the bottom hangs at the wound and it curves
+// out towards you, more the higher it goes (this many half-sizes nearer at the top) and at the upper sides; its shading
+// follows that bend, exaggerated by SHEET_CUP
+const SHEET_GRID = 8; // quads per side the sheet is split into, so it can bend
+const SHEET_THIN = 0.06, SHEET_THICK = 0.35; // paint thickness (web cells) from translucent scarlet to near-black maroon
+const SHEET_TRANSLUCENT = 0.1, SHEET_GLOSS = 120, SHEET_GLINT = 0.9; // light through thin paint; glint tightness, strength
+const SHEET_RELIEF = 1.5; // how tall the paint stands (in blood pixels per unit height): more, the deeper its shading
+const SHEET_EDGE = 0.75; // how far in from every contour the paint rises (share of a shape's depth: 1 is its middle)
+const SHEET_CELLS = 3.6, SHEET_WEB = 0.17; // web cells across the sheet's half-size; filament half-width (in cells), new
+const SHEET_WARP = 0.6, SHEET_LUMPS = 0.6; // how far (in cells) smooth noise bends the web; how much strands swell and pinch
+const SHEET_FLOW = 3, SHEET_SPREAD = 0.5; // how fast (noise units/s) the warp flows, so the arms writhe; how far (in
+// cells, over its life) the pattern streams outwards from the centre
+const SHEET_GAPS = 0.3; // how much of the web a slow noise removes near the centre, breaking closed cells into separate
+// branching arms; it eases off outwards (gone by SHEET_WEB_OUT of the radius), so the edge is a connected web
+const SHEET_WEB_OUT = 0.45;
+const SHEET_KNOT = 0.5, SHEET_CORE = 0.4; // where filaments meet, a blob (F3 − F1 under this, in cells); solid centre (share of the sheet)
+// The centre patch drains into the web: it shrinks to nothing by SHEET_CORE_GONE of its life, and the paint it
+// loses fattens the strands and knots round it (most near the centre, tapering out), which then thin with the rest
+const SHEET_CORE_GONE = 0.6, SHEET_FEED = 1.5; // share of its life the patch lasts; most the arms near it thicken by
+const shA = new Int32Array(SHEET_MAX), shB = new Int32Array(SHEET_MAX), shSA = new Uint32Array(SHEET_MAX), shSB = new Uint32Array(SHEET_MAX);
+const shBirth = new Float32Array(SHEET_MAX), shSeed = new Float32Array(SHEET_MAX), shAlive = new Uint8Array(SHEET_MAX);
+const shStained = new Uint8Array(SHEET_MAX); // its gob has landed and left its stain (it may have faded from the air long before)
+let shHead = 0;
+function addSheet(a, b) {
+  const i = shHead++ % SHEET_MAX;
+  shA[i] = a; shB[i] = b; shSA[i] = flSerial[a]; shSB[i] = flSerial[b];
+  shBirth[i] = bloodTime; shSeed[i] = Math.random() * 100; shAlive[i] = 1; shStained[i] = 0;
+  flSheet[a] = flSheet[b] = i;
+}
+// One of sheet sh's end particles (i) has landed, at _bp (normal: the wall's, or null for the floor): the splat lands
+// with it, leaving one big stain its size, and is gone. Most gobs are still in the air after the sheet has faded out
+// (SHEET_LIFE), so this goes by the gob, not by whether its sheet is still drawn.
+function landSheet(sh, i, normal) {
+  flSheet[i] = -1;
+  if (shStained[sh] || (shA[sh] !== i && shB[sh] !== i) || flSerial[shA[sh]] !== shSA[sh] || flSerial[shB[sh]] !== shSB[sh]) return;
+  const j = shA[sh] === i ? shB[sh] : shA[sh], ki = i * 3, kj = j * 3;
+  flSheet[j] = -1;
+  shStained[sh] = 1;
+  shAlive[sh] = 0;
+  const len = Math.hypot(flP[kj] - flP[ki], flP[kj + 1] - flP[ki + 1], flP[kj + 2] - flP[ki + 2]);
+  const half = (0.5 * len + SHEET_PAD) * SHEET_SCALE; // as the sheet's drawn (see sheetMat)
+  const size = THREE.MathUtils.clamp(STAIN_SHARE * half, 0.15, STAIN_MAX);
+  spawnDecal(_bp, normal, _bv.fromArray(flV, ki), 0, size);
+}
+const sheetGeo = new THREE.InstancedBufferGeometry();
+{ // a grid, not one quad, so the sheet can bend (see SHEET_CURL)
+  const N = SHEET_GRID, corners = [], index = [];
+  for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) corners.push(i / N * 2 - 1, j / N * 2 - 1);
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const a = j * (N + 1) + i;
+    index.push(a, a + 1, a + N + 2, a, a + N + 2, a + N + 1);
+  }
+  sheetGeo.setAttribute('corner', new THREE.Float32BufferAttribute(corners, 2));
+  sheetGeo.setIndex(index);
+}
+const sheetAttr = (name, n) => {
+  const a = new THREE.InstancedBufferAttribute(new Float32Array(SHEET_MAX * n), n).setUsage(THREE.DynamicDrawUsage);
+  sheetGeo.setAttribute(name, a);
+  return a;
+};
+const shAttrA = sheetAttr('aA', 3), shAttrB = sheetAttr('aB', 3), shAttrLight = sheetAttr('aLight', 3), shAttrLightDir = sheetAttr('aLightDir', 3);
+const shAttrSeed = sheetAttr('aSeed', 1), shAttrAge = sheetAttr('aAge', 1);
+sheetGeo.instanceCount = 0;
+const sheetMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uThin: { value: srgb(0.7, 0.03, 0.05) }, uThick: { value: srgb(0.25, 0.0, 0.02) }, // albedo: thin film, thick paint
+    uFogColor: gooMat.uniforms.uFogColor, uFogDensity: gooMat.uniforms.uFogDensity,
+  },
+  vertexShader: `
+    attribute vec2 corner;
+    attribute vec3 aA, aB, aLight, aLightDir;
+    attribute float aSeed, aAge;
+    varying vec2 vUv, vS;
+    varying vec3 vLight, vLightDir;
+    varying float vSeed, vAge, vZ;
+    void main() {
+      vLightDir = normalize(mat3(viewMatrix) * aLightDir); // view space: x right, y up, z towards you
+      vec4 a = viewMatrix * vec4(aA, 1.0), b = viewMatrix * vec4(aB, 1.0), c = (a + b) * 0.5;
+      vec2 ax = b.xy - a.xy;
+      float len = length(ax);
+      vec2 dir = len > 1e-4 ? ax / len : vec2(1.0, 0.0), nrm = vec2(-dir.y, dir.x);
+      vec2 half_ = vec2(0.5 * len + ${SHEET_PAD.toFixed(3)}, 0.5 * len * ${SHEET_WIDTH.toFixed(2)} + ${SHEET_PAD.toFixed(3)}) * ${SHEET_SCALE.toFixed(1)};
+      vec2 off = dir * corner.x * half_.x + nrm * corner.y * half_.y; // view space: x right, y up
+      float size = length(half_);
+      vS = off / size; // where on the splat, upright (y up) whichever way its rope runs
+      c.xy += off;
+      // the bend: flat where it hangs at the bottom, curving towards you faster the higher it goes, and the upper
+      // sides curling in too, like a flower's petals
+      float up = clamp(vS.y * 0.5 + 0.5, 0.0, 1.0);
+      c.z += ${SHEET_CURL.toFixed(2)} * size * (up * up + 0.6 * vS.x * vS.x * up);
+      vUv = corner; vSeed = aSeed; vAge = aAge; vZ = -c.z;
+      vLight = min(aLight, vec3(${SHEET_LIGHT_MAX.toFixed(1)})); // capped, as for the casings (see CASE_LIGHT_MAX)
+      gl_Position = projectionMatrix * c; // facing you, along the rope as you see it
+    }`,
+  fragmentShader: `
+    uniform vec3 uThin, uThick, uFogColor;
+    uniform float uFogDensity;
+    varying vec2 vUv, vS;
+    varying vec3 vLight, vLightDir;
+    varying float vSeed, vAge, vZ;
+    vec2 hash2(vec2 p) { return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
+    float vnoise(vec2 p) { // smooth value noise, about -1..1
+      vec2 i = floor(p), f = fract(p), u = f * f * (3.0 - 2.0 * f);
+      float a = hash2(i).x, b = hash2(i + vec2(1.0, 0.0)).x, c = hash2(i + vec2(0.0, 1.0)).x, d = hash2(i + vec2(1.0)).x;
+      return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 2.0 - 1.0;
+    }
+    float fbm(vec2 p) { return vnoise(p) * 0.65 + vnoise(p * 2.3 + 7.1) * 0.35; }
+    vec3 worley(vec2 p) { // distances to the nearest three feature points: F1, F2, F3
+      vec2 i = floor(p), f = fract(p);
+      float d1 = 8.0, d2 = 8.0, d3 = 8.0;
+      for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+        vec2 o = vec2(x, y), r = o + hash2(i + o) - f;
+        float d = dot(r, r);
+        if (d < d1) { d3 = d2; d2 = d1; d1 = d; } else if (d < d2) { d3 = d2; d2 = d; } else if (d < d3) d3 = d;
+      }
+      return sqrt(vec3(d1, d2, d3));
+    }
+    // how far inside the paint a point of the sheet is: > 0 is paint, about 1 deep in a shape's middle
+    float paint(vec2 uv, out float thick) {
+      float r2 = dot(uv, uv);
+      thick = 0.0;
+      if (r2 > 1.0) return -1.0;
+      // paint (> 0) on three kinds of shape, all thinning towards the rim and as the sheet ages: filaments on the
+      // cell borders (F2 − F1 small), fat knots where three cells meet (F3 − F1 small), and a solid patch at the
+      // centre whose edge wobbles with the cells
+      float thin = max((1.0 - vAge / ${SHEET_LIFE.toFixed(2)}) * (1.0 - r2), 1e-4);
+      // Worley's cell borders are straight lines; bending its coordinates with smooth noise first (a domain warp)
+      // curves them into wandering strands, and more noise swells and pinches each strand along its length
+      vec2 q = uv * ${SHEET_CELLS.toFixed(1)} + vSeed;
+      // the warp flows with age, so the arms writhe, and the pattern streams outwards a little, as if flung
+      float flow = vAge * ${SHEET_FLOW.toFixed(1)};
+      q -= uv * ${SHEET_SPREAD.toFixed(2)} * ${SHEET_CELLS.toFixed(1)} * vAge / ${SHEET_LIFE.toFixed(2)};
+      q += ${SHEET_WARP.toFixed(2)} * vec2(fbm(q * 0.6 + vec2(flow, 0.0)), fbm(q * 0.6 + 31.7 - vec2(0.0, flow)));
+      vec3 F = worley(q);
+      float lumps = (1.0 + ${SHEET_LUMPS.toFixed(2)} * vnoise(q * 2.7 + 13.3))
+        * smoothstep(-0.2, 0.25, vnoise(q * 0.8 + 57.3) + 0.5 // some strands gone: arms near the centre, web outside
+          - ${SHEET_GAPS.toFixed(2)} * (1.0 - smoothstep(0.2, ${SHEET_WEB_OUT.toFixed(2)}, sqrt(r2))));
+      // the patch shrinks (its edge wobbling with the cells); what it loses feeds the arms round the centre
+      float t = vAge / ${SHEET_LIFE.toFixed(2)}, rr = sqrt(r2);
+      float patchR = ${SHEET_CORE.toFixed(2)} * (0.75 + 0.5 * F.x);
+      float left = 1.0 - smoothstep(0.0, ${SHEET_CORE_GONE.toFixed(2)}, t); // share of the patch's radius still there
+      float feed = 1.0 + ${SHEET_FEED.toFixed(1)} * (1.0 - left) * clamp(1.0 - rr / (1.8 * patchR), 0.0, 1.0);
+      float wStrand = ${SHEET_WEB.toFixed(2)} * thin * lumps * feed, wKnot = ${SHEET_KNOT.toFixed(2)} * thin * feed;
+      float wCore = patchR * left * ${SHEET_CELLS.toFixed(1)}; // all in web cells
+      float strand = 1.0 - (F.y - F.x) / wStrand, knot = 1.0 - (F.z - F.x) / wKnot, core = 1.0 - rr / max(patchR * left, 1e-4);
+      thick = max(max(strand * wStrand, knot * wKnot), core * wCore);
+      return max(strand, max(knot, core));
+    }
+    // the paint's height there: flat at the core, rising gradually towards the edges (paint pooled into a raised
+    // rim), then dropping off at the contour itself (thin strands are all rim)
+    float height(float inside) {
+      float e = clamp(inside / ${SHEET_EDGE.toFixed(2)}, 0.0, 1.0); // 0 on the contour, 1 in the flat core
+      return (0.35 + 0.65 * (1.0 - smoothstep(0.1, 1.0, e))) * smoothstep(0.0, 0.12, e);
+    }
+    void main() {
+      // the uv at the centre of this fragment's ${GOO_PIXEL} px block: the blood's chunky pixels
+      vec2 dp = (floor(gl_FragCoord.xy / ${GOO_PIXEL.toFixed(1)}) + 0.5) * ${GOO_PIXEL.toFixed(1)} - gl_FragCoord.xy;
+      vec2 uv = vUv + dFdx(vUv) * dp.x + dFdy(vUv) * dp.y;
+      vec2 ex = dFdx(vUv) * ${GOO_PIXEL.toFixed(1)}, ey = dFdy(vUv) * ${GOO_PIXEL.toFixed(1)}; // one blood pixel (before any discard)
+      float thick, unused;
+      float inside = paint(uv, thick);
+      if (inside <= 0.0) discard;
+      // lit from the main light's direction: the slope comes from the height one blood pixel to the right and up
+      // (screen x, y, which are view space's), so the rim facing the light is bright and the far side shadowed
+      float h = height(inside);
+      float gx = height(paint(uv + ex, unused)) - h, gy = height(paint(uv + ey, unused)) - h;
+      vec3 nPaint = normalize(vec3(-gx, -gy, 1.0 / ${SHEET_RELIEF.toFixed(1)}));
+      // the flower's cup: flat where it hangs at the bottom, curving towards you higher up (and a little at the
+      // sides up there), so it faces further down and out the higher it goes; the paint's own relief rides on it
+      float up = clamp(vS.y * 0.5 + 0.5, 0.0, 1.0);
+      float bend = ${(SHEET_CURL * SHEET_CUP).toFixed(2)}; // the bend's slope (from its height above), exaggerated
+      vec3 nCup = normalize(vec3(-bend * 1.2 * vS.x * up, -bend * (up + 0.3 * vS.x * vS.x), 1.0));
+      vec3 n = normalize(vec3(nPaint.xy + nCup.xy, nPaint.z * nCup.z));
+      // wet blood: thick paint is near-black maroon, thin films and strands translucent scarlet (light passing
+      // through them, whichever way they face); a liquid's sharp glint of the light itself, landing on whole blood
+      // pixels; and Fresnel: where the surface turns away from you it mirrors more, a faint sheen of the room's light
+      float t = smoothstep(${SHEET_THIN.toFixed(2)}, ${SHEET_THICK.toFixed(2)}, thick); // 0 thin, 1 thick
+      vec3 albedo = mix(uThin, uThick, t);
+      float diffuse = max(dot(n, vLightDir) * 0.6 + 0.4, 0.0); // wrapped, so the unlit side isn't black
+      float fresnel = pow(1.0 - clamp(n.z, 0.0, 1.0), 4.0);
+      float spec = pow(max(dot(n, normalize(vLightDir + vec3(0.0, 0.0, 1.0))), 0.0), ${SHEET_GLOSS.toFixed(1)});
+      float glint = smoothstep(0.3, 0.6, spec) * (0.4 + 0.6 * h); // on or off per blood pixel, mostly on the rims
+      vec3 lit = min(vLight, vec3(2.0)); // what a highlight reflects (capped, so a glint doesn't blow out the bloom)
+      vec3 col = albedo * vLight * (0.25 + 0.75 * diffuse) * (1.0 - 0.5 * fresnel)
+        + uThin * vLight * ${SHEET_TRANSLUCENT.toFixed(2)} * (1.0 - t) // light through the thin parts
+        + lit * (${SHEET_GLINT.toFixed(2)} * glint + 0.04 * fresnel);
+      gl_FragColor = vec4(mix(col, uFogColor, 1.0 - exp(-uFogDensity * uFogDensity * vZ * vZ)), 1.0);
+    }`,
+});
+const sheets = new THREE.Mesh(sheetGeo, sheetMat);
+sheets.frustumCulled = false;
+scene.add(sheets);
+// Each frame: drop sheets whose gob's ends have landed (or whose slots were reused), and place the rest
+function updateSheets() {
+  let m = 0;
+  for (let i = 0; i < SHEET_MAX; i++) {
+    if (!shAlive[i]) continue;
+    const a = shA[i], b = shB[i], age = bloodTime - shBirth[i];
+    if (age > SHEET_LIFE || !flAlive[a] || !flAlive[b] || flSerial[a] !== shSA[i] || flSerial[b] !== shSB[i]) { shAlive[i] = 0; continue; }
+    const ka = a * 3, kb = b * 3;
+    shAttrA.array.set(flP.subarray(ka, ka + 3), m * 3);
+    shAttrB.array.set(flP.subarray(kb, kb + 3), m * 3);
+    bloodLight((flP[ka] + flP[kb]) / 2, (flP[ka + 1] + flP[kb + 1]) / 2, (flP[ka + 2] + flP[kb + 2]) / 2, shAttrLight.array, m * 3, shAttrLightDir.array);
+    shAttrSeed.array[m] = shSeed[i];
+    shAttrAge.array[m++] = age;
+  }
+  sheetGeo.instanceCount = m;
+  for (const at of [shAttrA, shAttrB, shAttrLight, shAttrLightDir, shAttrSeed, shAttrAge]) at.needsUpdate = true;
+}
+
+// Stepped like the demons' animation (opts.stepped, the N key): the fluid still simulates at FL_STEP, but what you
+// see of the blood (the splats' places and ages, the stains' spreading and drips) only changes BLOOD_FPS times a
+// second, held in between. One shared clock that subtracts its step, so it averages exactly BLOOD_FPS on any display
+// and every splat changes on the same frames; a new burst shows at once rather than waiting for the next tick.
+const BLOOD_FPS = Infinity; // every frame (the display's max); a number steps it, e.g. 12 like the demons
+let bloodTick = 0, bloodFresh = false;
+function updateBlood(dt) {
+  bloodTime += dt;
+  decalMat.uniforms.fogDensity.value = scene.fog.density;
+  gooMat.uniforms.uFogColor.value.copy(scene.fog.color);
+  gooMat.uniforms.uFogDensity.value = scene.fog.density;
+  flAccum = Math.min(flAccum + dt, 2 * FL_STEP); // fixed steps; a long frame drops time rather than piling up steps
+  for (; flAccum >= FL_STEP; flAccum -= FL_STEP) flStep(FL_STEP);
+  bloodTick += dt;
+  if (opts.stepped && bloodTick < 1 / BLOOD_FPS && !bloodFresh) return; // hold what's shown
+  bloodTick = opts.stepped && !bloodFresh ? Math.min(bloodTick - 1 / BLOOD_FPS, 1 / BLOOD_FPS) : 0;
+  bloodFresh = false;
+  decalMat.uniforms.uTime.value = bloodTime;
+  let n = 0;
+  for (let i = 0; i < FL_MAX; i++) {
+    if (!flAlive[i]) continue;
+    const k = i * 3;
+    splatPos.array.set(flP.subarray(k, k + 3), 3 * n);
+    bloodLight(flP[k], flP[k + 1], flP[k + 2], splatLight.array, 3 * n++);
+  }
+  splatGeo.instanceCount = n;
+  splatPos.needsUpdate = splatLight.needsUpdate = true;
+  gooQuad.visible = BLOOD_METABALLS && n > 0;
+  updateSheets();
+}
+// The light on a blood particle, as the demons get it: the sprite stage's lights (the pools near you and the muzzle
+// flashes) and its dim environment, evaluated like three.js does for a matte surface (radiance per unit albedo:
+// intensity × falloff × cos / π), with no normal (an average cos of 0.6). The ceiling's area lights count as small
+// down-facing emitters (intensity × area × the cosine below them). No occlusion, like the sprites.
+const stageLights = [];
+stage.traverse((o) => o.isLight && stageLights.push(o));
+// dirOut (optional): the main direction the light comes from, each light's unit direction weighted by its brightness
+// (straight up when nothing's lit)
+function bloodLight(x, y, z, out, at, dirOut) {
+  let r = stage.environmentIntensity, g = r, b = r, lx = 0, ly = 1e-4, lz = 0;
+  for (const l of stageLights) {
+    if (!(l.intensity > 0)) continue;
+    let e = l.intensity * 0.6 / Math.PI, dx = l.position.x, dy = l.position.y, dz = l.position.z; // a sun: from its position
+    if (!l.isDirectionalLight) {
+      dx -= x; dy -= y; dz -= z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      e /= Math.max(d2, 0.01);
+      if (l.isRectAreaLight) e *= l.width * l.height * Math.max(dy, 0) / Math.sqrt(d2);
+      else if (l.distance > 0) { const q = d2 / (l.distance * l.distance); e *= Math.max(1 - q * q, 0) ** 2; }
+    }
+    r += e * l.color.r; g += e * l.color.g; b += e * l.color.b;
+    const w = e * (l.color.r + l.color.g + l.color.b) / Math.max(Math.hypot(dx, dy, dz), 1e-6);
+    lx += dx * w; ly += dy * w; lz += dz * w;
+  }
+  out[at] = r; out[at + 1] = g; out[at + 2] = b;
+  if (dirOut) { const n = Math.hypot(lx, ly, lz); dirOut[at] = lx / n; dirOut[at + 1] = ly / n; dirOut[at + 2] = lz / n; }
+}
+// Splat the particles into the field, from the camera as it's about to render (shake included)
+const _clear = new THREE.Color();
+function drawBloodField() {
+  if (!gooQuad.visible) return;
+  const W = renderer.domElement.width, H = renderer.domElement.height;
+  fieldRT.setSize(Math.ceil(W / GOO_PIXEL), Math.ceil(H / GOO_PIXEL));
+  lightRT.setSize(fieldRT.width, fieldRT.height);
+  splatMat.uniforms.uMinPerZ.value = GOO_MIN_SPLAT * 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / fieldRT.height;
+  gooMat.uniforms.uRes.value.set(W, H);
+  const target = renderer.getRenderTarget(), alpha = renderer.getClearAlpha();
+  renderer.getClearColor(_clear);
+  renderer.setClearColor(0x000000, 0);
+  for (const [rt, mat] of [[fieldRT, splatMat], [lightRT, splatLightMat]]) {
+    splats.material = mat;
+    renderer.setRenderTarget(rt);
+    renderer.render(fieldScene, camera);
+  }
+  renderer.setRenderTarget(target);
+  renderer.setClearColor(_clear, alpha);
+}
+
+// Bullet holes: a shot that misses the demons leaves a hole where it hits the arena (rayWorld). Each is a small lit
+// quad on the surface, drawn on its panel's pixel grid (32 px/m; HOLE_PX px square, centred on a pixel): a ragged
+// black hole, a rim of bare steel pushed up round it (metal, glossy: it catches the lights and muzzle flashes, so it
+// glints in the dark rather than glowing), and a dull scorch ring, dithered, fading into the panel. A ring of
+// HOLE_MAX, oldest replaced.
+const HOLE_MAX = 512, HOLE_PX = 9; // holes; px across a hole's quad (odd, so the hole sits on a pixel)
+const HOLE_SIZE = HOLE_PX / 32; // m
+const holeGeo = new THREE.PlaneGeometry(HOLE_SIZE, HOLE_SIZE); // faces +Z
+const holeSeed = new THREE.InstancedBufferAttribute(new Float32Array(HOLE_MAX), 1);
+holeGeo.setAttribute('aSeed', holeSeed);
+const holeMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff, transparent: true, depthWrite: false,
+  polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+});
+holeMat.onBeforeCompile = (shader) => {
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nattribute float aSeed;\nvarying vec2 vHoleUv;\nvarying float vHoleSeed;')
+    .replace('#include <uv_vertex>', '#include <uv_vertex>\n  vHoleUv = uv; vHoleSeed = aSeed;');
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', `#include <common>
+varying vec2 vHoleUv;
+varying float vHoleSeed;
+float holeHash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233)) + vHoleSeed) * 43758.5453); }`)
+    .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
+  {
+    vec2 px = floor(vHoleUv * ${HOLE_PX.toFixed(1)}); // the panel's pixels
+    vec2 c = px - ${((HOLE_PX - 1) / 2).toFixed(1)};
+    float r = length(c) + 0.5 * (holeHash(px) - 0.5); // ragged
+    float dith = mod(px.x + px.y, 2.0);
+    if (r < 1.0) {        // the hole: nothing comes back out of it
+      diffuseColor = vec4(0.0, 0.0, 0.0, 1.0); metalnessFactor = 0.0; roughnessFactor = 1.0;
+    } else if (r < 2.0) { // the rim: bare steel pushed up, bright and glossy (a pixel here and there torn away)
+      if (holeHash(px + 7.0) < 0.15) discard;
+      diffuseColor = vec4(vec3(0.75), 1.0); metalnessFactor = 1.0; roughnessFactor = 0.25;
+    } else if (r < 3.4) { // the scorch: dull, dark, dithered as it fades out
+      if ((r > 2.7 && dith > 0.5) || holeHash(px + 13.0) < 0.2) discard;
+      diffuseColor = vec4(vec3(0.04, 0.035, 0.03), 0.85); metalnessFactor = 0.0; roughnessFactor = 0.9;
+    } else discard;
+  }`);
+};
+const holes = new THREE.InstancedMesh(holeGeo, holeMat, HOLE_MAX);
+holes.count = 0;
+holes.frustumCulled = false;
+scene.add(holes);
+let holeNext = 0;
+const _hm = new THREE.Matrix4(), _hq = new THREE.Quaternion(), _hz = new THREE.Vector3(0, 0, 1), _hp = new THREE.Vector3();
+function spawnHole(at, normal) {
+  const i = holeNext++ % HOLE_MAX;
+  // centred on a panel pixel (the grid is 1/32 m on every axis-aligned surface), a hair off the surface
+  _hp.set(...[at.x, at.y, at.z].map((v, a) => (normal.getComponent(a) !== 0 ? v : (Math.floor(v * 32) + 0.5) / 32))).addScaledVector(normal, 0.003);
+  _hq.setFromUnitVectors(_hz, normal).multiply(randomTurn(AXIS_Z, 4)); // quarter turns keep it on the pixel grid
+  holes.setMatrixAt(i, _hm.compose(_hp, _hq, ONE));
+  holeSeed.array[i] = Math.random() * 100;
+  holes.count = Math.min(holeNext, HOLE_MAX);
+  holes.instanceMatrix.needsUpdate = holeSeed.needsUpdate = true;
+}
+// Where a ray (origin o, direction dir) first hits the arena itself: the floor, the ceiling, the walls, a column or
+// the centre platform. Returns { t, normal } (normal: the surface's, facing back at the ray) or null.
+function rayOctagon(o, dir, cx, cz, apothem, height) { // an octagonal prism (faces as PLATFORM_FACES) on the floor
+  let tIn = -Infinity, tOut = Infinity, nIn = null;
+  const clip = (den, num, n) => { // the half-space n·(o + t dir) ≤ k: den = n·dir, num = k − n·o
+    if (Math.abs(den) < 1e-9) { if (num < 0) tIn = Infinity; } else if (den > 0) tOut = Math.min(tOut, num / den);
+    else if (num / den > tIn) { tIn = num / den; nIn = n; }
+  };
+  for (const f of PLATFORM_FACES) clip(f.x * dir.x + f.y * dir.z, apothem - (f.x * (o.x - cx) + f.y * (o.z - cz)), [f.x, 0, f.y]);
+  clip(dir.y, height - o.y, [0, 1, 0]); clip(-dir.y, o.y, [0, -1, 0]);
+  return tIn <= tOut && tIn > 0 && nIn ? { t: tIn, normal: new THREE.Vector3(...nIn) } : null;
+}
+function rayWorld(o, dir) {
+  const H = WALL_ROWS * TILE;
+  let best = null;
+  const take = (t, nx, ny, nz) => { if (t > 0 && (!best || t < best.t)) best = { t, normal: new THREE.Vector3(nx, ny, nz) }; };
+  if (dir.y < 0) take(-o.y / dir.y, 0, 1, 0); else if (dir.y > 0) take((H - o.y) / dir.y, 0, -1, 0);
+  if (dir.x > 0) take((ARENA - o.x) / dir.x, -1, 0, 0); else if (dir.x < 0) take((-ARENA - o.x) / dir.x, 1, 0, 0);
+  if (dir.z > 0) take((ARENA - o.z) / dir.z, 0, 0, -1); else if (dir.z < 0) take((-ARENA - o.z) / dir.z, 0, 0, 1);
+  for (const c of COLUMNS) { const h = rayOctagon(o, dir, c.x, c.y, COLUMN_APOTHEM, H); if (h && (!best || h.t < best.t)) best = h; }
+  const p = rayOctagon(o, dir, 0, 0, PLATFORM_APOTHEM, PLATFORM_H);
+  if (p && (!best || p.t < best.t)) best = p;
+  return best;
+}
+
+// Spent casings: each shot throws one out of the M4's ejection port, to your right. Sprites, like everything else:
+// the casing model (models/bullet_case: its tall, bottlenecked rifle casing, pCylinder3; the other is a
+// straight-walled one) is rendered once at load into CASE_FRAMES frames of CASE_PX px, a full turn of it end over
+// end (seen a little from above, so its mouth and base show as it turns), lit by a plain key light and the room's
+// environment. In the world each casing is a quad facing you showing the frame for its tumble angle, multiplied by
+// the light where it is (bloodLight, as the demons get it). It arcs out, falls, bounces a couple of times and lies
+// on its side, for CASE_LIFE s.
+const CASE_MAX = 200, CASE_FRAMES = 16, CASE_PX = 24, CASE_LEN = 0.045, CASE_LIFE = 30; // casings, frames, px, m, s
+const CASE_GRAVITY = 9.8, CASE_BOUNCE = 0.35; // m/s²; share of its speed a bounce keeps (upwards)
+// bloodLight's inverse-square sum has no ceiling: right by the muzzle flash or a floor light a casing would get dozens
+// of times the light all over (a real one shows a small highlight, not that), so it's capped, and so is the colour,
+// below BLOOM_THRESHOLD: casings brighten near lights but never glow
+const CASE_LIGHT_MAX = 1.5, CASE_COLOR_MAX = 2.0;
+const caseRT = new THREE.WebGLRenderTarget(CASE_FRAMES * CASE_PX, CASE_PX, {
+  type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
+});
+function bakeCasings(gltf) {
+  const inner = new THREE.Group(), pivot = new THREE.Group();
+  inner.add(gltf.scene.getObjectByName('pCylinder3').clone(true));
+  pivot.add(inner);
+  inner.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(inner), size = box.getSize(new THREE.Vector3());
+  inner.position.copy(box.getCenter(new THREE.Vector3())).negate();
+  pivot.scale.setScalar(1.8 / size.y); // its length (model Y) fills 90% of a frame
+  const bake = new THREE.Scene(), key = new THREE.DirectionalLight(0xfff0d8, 2.5);
+  bake.environment = scene.environment;
+  key.position.set(-1, 2, 3);
+  bake.add(key, pivot);
+  const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+  cam.position.z = 5;
+  const alpha = renderer.getClearAlpha(), clear = new THREE.Color();
+  renderer.getClearColor(clear);
+  renderer.setClearColor(0x000000, 0);
+  caseRT.scissorTest = true;
+  for (let k = 0; k < CASE_FRAMES; k++) {
+    pivot.rotation.set(0.5, 0, (k / CASE_FRAMES) * 2 * Math.PI); // turned in your view's plane, tipped towards you
+    caseRT.viewport.set(k * CASE_PX, 0, CASE_PX, CASE_PX);
+    caseRT.scissor.copy(caseRT.viewport);
+    renderer.setRenderTarget(caseRT);
+    renderer.render(bake, cam);
+  }
+  renderer.setRenderTarget(null);
+  renderer.setClearColor(clear, alpha);
+}
+const casePos = new Float32Array(CASE_MAX * 3), caseVel = new Float32Array(CASE_MAX * 3);
+const caseAngle = new Float32Array(CASE_MAX), caseSpin = new Float32Array(CASE_MAX), caseLife = new Float32Array(CASE_MAX);
+let caseNext = 0;
+const caseGeo = new THREE.InstancedBufferGeometry();
+{
+  const quad = new THREE.PlaneGeometry(1, 1);
+  caseGeo.index = quad.index;
+  caseGeo.setAttribute('position', quad.attributes.position);
+}
+const caseAttr = (name, n) => {
+  const a = new THREE.InstancedBufferAttribute(new Float32Array(CASE_MAX * n), n).setUsage(THREE.DynamicDrawUsage);
+  caseGeo.setAttribute(name, a);
+  return a;
+};
+const caseAttrPos = caseAttr('aPos', 3), caseAttrLight = caseAttr('aLight', 3), caseAttrFrame = caseAttr('aFrame', 1);
+caseGeo.instanceCount = 0;
+const casings = new THREE.Mesh(caseGeo, new THREE.ShaderMaterial({
+  uniforms: { uSheet: { value: caseRT.texture }, uFogColor: { value: new THREE.Color() }, uFogDensity: { value: 0 } },
+  vertexShader: `
+    attribute vec3 aPos, aLight;
+    attribute float aFrame;
+    varying vec2 vUv;
+    varying vec3 vLight;
+    varying float vZ;
+    void main() {
+      vec4 c = viewMatrix * vec4(aPos, 1.0);
+      c.xy += position.xy * ${(CASE_LEN / 0.9).toFixed(4)}; // facing you; the casing fills 90% of its frame
+      vUv = vec2((position.x + 0.5 + aFrame) / ${CASE_FRAMES}.0, position.y + 0.5);
+      vLight = min(aLight, vec3(${CASE_LIGHT_MAX.toFixed(1)})); vZ = -c.z;
+      gl_Position = projectionMatrix * c;
+    }`,
+  fragmentShader: `
+    uniform sampler2D uSheet;
+    uniform vec3 uFogColor;
+    uniform float uFogDensity;
+    varying vec2 vUv;
+    varying vec3 vLight;
+    varying float vZ;
+    void main() {
+      vec4 t = texture2D(uSheet, vUv);
+      if (t.a < 0.5) discard;
+      gl_FragColor = vec4(mix(min(t.rgb / t.a * vLight, vec3(${CASE_COLOR_MAX.toFixed(1)})), uFogColor, 1.0 - exp(-uFogDensity * uFogDensity * vZ * vZ)), 1.0);
+    }`,
+}));
+casings.frustumCulled = false;
+scene.add(casings);
+const _cr = new THREE.Vector3(), _cu = new THREE.Vector3(), _cf = new THREE.Vector3();
+function ejectCasing() { // out of the port: right of and a little below your eye, just ahead
+  const i = caseNext++ % CASE_MAX, k = i * 3;
+  camera.getWorldDirection(_cf);
+  _cr.crossVectors(_cf, camera.up).normalize();
+  _cu.crossVectors(_cr, _cf);
+  const p = _v.copy(camera.position).addScaledVector(_cr, 0.14).addScaledVector(_cu, -0.12).addScaledVector(_cf, 0.45);
+  const v = _cr.clone().multiplyScalar(2.2 + Math.random()).addScaledVector(_cu, 1.2 + Math.random() * 0.8).addScaledVector(_cf, (Math.random() - 0.7) * 0.6);
+  casePos.set([p.x, p.y, p.z], k);
+  caseVel.set([v.x, v.y, v.z], k);
+  caseAngle[i] = Math.random() * 2 * Math.PI;
+  caseSpin[i] = (Math.random() < 0.5 ? -1 : 1) * (20 + Math.random() * 15);
+  caseLife[i] = CASE_LIFE;
+}
+function updateCasings(dt) {
+  let n = 0;
+  const P = caseAttrPos.array, F = caseAttrFrame.array;
+  for (let i = 0; i < CASE_MAX; i++) {
+    if (caseLife[i] <= 0) continue;
+    if ((caseLife[i] -= dt) <= 0) continue;
+    const k = i * 3;
+    caseVel[k + 1] -= CASE_GRAVITY * dt;
+    for (let c = 0; c < 3; c++) casePos[k + c] += caseVel[k + c] * dt;
+    caseAngle[i] += caseSpin[i] * dt;
+    for (const c of [0, 2]) if (Math.abs(casePos[k + c]) > ARENA - 0.02) { // the walls
+      casePos[k + c] = Math.sign(casePos[k + c]) * (ARENA - 0.02); caseVel[k + c] *= -0.4;
+    }
+    const ground = (platformDist(casePos[k], casePos[k + 2]) < PLATFORM_APOTHEM ? PLATFORM_H : 0) + 0.008; // lying: its radius
+    if (casePos[k + 1] < ground) {
+      casePos[k + 1] = ground;
+      if (caseVel[k + 1] < -0.6) { // a bounce: up a little, slowed, spinning less
+        caseVel[k + 1] *= -CASE_BOUNCE; caseVel[k] *= 0.6; caseVel[k + 2] *= 0.6; caseSpin[i] *= 0.5;
+      } else { // settled: slides to a stop on its side
+        caseVel[k + 1] = 0; caseVel[k] *= 0.85; caseVel[k + 2] *= 0.85; caseSpin[i] = 0;
+        caseAngle[i] = (Math.round(caseAngle[i] / Math.PI - 0.5) + 0.5) * Math.PI;
+      }
+    }
+    P.set(casePos.subarray(k, k + 3), n * 3);
+    bloodLight(casePos[k], casePos[k + 1], casePos[k + 2], caseAttrLight.array, n * 3);
+    const turn = ((caseAngle[i] / (2 * Math.PI)) % 1 + 1) % 1;
+    F[n++] = Math.round(turn * CASE_FRAMES) % CASE_FRAMES;
+  }
+  caseGeo.instanceCount = n;
+  caseAttrPos.needsUpdate = caseAttrLight.needsUpdate = caseAttrFrame.needsUpdate = true;
+  casings.material.uniforms.uFogColor.value.copy(scene.fog.color);
+  casings.material.uniforms.uFogDensity.value = scene.fog.density;
+}
+
+// The flash's glow: the gun is drawn over the finished frame, after bloom, so its flash can't glow. A bright,
+// pixelated disc at the muzzle's place in the world (where its light goes) for the bang does: far over
+// BLOOM_THRESHOLD at its core, so the bloom pass spreads it round the barrel like any light.
+const HALO_SIZE = 0.3, HALO_PEAK = 9, HALO_PX = 12; // m across; core brightness; px across it
+const halo = new THREE.Mesh(new THREE.PlaneGeometry(HALO_SIZE, HALO_SIZE), new THREE.ShaderMaterial({
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      vec4 c = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+      c.xy += position.xy; // facing you
+      gl_Position = projectionMatrix * c;
+    }`,
+  fragmentShader: `
+    varying vec2 vUv;
+    void main() {
+      vec2 q = (floor(vUv * ${HALO_PX}.0) + 0.5) / ${HALO_PX}.0 * 2.0 - 1.0; // its own chunky pixels
+      float g = max(1.0 - length(q), 0.0);
+      if (g <= 0.0) discard;
+      gl_FragColor = vec4(vec3(1.0, 0.72, 0.38) * ${HALO_PEAK}.0 * g * g * g, 1.0);
+    }`,
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+}));
+halo.frustumCulled = false;
+halo.visible = false;
+scene.add(halo);
+
+// Smoke: each shot leaves a wisp at the muzzle that rises, drifts and spreads, thinning out over SMOKE_LIFE.
+// Grey pixels, lit where they are (bloodLight, capped like the casings), each see-through (at most SMOKE_OPACITY,
+// in SMOKE_LEVELS steps so it stays pixel art), thinning towards its ragged edge and as it ages.
+const SMOKE_MAX = 48, SMOKE_LIFE = 0.7, SMOKE_PX = 10; // wisps; s; px across one
+const SMOKE_OPACITY = 0.3, SMOKE_LEVELS = 3; // the most a smoke pixel covers what's behind it; steps of it (pixel art)
+const smokePos = new Float32Array(SMOKE_MAX * 3), smokeVel = new Float32Array(SMOKE_MAX * 3), smokeAge = new Float32Array(SMOKE_MAX).fill(SMOKE_LIFE);
+let smokeNext = 0;
+const smokeGeo = new THREE.InstancedBufferGeometry();
+{
+  const quad = new THREE.PlaneGeometry(1, 1);
+  smokeGeo.index = quad.index;
+  smokeGeo.setAttribute('position', quad.attributes.position);
+}
+const smokeAttr = (name, n) => {
+  const a = new THREE.InstancedBufferAttribute(new Float32Array(SMOKE_MAX * n), n).setUsage(THREE.DynamicDrawUsage);
+  smokeGeo.setAttribute(name, a);
+  return a;
+};
+const smokeAttrPos = smokeAttr('aPos', 3), smokeAttrLight = smokeAttr('aLight', 3), smokeAttrT = smokeAttr('aT', 1), smokeAttrSeed = smokeAttr('aSeed', 1);
+smokeGeo.instanceCount = 0;
+const smoke = new THREE.Mesh(smokeGeo, new THREE.ShaderMaterial({
+  uniforms: { uFogColor: { value: new THREE.Color() }, uFogDensity: { value: 0 } },
+  vertexShader: `
+    attribute vec3 aPos, aLight;
+    attribute float aT, aSeed;
+    varying vec2 vUv;
+    varying vec3 vLight;
+    varying float vT, vSeed, vZ;
+    void main() {
+      vec4 c = viewMatrix * vec4(aPos, 1.0);
+      c.xy += position.xy * (0.05 + 0.22 * aT); // spreads as it rises
+      vUv = position.xy + 0.5; vLight = min(aLight, vec3(${CASE_LIGHT_MAX.toFixed(1)})); vT = aT; vSeed = aSeed; vZ = -c.z;
+      gl_Position = projectionMatrix * c;
+    }`,
+  fragmentShader: `
+    uniform vec3 uFogColor;
+    uniform float uFogDensity;
+    varying vec2 vUv;
+    varying vec3 vLight;
+    varying float vT, vSeed, vZ;
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233)) + vSeed) * 43758.5453); }
+    void main() {
+      vec2 px = floor(vUv * ${SMOKE_PX}.0);
+      vec2 q = (px + 0.5) / ${SMOKE_PX}.0 * 2.0 - 1.0;
+      float dens = clamp((1.0 - length(q) - 0.35 * hash(px)) * (1.0 - vT) * 1.4, 0.0, 1.0); // ragged, thinning
+      float a = floor(dens * ${SMOKE_LEVELS}.0 + 0.5) / ${SMOKE_LEVELS}.0 * ${SMOKE_OPACITY.toFixed(2)}; // in steps
+      if (a <= 0.0) discard;
+      vec3 col = vec3(0.32, 0.31, 0.3) * vLight;
+      gl_FragColor = vec4(mix(col, uFogColor, 1.0 - exp(-uFogDensity * uFogDensity * vZ * vZ)), a);
+    }`,
+  transparent: true, depthWrite: false,
+}));
+smoke.frustumCulled = false;
+scene.add(smoke);
+function puffSmoke(at) {
+  const i = smokeNext++ % SMOKE_MAX, k = i * 3;
+  camera.getWorldDirection(_cf);
+  smokePos.set([at.x, at.y, at.z], k);
+  smokeVel.set([_cf.x * 0.4 + (Math.random() - 0.5) * 0.15, 0.35 + Math.random() * 0.2, _cf.z * 0.4 + (Math.random() - 0.5) * 0.15], k);
+  smokeAge[i] = 0;
+  smokeAttrSeed.array[i] = Math.random() * 100;
+}
+function updateMuzzleFx(dt, now) {
+  halo.visible = !!gun && now < gun.flashUntil - (GUN_FLASH_TIME - GUN_BANG_TIME); // the bang only
+  let n = 0;
+  for (let i = 0; i < SMOKE_MAX; i++) {
+    if ((smokeAge[i] += dt) >= SMOKE_LIFE) continue;
+    const k = i * 3;
+    for (let c = 0; c < 3; c++) { smokePos[k + c] += smokeVel[k + c] * dt; smokeVel[k + c] *= Math.exp(-2.5 * dt); } // slows in the air
+    smokeAttrPos.array.set(smokePos.subarray(k, k + 3), n * 3);
+    bloodLight(smokePos[k], smokePos[k + 1], smokePos[k + 2], smokeAttrLight.array, n * 3);
+    smokeAttrT.array[n] = smokeAge[i] / SMOKE_LIFE;
+    smokeAttrSeed.array[n++] = smokeAttrSeed.array[i];
+  }
+  smokeGeo.instanceCount = n;
+  smokeAttrPos.needsUpdate = smokeAttrLight.needsUpdate = smokeAttrT.needsUpdate = smokeAttrSeed.needsUpdate = true;
+  smoke.material.uniforms.uFogColor.value.copy(scene.fog.color);
+  smoke.material.uniforms.uFogDensity.value = scene.fog.density;
+}
+
+// Where a shot from the centre of the view hits a demon: a ray against a sphere round each demon's body (its
+// sprite's bounding radius, at its centre height); the nearest wins, unless a column (in plan, a circle round its
+// corners) is in the way. A demon's sphere only nominates it: the hit is where the shot touches its actual animated
+// body (probeDepth). Returns the entry and exit wounds, the shot's direction and the demon hit, or null.
+const _ray = new THREE.Vector3(), _toC = new THREE.Vector3();
+function shotHit() {
+  const o = camera.position, dir = camera.getWorldDirection(_ray);
+  const near = []; // demons whose sphere the shot passes through, nearest first
+  for (const npc of npcs) {
+    const { imp } = npc;
+    const R = imp.r * 0.5;
+    _toC.copy(imp.model.position).setY(imp.model.position.y + imp.centerY).sub(o);
+    const t = _toC.dot(dir), d2 = _toC.lengthSq() - t * t;
+    if (t > 0 && d2 < (imp.r * imp.r)) near.push({ npc, t, out: t + Math.sqrt(Math.max(R * R - d2, 0)) });
+  }
+  near.sort((p, q) => p.t - q.t);
+  let best = Infinity, hit = null;
+  for (const c of near) { // the first whose actual body the shot touches (between the legs isn't a hit)
+    const t = probeDepth(c.npc, o, dir);
+    if (t < best) { best = t; hit = c; break; }
+  }
+  if (!hit) return null;
+  if (rayPlatform(o, dir) < best) return null; // the platform's in the way
+  const Rc = COLUMN_APOTHEM / Math.cos(Math.PI / 8), a = dir.x * dir.x + dir.z * dir.z;
+  for (const c of COLUMNS) {
+    const ox = o.x - c.x, oz = o.z - c.y, b = 2 * (dir.x * ox + dir.z * oz), disc = b * b - 4 * a * (ox * ox + oz * oz - Rc * Rc);
+    if (disc > 0 && a > 1e-9) {
+      const t0 = (-b - Math.sqrt(disc)) / (2 * a);
+      if (t0 > 0 && t0 < best) return null;
+    }
+  }
+  return { entry: o.clone().addScaledVector(dir, best), exit: o.clone().addScaledVector(dir, Math.max(hit.out, best + 0.1)), dir: dir.clone(), npc: hit.npc };
+}
+
+// Wounds: the shot's exact hit on a demon's animated body, and blood painted onto it. A ray against the 50k-triangle
+// skinned mesh on the CPU takes ~20 ms, so both run on the GPU with the model's own skinning:
+// - the probe renders the body's distance along the shot into a 1 px target (a camera looking down the shot, a
+//   1 cm view), read back: where the shot touches it, or nothing
+// - each demon has a blood mask in its texture's layout (WOUND_RES², unique UVs, no mirroring); a hit draws the body
+//   into it in UV space, every texel testing its posed 3D position against the hit, so a wound crosses texture
+//   seams cleanly; stretched downward, as blood runs, with a ragged noisy edge, the mask keeping the most
+//   blood each texel has had. The demon's material mixes the mask in (dark wet red, glossy), lit by the sprite stage
+//   like the rest of it, and its sprite re-renders.
+const WOUND_RES = 256, WOUND_RADIUS = 0.17, WOUND_RUN = 2.5; // px; m; how much further it runs down than across
+const WOUND_STREAKS = 5, WOUND_STREAK_LEN = 0.9, WOUND_SPATTER = 0.7; // runs down the body from each wound, m (longest); m: specks round it
+const woundVertex = `
+  #include <common>
+  #include <skinning_pars_vertex>
+  varying vec3 vWorld;
+  void main() {
+    #include <skinbase_vertex>
+    #include <begin_vertex>
+    #include <skinning_vertex>
+    vec4 w = modelMatrix * vec4(transformed, 1.0);
+    vWorld = w.xyz;
+  #ifdef PAINT
+    gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0); // where it is in the texture
+  #else
+    gl_Position = projectionMatrix * viewMatrix * w;
+  #endif
+  }`;
+const probeMat = new THREE.ShaderMaterial({
+  vertexShader: woundVertex,
+  fragmentShader: `varying vec3 vWorld;\nvoid main() { gl_FragColor = vec4(distance(vWorld, cameraPosition), 0.0, 0.0, 1.0); }`,
+  side: THREE.DoubleSide,
+});
+const probeRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter });
+const probeCam = new THREE.OrthographicCamera(-0.005, 0.005, 0.005, -0.005, 0.01, 200);
+const _probe = new Float32Array(4), _clearColor = new THREE.Color();
+// Renders a demon with its mesh's material swapped (its pose current) into target, cleared to transparent black
+// first or drawn over what's there; the renderer's state is put back after
+function renderDemon(npc, mat, target, cam, clear) {
+  const model = npc.imp.model, mesh = npc.mesh, keep = mesh.material, culled = mesh.frustumCulled, parent = model.parent;
+  const autoClear = renderer.autoClear, alpha = renderer.getClearAlpha(), rt = renderer.getRenderTarget();
+  renderer.getClearColor(_clearColor);
+  renderer.setClearColor(0x000000, 0);
+  renderer.autoClear = clear;
+  if (parent) parent.remove(model);
+  mesh.material = mat; mesh.frustumCulled = false;
+  renderer.setRenderTarget(target);
+  renderer.render(model, cam);
+  mesh.material = keep; mesh.frustumCulled = culled;
+  if (parent) parent.add(model);
+  renderer.setRenderTarget(rt);
+  renderer.autoClear = autoClear;
+  renderer.setClearColor(_clearColor, alpha);
+}
+// How far along the shot (origin o, direction dir) it first touches this demon's body, or Infinity
+function probeDepth(npc, o, dir) {
+  probeCam.position.copy(o);
+  probeCam.lookAt(_v.copy(o).add(dir));
+  probeCam.updateMatrixWorld();
+  renderDemon(npc, probeMat, probeRT, probeCam, true);
+  renderer.readRenderTargetPixels(probeRT, 0, 0, 1, 1, _probe);
+  return _probe[3] > 0.5 ? _probe[0] : Infinity;
+}
+const woundMat = new THREE.ShaderMaterial({
+  defines: { PAINT: '' },
+  uniforms: { uHit: { value: new THREE.Vector3() }, uSeed: { value: 0 } },
+  vertexShader: woundVertex,
+  fragmentShader: `
+    uniform vec3 uHit;
+    uniform float uSeed;
+    varying vec3 vWorld;
+    float hash(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7)) + uSeed) * 43758.5453); }
+    float vnoise(vec3 p) {
+      vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(mix(hash(i), hash(i + vec3(1, 0, 0)), f.x), mix(hash(i + vec3(0, 1, 0)), hash(i + vec3(1, 1, 0)), f.x), f.y),
+                 mix(mix(hash(i + vec3(0, 0, 1)), hash(i + vec3(1, 0, 1)), f.x), mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+    }
+    void main() {
+      vec3 d = vWorld - uHit;
+      d.y = d.y > 0.0 ? d.y * 1.5 : d.y / ${WOUND_RUN.toFixed(1)}; // runs down further than it spreads up
+      float r = length(d) / ${WOUND_RADIUS.toFixed(3)} + 0.45 * (vnoise(vWorld * 60.0) - 0.5) + 0.25 * (vnoise(vWorld * 150.0) - 0.5);
+      float v = 1.0 - smoothstep(0.55, 1.0, r);
+      // smeared round it: a fainter, patchy stain out to twice its size
+      v = max(v, 0.4 * (1.0 - smoothstep(1.0, 2.0, r)) * step(0.45, vnoise(vWorld * 35.0)));
+      // runs: a few thin streaks running straight down the body from the wound (vertical lines in the world, each its
+      // own length), thinning towards the end
+      for (int k = 0; k < ${WOUND_STREAKS}; k++) {
+        float fk = float(k);
+        vec2 off = (vec2(hash(vec3(fk, 1.0, 2.0)), hash(vec3(fk, 3.0, 4.0))) - 0.5) * ${(WOUND_RADIUS * 1.2).toFixed(3)};
+        float len = ${WOUND_STREAK_LEN.toFixed(2)} * (0.3 + 0.7 * hash(vec3(fk, 5.0, 6.0))), down = uHit.y - vWorld.y;
+        float along = clamp(down / len, 0.0, 1.0);
+        float w = 0.03 * (1.0 - 0.6 * along) * (0.7 + 0.6 * vnoise(vWorld * 90.0));
+        if (down > 0.0 && down < len && length(vWorld.xz - uHit.xz - off) < w) v = max(v, 0.9 - 0.3 * along);
+      }
+      // spatter: specks flung round it, sparser further out
+      float far = length(vWorld - uHit) / ${WOUND_SPATTER.toFixed(2)};
+      if (far < 1.0 && vnoise(vWorld * 110.0) > 0.6 + 0.3 * far) v = max(v, 0.8 - 0.4 * far);
+      if (v <= 0.0) discard;
+      gl_FragColor = vec4(v, 0.0, 0.0, 1.0);
+    }`,
+  side: THREE.DoubleSide, depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendEquation: THREE.MaxEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+const woundCam = new THREE.Camera(); // unused by the UV-space pass, but render() wants one
+function paintWound(npc, at) {
+  woundMat.uniforms.uHit.value.copy(at);
+  woundMat.uniforms.uSeed.value = Math.random() * 100;
+  renderDemon(npc, woundMat, npc.bloodRT, woundCam, false);
+  npc.imp.lastKey = undefined; // its sprite re-renders with the new wound
+}
+// The demons' material: a copy each, its roughnessMap slot carrying that demon's blood mask (three binds a map per
+// material, so they all share one program)
+function bloodyMaterial(mat, mask) {
+  const m = mat.clone();
+  m.roughnessMap = mask;
+  m.onBeforeCompile = bloodOnBeforeCompile;
+  return m;
+}
+function bloodOnBeforeCompile(shader) {
+  shader.fragmentShader = shader.fragmentShader.replace('#include <roughnessmap_fragment>', `float roughnessFactor = roughness;
+#ifdef USE_ROUGHNESSMAP
+  float blood = texture2D(roughnessMap, vRoughnessMapUv).r; // the wound mask (see paintWound)
+  // wet red: brighter scarlet where it's thin (the edges, runs and specks), deep red where it's pooled; glossy
+  diffuseColor.rgb = mix(diffuseColor.rgb, mix(vec3(0.45, 0.015, 0.025), vec3(0.2, 0.004, 0.01), blood), min(blood * 1.6, 1.0));
+  roughnessFactor = mix(roughnessFactor, 0.15, blood);
+#endif`);
+}
+
 function tryFire(now) {
   if (!gun || gun.busy || gun.cooldown > 0) return;
   if (gun.ammo === 0) return reload();
@@ -676,7 +2398,21 @@ function tryFire(now) {
   gun.root.updateMatrixWorld(true);
   gun.muzzle.getWorldPosition(_mw).applyMatrix4(gunCam.matrixWorldInverse).applyMatrix4(camera.matrixWorld);
   muzzleFlash(_mw);
-  gun.flashUntil = now + 0.06;
+  halo.position.copy(_mw);
+  puffSmoke(_mw);
+  gun.flashUntil = now + GUN_FLASH_TIME;
+  ejectCasing();
+  gun.flashVariant = (Math.random() * FLASH_VARIANTS) | 0;
+  gun.flashMirror = Math.random() < 0.5;
+  gun.flashFrame = -1; // a new shot: re-render now
+  shakeKick += KICK_PER_SHOT;
+  shakeTrauma = Math.min(shakeTrauma + TRAUMA_PER_SHOT, 1);
+  const hit = shotHit();
+  if (hit) { burstBlood(hit); staggerNpc(hit.npc, hit.dir); paintWound(hit.npc, hit.entry); }
+  else { // missed them: it hits the arena
+    const dir = camera.getWorldDirection(_ray), w = rayWorld(camera.position, dir);
+    if (w) spawnHole(_v.copy(camera.position).addScaledVector(dir, w.t), w.normal);
+  }
   updateAmmo();
 }
 
@@ -696,6 +2432,9 @@ function updateGun(dt, now) {
 
   let lights = 0; // which flash lights reach your eye; a change means a re-render
   flashes.forEach((f, i) => { if (f.world.intensity > 0 && f.world.position.distanceTo(camera.position) < FLASH_RANGE + 1) lights |= 1 << i; });
+  // the flash's frame: 0 the bang, 1 the next instant, -1 none; a change means a re-render
+  const flashFrame = now < gun.flashUntil ? (now < gun.flashUntil - (GUN_FLASH_TIME - GUN_BANG_TIME) ? 0 : 1) : -1;
+  if (flashFrame !== gun.flashFrame) { gun.flashFrame = flashFrame; gun.dirty = true; }
   if (!posed && lights === gun.lastLights && !gun.dirty) return 0;
   gun.lastLights = lights;
   gun.dirty = false;
@@ -721,13 +2460,21 @@ function updateGun(dt, now) {
     gunCeil[i].position.copy(c.world.position).applyMatrix4(_toGun);
     gunCeil[i].quaternion.multiplyQuaternions(_tgq, c.world.quaternion);
     gunCeil[i].intensity = c.world.intensity;
+    gunCeil[i].color.copy(c.world.color);
+  });
+  spotLights.forEach((s, i) => { // spots have an aim: carry the target over too
+    gunSpots[i].position.copy(s.world.position).applyMatrix4(_toGun);
+    if (gunSpots[i].target) gunSpots[i].target.position.copy(s.world.target.position).applyMatrix4(_toGun);
+    gunSpots[i].intensity = s.world.intensity;
   });
 
-  muzzleSprite.visible = now < gun.flashUntil;
+  muzzleSprite.visible = gun.flashFrame >= 0;
   if (muzzleSprite.visible) {
     gun.muzzle.getWorldPosition(muzzleSprite.position);
-    muzzleSprite.lookAt(gunCam.position);
-    muzzleSprite.rotateZ(Math.random() * Math.PI);
+    muzzleSprite.quaternion.copy(gunCam.quaternion); // facing the eye, upright on screen
+    const v = gun.flashVariant, m = gun.flashMirror; // its cell in the sheet (rows: the bang on top; flipY)
+    flashSheet.repeat.x = (m ? -1 : 1) / FLASH_VARIANTS;
+    flashSheet.offset.set((v + (m ? 1 : 0)) / FLASH_VARIANTS, gun.flashFrame === 0 ? 0.5 : 0);
   }
 
   renderer.setRenderTarget(gunRT);
@@ -745,7 +2492,7 @@ function updateAmmo() {
 // Demons
 // ---------------------------------------------------------------------------
 let demonGltf;
-const npcs = []; // { imp, walk, fire, target, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer }
+const npcs = []; // { imp, walk, fire, target, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer, stagger, knock, shakeDir }
 const _v = new THREE.Vector3();
 
 function addNpcs(n) {
@@ -753,30 +2500,41 @@ function addNpcs(n) {
     const model = cloneSkinned(demonGltf.scene);
     model.position.set((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
     model.traverse((o) => { if (o.isMesh) o.castShadow = false; }); // blob/sprite shadows in both modes, so V compares fairly
+    const bloodRT = new THREE.WebGLRenderTarget(WOUND_RES, WOUND_RES); // its wounds (see paintWound)
+    let mesh;
+    model.traverse((o) => { if (o.isSkinnedMesh) { mesh = o; o.material = bloodyMaterial(o.material, bloodRT.texture); } });
     const imp = new SpriteImpostor(model, new THREE.AnimationMixer(model), opts);
     scene.add(imp);
     const clip = (name) => imp.mixer.clipAction(THREE.AnimationClip.findByName(demonGltf.animations, name));
     const walk = clip('Walk'), fire = clip('Fire');
     walk.play().time = Math.random() * walk.getClip().duration; // out of step with each other
     const npc = {
-      imp, walk, fire, target: randomTarget(), muzzle: model.getObjectByName('muzzle'),
+      imp, walk, fire, target: randomTarget(), muzzle: model.getObjectByName('muzzle'), mesh, bloodRT,
       shooter: Math.random() < 0.5, firing: false, timer: nextVolley(),
       pace: 1, paceTarget: 1, paceTimer: 0, // demo: switches between normal and fast every few seconds
+      stagger: 0, knock: new THREE.Vector3(), shakeDir: new THREE.Vector3(), // hit reaction (see staggerNpc)
     };
     imp.mixer.addEventListener('loop', (e) => { if (e.action === fire) muzzleFlash(npc.muzzle.getWorldPosition(_v)); }); // each shot
     npcs.push(npc);
   }
 }
 function removeNpcs(n) {
-  for (const { imp } of npcs.splice(-n)) imp.dispose();
+  for (const { imp, bloodRT, mesh } of npcs.splice(-n)) { imp.dispose(); bloodRT.dispose(); mesh.material.dispose(); }
 }
 const nextVolley = () => 3 + Math.random() * 5; // seconds of walking between volleys
-const randomTarget = () => new THREE.Vector3((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
+const randomTarget = () => { // anywhere on the floor, off the centre platform
+  const v = new THREE.Vector3();
+  do v.set((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
+  while (platformDist(v.x, v.z) < PLATFORM_APOTHEM + 1.5);
+  return v;
+};
 
 const loader = new GLTFLoader();
 Promise.all([
   loader.loadAsync('models/demon.glb'), loader.loadAsync('models/demon_walk.glb'), loader.loadAsync('models/m4/scene.gltf'),
-]).then(([demon, demonWalk, m4]) => {
+  loader.loadAsync('models/bullet_case/scene.gltf'),
+]).then(([demon, demonWalk, m4, bulletCase]) => {
+  bakeCasings(bulletCase);
   // demon_walk.glb: Mixamo "Orc Walk" retargeted onto the demon rig in Blender; replaces the built-in Walk
   demon.animations = demon.animations.filter((c) => c.name !== 'Walk').concat(demonWalk.animations);
   demonGltf = demon;
@@ -845,6 +2603,29 @@ const UP = new THREE.Vector3(0, 1, 0), fwd = new THREE.Vector3(), right = new TH
 const clock = new THREE.Clock();
 let bobPhase = 0, bobAmp = 0;
 
+// Hit reaction: a hit demon stops walking (its pose frozen) for STAGGER_TIME, refreshed by every hit, and is knocked
+// back along the shot, the push easing off (KNOCK_DRAG) and a shudder shaking it back and forth along the shot on top.
+// It's still free to turn towards where it was heading, and to shoot (a volley carries on, and new ones start).
+const STAGGER_TIME = 0.35, KNOCK_SPEED = 0.8, KNOCK_DRAG = 10; // s, m/s per hit, 1/s
+const SHUDDER = 0.03, SHUDDER_RATE = 45; // m, rad/s
+function staggerNpc(npc, dir) {
+  npc.stagger = STAGGER_TIME;
+  npc.shakeDir.set(dir.x, 0, dir.z).normalize();
+  npc.knock.addScaledVector(npc.shakeDir, KNOCK_SPEED);
+}
+function updateStagger(npc, dt) {
+  const m = npc.imp.model, p = m.position, left = npc.stagger / STAGGER_TIME;
+  npc.stagger = Math.max(npc.stagger - dt, 0);
+  npc.walk.timeScale = 0; // frozen mid-stride; the pace eases it back after
+  npc.pace = 0;
+  // shudder: a velocity whose integral is SHUDDER × sin, so it shakes about where the knock carries it
+  const phase = (STAGGER_TIME - npc.stagger) * SHUDDER_RATE;
+  p.addScaledVector(npc.knock, dt).addScaledVector(npc.shakeDir, SHUDDER * SHUDDER_RATE * Math.cos(phase) * left * dt);
+  npc.knock.multiplyScalar(Math.exp(-KNOCK_DRAG * dt));
+  p.x = THREE.MathUtils.clamp(p.x, -ARENA + 0.5, ARENA - 0.5); p.z = THREE.MathUtils.clamp(p.z, -ARENA + 0.5, ARENA - 0.5);
+  pushOutOfPlatform(p, 0.5);
+  steer(m, move.subVectors(npc.target, p).setY(0).normalize(), 0, dt, DEMON_FACING); // free to turn
+}
 function steer(model, dir, speed, dt, facing) { // dir: normalized XZ direction
   model.quaternion.slerp(q.setFromAxisAngle(UP, Math.atan2(dir.x, dir.z) + facing), 1 - Math.exp(-12 * dt));
   model.position.addScaledVector(dir, speed * dt);
@@ -864,13 +2645,33 @@ renderer.setAnimationLoop(() => {
     .addScaledVector(right, (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0));
   const moving = move.lengthSq() > 0, sprinting = keys.ShiftLeft || keys.ShiftRight;
   if (moving) camera.position.addScaledVector(move.normalize(), (sprinting ? SPRINT : MOVE) * dt);
-  camera.position.y = EYE_HEIGHT;
+  // Jump: Space launches you at the speed that peaks at JUMP_HEIGHT; held, you hop again on landing
+  // the centre platform: once your feet are (nearly) up to its top you stand on it, else it's a wall
+  let floorY = 0;
+  if (platformDist(camera.position.x, camera.position.z) < PLATFORM_APOTHEM + 0.4) {
+    if (jumpY >= PLATFORM_H - PLATFORM_STEP) floorY = PLATFORM_H;
+    else pushOutOfPlatform(camera.position, 0.4);
+  }
+  const grounded = jumpY <= floorY;
+  if (grounded && keys.Space) jumpV = Math.sqrt(2 * GRAVITY * JUMP_HEIGHT);
+  jumpV -= GRAVITY * dt;
+  jumpY = Math.max(jumpY + jumpV * dt, floorY);
+  if (jumpY === floorY && jumpV < 0) jumpV = 0;
+  camera.position.y = EYE_HEIGHT + jumpY;
   const reach = ARENA - 0.5; // the wall is solid: stop half a metre short of it
   camera.position.x = THREE.MathUtils.clamp(camera.position.x, -reach, reach);
   camera.position.z = THREE.MathUtils.clamp(camera.position.z, -reach, reach);
+  for (const c of COLUMNS) { // columns are solid too: push out to their reach (a circle round the octagon)
+    const dx = camera.position.x - c.x, dz = camera.position.z - c.y, d = Math.hypot(dx, dz);
+    if (d < COLUMN_REACH) {
+      const k = d > 1e-6 ? COLUMN_REACH / d : 0;
+      camera.position.x = c.x + (d > 1e-6 ? dx * k : COLUMN_REACH);
+      camera.position.z = c.y + dz * k;
+    }
+  }
 
   // Weapon bob: Doom's sideways sway + downward dip, snapped to whole weapon-sprite pixels
-  bobAmp += ((moving ? 1 : 0) - bobAmp) * (1 - Math.exp(-8 * dt));
+  bobAmp += ((moving && grounded ? 1 : 0) - bobAmp) * (1 - Math.exp(-8 * dt)); // no footsteps in the air
   bobPhase += dt * (sprinting ? 11 : 8);
   const tx = 2 / gunRT.width, ty = 2 / gunRT.height;
   gunQuad.position.x = Math.round((Math.cos(bobPhase) * BOB * bobAmp) / tx) * tx;
@@ -879,6 +2680,7 @@ renderer.setAnimationLoop(() => {
   if (trigger) tryFire(now);
 
   for (const npc of npcs) {
+    if (npc.stagger > 0) updateStagger(npc, dt); // knocked back, but still free to turn and shoot
     // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on
     npc.timer -= dt;
     if (npc.firing) {
@@ -895,6 +2697,7 @@ renderer.setAnimationLoop(() => {
       muzzleFlash(npc.muzzle.getWorldPosition(_v)); // first shot; later ones come from the loop event
       continue;
     }
+    if (npc.stagger > 0) continue; // no walking while staggered
     if ((npc.paceTimer -= dt) <= 0) {
       npc.paceTarget = Math.random() < 0.5 ? 1 : DEMON_FAST;
       npc.paceTimer = 2 + Math.random() * 4;
@@ -904,22 +2707,30 @@ renderer.setAnimationLoop(() => {
     const p = npc.imp.model.position;
     if (p.distanceToSquared(npc.target) < 1) npc.target = randomTarget();
     steer(npc.imp.model, move.subVectors(npc.target, p).setY(0).normalize(), DEMON_WALK * npc.pace, dt, DEMON_FACING);
+    pushOutOfPlatform(p, 0.5); // they walk round it
   }
 
-  sun.position.copy(camera.position).add(sunOffset); // box shadows follow you
+  sun.position.copy(camera.position).add(sunOffset); // shadows follow you
   sun.target.position.copy(camera.position);
   for (const f of flashes) if (f.ttl > 0 && (f.ttl -= dt) <= 0) f.world.intensity = f.sprite.intensity = 0;
   updatePool(stripTiles, stripLights, STRIP_REACH, STRIP_FADE, STRIP_INTENSITY);
   updatePool(ceilLightTiles, ceilLights, CEIL_REACH, CEIL_FADE, CEIL_INTENSITY);
+  updatePool(spotPoolTiles, spotLights, SPOT_REACH, SPOT_FADE, SPOT_INTENSITY);
   camera.updateMatrixWorld();
 
   for (const npc of npcs) sprites += npc.imp.update(renderer, camera, dt);
   sprites += updateGun(dt, now);
+  updateBlood(dt);
+  updateCasings(dt);
+  updateMuzzleFx(dt, now);
 
+  const shaken = shakeCamera(dt, now);
+  drawBloodField();
   composer.render(dt);
   renderer.autoClear = false; // weapon goes flat on top of the world (no bloom on it)
   renderer.render(hudScene, hudCam);
   renderer.autoClear = true;
+  if (shaken) camera.quaternion.copy(_camQ); // undo: the look controls own the real orientation
   reportStats(performance.now() - t0, sprites);
 });
 </script>

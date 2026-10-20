@@ -2,8 +2,18 @@
   vent   round holes, staggered near-hex lattice (5 rows of 5 and 4)
   slits  long narrow slots spanning the tile (4 rows, a blank row's margin top and bottom)
   plain  no holes, just the plate
+  plain_bolted  plain plate held down by a domed bolt (with washer) in each corner
+  plain_welded  plain plate with a weld bead across the middle, rippled, in a band of heat tint
   light  plate with a recessed LED strip across the middle
+  slitlight  plain plate with a thin glowing slit along its top edge (a downlight; the game hangs a spot under it)
+  sidelight  plain plate with a thin vertical glowing slit inside each side edge
+  sidelight_left  the same with only the left slit (a half turn makes it a right one)
   cover  plain plate with an octagonal cover plate laid on top, a domed rivet in each corner
+  vent_patch  vent with a repair plate welded over part of the lattice (weld bead, heat-tint ring)
+  slits_strapped  slits with two raised reinforcing straps across the slots
+  cover_hatch  cover plate with a recessed lifting slot in the middle (an access panel)
+  walllight  plate with a deep recessed fixture: a glowing semi-cylindrical tube with metal end caps in a dark
+         housing, under a clear cover embossed with ridges along the slot (built for parallax mapping)
 Tiles are self-contained (holes never cross the edge, a recessed seam runs round it) so any two can
 sit side by side.
 
@@ -18,9 +28,13 @@ along the lines (LEAN/Toksvig-style), which becomes roughness + anisotropy. Thei
 into the normal map: real scratches average out flat over a 31 mm pixel, and the scaled-up ones leaking in
 read as dents. The finish is a worn floor, not a fresh mill sheet: a fresh #4 is ≥10× smoother along the
 brush (near-mirror along it, glaring in the sun); here BASE_ALPHA floors it at ~2×.
-On top lies a worn grime/oxide film (grime_mask): patchy scuffs from tileable noise plus dirt packed into
-seams, round holes and plate edges, quantised to 4 dithered levels. It's a dielectric, so where it lies the
-steel goes darker, non-metallic, rough and loses its brush anisotropy: it stops mirroring the sun.
+On top lies a worn grime/oxide film, quantised to 4 dithered levels. It's a dielectric, so where it lies the
+steel goes darker, non-metallic, rough and loses its brush anisotropy: it stops mirroring the sun. Two parts:
+- dirt packed into seams, round holes and plate edges (grime_mask): part of the tile's shape, baked into its maps
+- drip streaks (drip_grime): the walls' and columns' grime instead of the scuff patches, NOT baked; one
+  textures/grime_drip.png the game reads in world space (see drip_grime).
+- scuff patches (patch_grime): NOT baked. One shared, tileable textures/grime.png (GRIME_N px, mask in R); the
+  game gives every tile its own random window into it, so no two tiles share a smudge pattern.
 No lighting or shading is baked into any map.
 
 Each <name> writes:
@@ -32,6 +46,10 @@ Each <name> writes:
   textures/<name>_a.png    anisotropy (three.js anisotropyMap): RG = direction (texture Y, across the brush,
                            where the surface is roughest), B = strength
   textures/<name>_e.png    emissive colour (sRGB), only for tiles that glow; brightness is set in the game
+Parallax tiles (walllight) also write:
+  textures/<name>_depth.png  depth below the plate, 0 (surface) .. 255 (PARALLAX_RANGE px down), for the shader
+  textures/<name>_ccn.png    clearcoat normal map: the clear cover's embossed ridges
+  textures/<name>_ccm.png    the clear cover: R = clearcoat (gloss, dulled by dirt), G = dirt, B = where the cover is
 Run: python3 tools/plate_textures.py   (stdlib only; seeded, so output is reproducible)"""
 import math, random, struct, zlib
 from pathlib import Path
@@ -50,6 +68,15 @@ STEEL = (0.56, 0.57, 0.585)             # linear base colour
 GRIME = (0.05, 0.046, 0.042)            # linear: dark brown-grey oxide and dirt
 GRIME_ROUGH = 0.85
 GRIME_PATCH, GRIME_EDGE = 0.9, 0.8      # how much the scuff patches and the packed-in edge dirt contribute
+GRIME_N = 256                           # px: the shared patch texture (a 4×4-tile area; the game samples 64 px of it)
+DRIP_W, DRIP_H = 1024, 256              # px: the walls' drip grime, 32 m along a wall × the 8 m wall (32 px/m, like the tiles)
+DRIP_SEAMS = (64, 128, 192)             # px down from the top: the tile rows' seams, ledges where water collects
+GRIME_DRIP = 0.95                       # how much the drip streaks contribute
+FLASH_N, FLASH_VARIANTS = 64, 4         # px per muzzle-flash frame; shots cycle through this many shapes
+FLASH_PALETTE = ((0.85, (255, 255, 235)), (0.65, (255, 236, 140)), (0.45, (255, 186, 60)),  # heat → colour, hottest
+                 (0.27, (240, 110, 24)), (0.12, (170, 40, 12)))                          # first; below: transparent
+FLASH_COVER = (1, 1, 0.75, 0.5, 0.25)    # share of each palette band's pixels kept (ordered dither): see-through wisps
+BAYER4 = ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))
 
 
 # Hole centres sit on whole pixels at whole-pixel spacing, so every hole rasterises identically. Rows are 10 px
@@ -74,6 +101,33 @@ def slits(x, y):
 
 
 def plain(x, y):
+    return math.inf, 0
+
+
+BOLTS = [(6, 6), (N - 6, 6), (6, N - 6), (N - 6, N - 6)]  # centres on pixel corners: all four rasterise alike
+
+
+def plain_bolted(x, y):
+    """Plain plate with a forged bolt head (smooth: no brush grain) on a washer in each corner."""
+    r = min(math.hypot(x + 0.5 - cx, y + 0.5 - cy) for cx, cy in BOLTS)
+    if r < 1.8: return STEEL_SRGB, 1.1 + 0.3 * math.sqrt(1 - (r / 1.8) ** 2), 1.0, 0.35, 1.0, 1.0  # domed head
+    if r < 2.7: return STEEL_SRGB, 1.1, 0.9, 0.4, 1.0, 1.0                                        # washer
+    return math.inf, 0
+
+
+# Heat tint: the oxide colours welding leaves on stainless, from the bead out (a real film colour, not lighting)
+HEAT_TINT = [(2.5, (96, 96, 128)), (3.4, (150, 112, 74)), (4.4, (196, 178, 124))]  # outer edge (px from the centre line): blue, bronze, straw
+
+
+def plain_welded(x, y):
+    """Plain plate with a weld bead across the middle (rows 30..33): a rounded bead with periodic ripples, rough
+    and darker weld metal, in a band of heat tint on the brushed sheet either side."""
+    dy = abs(y + 0.5 - N / 2)
+    if dy < 1.6:
+        ripple = 0.85 + 0.15 * math.cos(2 * math.pi * x / 3)                                 # weld puddle ripples
+        return (128, 126, 122), 1 + 0.25 * math.sqrt(1 - (dy / 1.6) ** 2) * ripple, 1.0, 0.6, 1.0, 1.0
+    for edge, colour in HEAT_TINT:
+        if dy < edge: return colour, 1.0, 1.0, None, 1.0, 1.0                              # tinted, still brushed
     return math.inf, 0
 
 
@@ -115,6 +169,123 @@ srgb = lambda l: round(255 * (12.92 * l if l <= 0.0031308 else 1.055 * l ** (1 /
 STEEL_SRGB = tuple(srgb(c) for c in STEEL)
 
 
+PARALLAX_RANGE = 6.0  # px: the depth map's full scale (match WALL_LIGHT_DEPTH in the game: PARALLAX_RANGE / N)
+WL_X0, WL_X1, WL_Y0, WL_Y1 = 4, 60, 26, 38  # housing, frame included; the cavity is 2 px inside it
+WL_CAVITY, WL_TUBE_R = 6.0, 2.5              # px: cavity floor below the plate (~18 cm); tube radius
+HOUSING = (40, 40, 44)                        # dark painted housing interior
+
+
+def walllight(x, y):
+    """Recessed light fixture. Heights here are true pixel depths (feature height = 1 − depth / BUMP, so the
+    normal map and the parallax depth map agree). The clear cover is flush with the plate and isn't in the
+    height at all: it's the material's clearcoat (see clearcoat_wl)."""
+    if not (WL_X0 <= x < WL_X1 and WL_Y0 <= y < WL_Y1): return math.inf, 0
+    h = lambda depth: 1 - depth / BUMP
+    f = min(x - WL_X0, WL_X1 - 1 - x, y - WL_Y0, WL_Y1 - 1 - y) + 0.5  # px in from the housing's outer edge
+    if f < 2: return HOUSING, h(WL_CAVITY * f / 2), 0.6, 0.7, 0.0, 1.0  # chamfered frame down into the cavity
+    t = (y + 0.5 - (WL_Y0 + WL_Y1) / 2) / WL_TUBE_R                     # across the tube, -1..1
+    if abs(t) < 1 and WL_X0 + 4 <= x < WL_X1 - 4:                        # tube: frosted glass, glowing
+        glow = 0.35 + 0.65 * math.sqrt(1 - t * t)  # brightest along the crest, so it reads as a half-cylinder
+        # mid grey, not white: it glows by its emissive; a white surface would re-light itself from the strip
+        # light hung in front of it and blow out
+        return (110, 115, 120), h(WL_CAVITY - WL_TUBE_R * math.sqrt(1 - t * t)), 1.0, 0.3, 0.0, 1.0, \
+            tuple(round(c * glow) for c in LIGHT)
+    if abs(t) < 0.8 and x in (WL_X0 + 2, WL_X0 + 3, WL_X1 - 4, WL_X1 - 3):  # end caps: steel pins
+        return STEEL_SRGB, h(WL_CAVITY - 2.5), 0.8, 0.4, 1.0, 1.0
+    return HOUSING, h(WL_CAVITY), 0.4, 0.7, 0.0, 1.0                     # cavity floor
+
+
+walllight.parallax = True
+
+
+def slitlight(x, y):
+    """Plain plate with a thin light slit near its top edge (on a column's top panel: just under the ceiling): a 2 px
+    LED line in a 4 px recessed slot with a dark 1 px frame (rows 6..9, x 4..59), ends dimmed."""
+    X0, X1, Y0, Y1 = 4, 60, 6, 10
+    if not (X0 <= x < X1 and Y0 <= y < Y1): return math.inf, 0
+    if x in (X0, X1 - 1) or y in (Y0, Y1 - 1): return HOUSING, 0.55, 0.5, 0.7, 0.0, 1.0  # recessed dark frame
+    glow = 0.6 if x in (X0 + 1, X1 - 2) else 1.0
+    return (210, 225, 235), 0.6, 1.0, 0.25, 0.0, 1.0, tuple(round(c * glow) for c in LIGHT)  # frosted LED line
+
+
+def clearcoat_wl(x, y):
+    """→ (mask, normal rgb): the clear cover over the cavity, embossed with ridges along the slot (every 2 rows,
+    alternating tilt across Y)."""
+    if not (WL_X0 + 2 <= x < WL_X1 - 2 and WL_Y0 + 2 <= y < WL_Y1 - 2): return 0, (128, 128, 255)
+    ny = 0.35 if (y - WL_Y0) % 2 == 0 else -0.35
+    l = math.sqrt(ny * ny + 1)
+    return 255, (128, b(ny / l * 0.5 + 0.5), b(1 / l * 0.5 + 0.5))
+
+
+def side_slits(x, y, edges):
+    """A thin vertical light slit inside the given side edges (x 4..7 and/or 56..59, y 6..57; vertically centred,
+    so a half turn moves a left slit to the right edge): slitlight's slot, stood upright."""
+    if not 6 <= y < 58: return math.inf, 0
+    for X0 in edges:
+        if X0 <= x < X0 + 4:
+            if x in (X0, X0 + 3) or y in (6, 57): return HOUSING, 0.55, 0.5, 0.7, 0.0, 1.0  # recessed dark frame
+            glow = 0.6 if y in (7, 56) else 1.0
+            return (210, 225, 235), 0.6, 1.0, 0.25, 0.0, 1.0, tuple(round(c * glow) for c in LIGHT)
+    return math.inf, 0
+
+
+def sidelight(x, y):  # a slit inside each side edge: neighbouring tiles' slits pair up at the seam
+    return side_slits(x, y, (4, N - 8))
+
+
+def sidelight_left(x, y):  # one slit, inside the left edge (half-turned in the game, it's a right one)
+    return side_slits(x, y, (4,))
+
+
+def cover_dirt(x, y):
+    """0..1 grime on the clear cover: packed along its rim (where it meets the frame), thinning over ~2 px, with a
+    few specks inward; 4 dithered steps like the plate's grime."""
+    x0, x1, y0, y1 = WL_X0 + 2, WL_X1 - 2, WL_Y0 + 2, WL_Y1 - 2
+    if not (x0 <= x < x1 and y0 <= y < y1): return 0
+    d = min(x - x0, x1 - 1 - x, y - y0, y1 - 1 - y)        # px in from the cover's edge
+    speck = random.Random(f'cover {x} {y}').random()        # per texel, reproducible
+    g = max(1 - d / 2.2, 0) * (0.35 + 0.4 * speck) + (0.4 if speck > 0.94 else 0)  # a little: light, not caked
+    return min(int(min(g, 1) * 3 + ((0, 2), (3, 1))[y % 2][x % 2] / 4), 3) / 3
+
+
+PATCH = (18, 46, 16, 38)  # vent_patch's repair plate: x0, x1, y0, y1 (px)
+
+
+def vent_patch(x, y):
+    """Vent with a repair plate welded on top: brushed plate (holes under it hidden), a weld bead round its edge
+    and heat tint just outside, where holes still poke through."""
+    x0, x1, y0, y1 = PATCH
+    if x0 <= x < x1 and y0 <= y < y1:
+        if min(x - x0, x1 - 1 - x, y - y0, y1 - 1 - y) == 0: return (128, 126, 122), 1.3, 0.85, 0.6, 1.0, 1.0  # weld
+        return STEEL_SRGB, 1.2, 1.0, None, 1.0, 1.0                                                          # plate
+    out = max(x0 - 1 - x, x - x1, y0 - 1 - y, y - y1)  # px outside the plate, 0 = touching
+    d, R = vent(x, y)
+    if out < len(HEAT_TINT) and d >= R + BEVEL_W: return HEAT_TINT[out][1], 1.0, 1.0, None, 1.0, 1.0
+    return d, R
+
+
+STRAPS = ((20, 23), (41, 44))  # slits_strapped: straps' x spans (px), across the slot rows
+
+
+def slits_strapped(x, y):
+    """Slits with two rolled-steel straps on top, running across all the slots (smooth: not brushed)."""
+    for a, b_ in STRAPS:
+        if a <= x < b_ and 9 <= y < N - 9:
+            t = (x + 0.5 - (a + b_) / 2) / ((b_ - a) / 2)
+            return STEEL_SRGB, 1.0 + 0.3 * math.sqrt(max(1 - t * t, 0)), 1.0, 0.5, 1.0, 1.0
+    return slits(x, y)
+
+
+def cover_hatch(x, y):
+    """Cover plate with a recessed lifting slot (14 × 4 px stadium) in the middle, chamfered 1 px in."""
+    t = cover(x, y)
+    if len(t) == 2: return t
+    d = math.hypot(max(abs(x + 0.5 - N / 2) - 5, 0), y + 0.5 - N / 2) - 2  # <0 inside the slot
+    if d < 0: return STEEL_SRGB, t[1] - 0.45, 0.35, 0.6, 1.0, 1.0
+    if d < 1: return STEEL_SRGB, t[1] - 0.45 * (1 - d), 0.7, 0.6, 1.0, 1.0
+    return t
+
+
 def texel(d, R):
     """→ (base colour, height, ao, roughness, metalness, specular). Roughness None = brushed sheet: roughness
     and anisotropy come from the simulated scratches. AO only where the flat texture stands in for a cavity."""
@@ -131,36 +302,143 @@ def seam(x, y, t):  # tile edge: a groove pressed into the same brushed sheet
 lin = lambda c: (c / 255 / 12.92) if c <= 10 else ((c / 255 + 0.055) / 1.055) ** 2.4
 
 
+def value_noise(rng, cell, size):
+    """Periodic value noise: a random value per cell corner (cell must divide size), smoothstep-blended."""
+    g = size // cell
+    v = [[rng.random() for _ in range(g)] for _ in range(g)]
+
+    def f(x, y):
+        fx, fy = (x + 0.5) / cell - 0.5, (y + 0.5) / cell - 0.5
+        x0, y0 = math.floor(fx), math.floor(fy)
+        sx, sy = (lambda t: t * t * (3 - 2 * t))(fx - x0), (lambda t: t * t * (3 - 2 * t))(fy - y0)
+        row = lambda yy: v[yy % g][x0 % g] + (v[yy % g][(x0 + 1) % g] - v[yy % g][x0 % g]) * sx
+        return row(y0) + (row(y0 + 1) - row(y0)) * sy
+    return f
+
+
+BAYER = ((0, 2), (3, 1))
+dither4 = lambda g, x, y: min(int(min(g, 1) * 3 + BAYER[y % 2][x % 2] / 4), 3) / 3  # 4 levels, 2×2 ordered dither
+
+
 def grime_mask(name, T):
-    """0..1 grime per texel, in 4 dithered steps. Patches: three octaves of periodic value noise (cells 16, 8,
-    4 px; tiles). Edges: dirt packed within a pixel of anything occluded (the AO channel marks the cavities)."""
-    rng = random.Random(name + ' grime')
-
-    def octave(cell):
-        g = N // cell
-        v = [[rng.random() for _ in range(g)] for _ in range(g)]
-
-        def f(x, y):
-            fx, fy = (x + 0.5) / cell - 0.5, (y + 0.5) / cell - 0.5
-            x0, y0 = math.floor(fx), math.floor(fy)
-            sx, sy = (lambda t: t * t * (3 - 2 * t))(fx - x0), (lambda t: t * t * (3 - 2 * t))(fy - y0)
-            row = lambda yy: v[yy % g][x0 % g] + (v[yy % g][(x0 + 1) % g] - v[yy % g][x0 % g]) * sx
-            return row(y0) + (row(y0 + 1) - row(y0)) * sy
-        return f
-
-    o1, o2, o3 = octave(16), octave(8), octave(4)
-    BAYER = ((0, 2), (3, 1))
+    """0..1 baked grime per texel: dirt packed within a pixel of anything occluded (the AO channel marks the
+    cavities). Only on steel: holes and the lens stay clean."""
     M = [[0.0] * N for _ in range(N)]
     for y in range(N):
         for x in range(N):
             t = T[y][x]
-            if t[4] < 1 or t[5] < 1: continue  # holes and the lens: no steel to dirty
-            n = 0.55 * o1(x, y) + 0.3 * o2(x, y) + 0.15 * o3(x, y)
-            patch = min(max((n - 0.5) / 0.25, 0), 1)
+            if t[4] < 1 or t[5] < 1: continue
             edge = max(1 - T[(y + j) % N][(x + i) % N][2] for i in (-1, 0, 1) for j in (-1, 0, 1))
-            g = min(GRIME_PATCH * patch + GRIME_EDGE * edge, 1)
-            M[y][x] = min(int(g * 3 + BAYER[y % 2][x % 2] / 4), 3) / 3
+            M[y][x] = dither4(GRIME_EDGE * edge, x, y)
     return M
+
+
+def patch_grime():
+    """The scuff patches, shared by every tile: three octaves of periodic value noise (cells 16, 8, 4 px),
+    thresholded and dithered, over GRIME_N px so each tile's 64 px window is different."""
+    rng = random.Random('patch grime')
+    o1, o2, o3 = (value_noise(rng, c, GRIME_N) for c in (16, 8, 4))
+    def g(x, y):
+        n = 0.55 * o1(x, y) + 0.3 * o2(x, y) + 0.15 * o3(x, y)
+        return dither4(GRIME_PATCH * min(max((n - 0.5) / 0.25, 0), 1), x, y)
+    return [[g(x, y) for x in range(GRIME_N)] for y in range(GRIME_N)]
+
+
+def muzzle_flash(rng, stage):
+    """One muzzle-flash frame, FLASH_N px, seen end-on from behind the gun: a white-hot core and flame prongs bursting
+    out of the flash hider (an M4's birdcage vents up and to the sides, so the prongs favour the top half), their
+    edges ragged with noise. stage 0 is the bang (big, white-yellow); stage 1 the next instant (the core gone dim,
+    prongs shorter, broken and redder, a few sparks). Heat is posterised to FLASH_PALETTE: pixel art, hard edges, the
+    cooler bands dithered thinner (FLASH_COVER) so the scene shows through the flame's outer wisps,
+    no blending. Returns RGBA rows (transparent black outside)."""
+    c = FLASH_N / 2
+    k = rng.randint(4, 6)
+    prongs = []
+    for i in range(k):
+        a = -math.pi / 2 + (i - (k - 1) / 2) * (2.4 / k) + rng.uniform(-0.25, 0.25)  # around the top, y down
+        if rng.random() < 0.3: a += math.pi  # now and then one out of the bottom
+        prongs.append((a, rng.uniform(0.55, 0.95) * c, rng.uniform(0.12, 0.22)))
+    noise = value_noise(rng, 8, FLASH_N)
+    core_r = (0.32 if stage == 0 else 0.18) * c
+    scale, cool = (1.0, 0.0) if stage == 0 else (0.75, 0.3)
+    rows = []
+    for y in range(FLASH_N):
+        row = []
+        for x in range(FLASH_N):
+            dx, dy = x + 0.5 - c, y + 0.5 - c
+            r, ang = math.hypot(dx, dy), math.atan2(dy, dx)
+            jag = 0.75 + 0.5 * noise(x, y)
+            h = max(0.0, 1 - r / (core_r * jag)) * 1.4  # the core
+            for a, L, w in prongs:
+                da = abs((ang - a + math.pi) % (2 * math.pi) - math.pi)
+                t = r / (L * scale * jag)
+                if t < 1 and da < w * (1 - 0.7 * t) * 2.2:
+                    h = max(h, (1 - t) ** 0.8 * (1 - da / (w * (1 - 0.7 * t) * 2.2)) * 1.1)
+            h -= cool * (0.6 + 0.8 * noise(x * 2 + 7, y * 2 + 3) - 0.4) if stage else 0
+            if stage and h < 0.12 and rng.random() < 0.012 and r < c * 0.9: h = 0.5  # sparks
+            px = (0, 0, 0, 0)
+            for (lo, col), cover in zip(FLASH_PALETTE, FLASH_COVER):
+                if h > lo:
+                    if (BAYER4[y % 4][x % 4] + 0.5) / 16 < cover: px = (*col, 255)  # the cooler bands thin out
+                    break
+            row.append(px)
+        rows.append(row)
+    return rows
+
+
+def drip_grime():
+    """The walls' grime: years of moisture sliding down. Streaks start at leak points (mostly the ceiling joint and
+    the row seams, where water collects), run down meandering a pixel now and then, strongest at the source and fading
+    as they go, some ending in a bead; older ones wider and fainter. A stain line sits under each seam where water
+    stood, and dirt is splashed up near the floor. Slow noise along the wall clusters it all, so some stretches are
+    badly stained and others nearly clean. Row 0 is the top of the wall; tiles round the 32 m width. Dithered to the
+    same 4 levels as the other grime. The game reads it in world space, so streaks run down across tile rows."""
+    rng = random.Random('drip grime')
+    G = [[0.0] * DRIP_W for _ in range(DRIP_H)]
+    def add(x, y, v):  # stains build up: 1 − Π(1 − v)
+        if 0 <= y < DRIP_H:
+            row = G[y]; x %= DRIP_W
+            row[x] = 1 - (1 - row[x]) * (1 - min(v, 1))
+    def noise1(cell):  # periodic 1D value noise along the wall (cell divides DRIP_W)
+        g = DRIP_W // cell; v = [rng.random() for _ in range(g)]
+        def f(x):
+            t = x / cell; i = math.floor(t); u = t - i; u = u * u * (3 - 2 * u)
+            return v[i % g] * (1 - u) + v[(i + 1) % g] * u
+        return f
+    n1, n2, n3, n4 = noise1(128), noise1(32), noise1(8), noise1(4)
+    leak = lambda x: max(0.0, 0.6 * n1(x) + 0.4 * n2(x) - 0.15) / 0.85  # 0 dry … 1 badly stained
+    # the old wash: under every leaky stretch a faint curtain of fine vertical striations runs down from the
+    # ceiling joint and each seam, fading as it goes (the sum of decades of streaks too faint to tell apart)
+    for y in range(DRIP_H):
+        below = y - max([0, *[sy for sy in DRIP_SEAMS if sy <= y]])
+        fade = math.exp(-below / 30)
+        for x in range(DRIP_W):
+            add(x, y, 0.5 * leak(x) ** 2 * fade * (0.3 + 0.7 * n4(x)))
+    for _ in range(1600):
+        x = rng.randrange(DRIP_W)
+        if rng.random() > leak(x) ** 1.5: continue
+        y0 = rng.choice((0, 0, *DRIP_SEAMS, rng.randrange(DRIP_H)))
+        for _ in range(rng.randint(1, 5)):  # a leak sheds a few streaks close together
+            age = rng.random()  # 0 new … 1 old
+            w = 1 if age < 0.5 else 2 if age < 0.85 else 3
+            s = (0.9 - 0.55 * age) * (0.6 + 0.4 * rng.random())
+            L = min(DRIP_H - y0, int(rng.expovariate(1 / (40 + 120 * leak(x)))) + 6)
+            cx = x + round(rng.gauss(0, 3))
+            for i in range(L):
+                if rng.random() < 0.06: cx += rng.choice((-1, 1))  # meanders
+                f = s * (1 - i / L) ** 0.7 * (1.3 if i < 2 else 1)  # strongest at the source, fading
+                for dx in range(w): add(cx + dx, y0 + i, f * (0.75 if w > 2 and dx in (0, w - 1) else 1))
+            if rng.random() < 0.4:  # a bead where it stopped
+                for dx in range(-1, w + 1):
+                    for dy in (-1, 0): add(cx + dx, y0 + L + dy, 0.9 * s)
+    for sy in DRIP_SEAMS:  # stain lines where water stood on each seam
+        for x in range(DRIP_W):
+            add(x, sy, 0.45 * leak(x)); add(x, sy + 1, 0.25 * leak(x))
+    for y in range(DRIP_H - 24, DRIP_H):  # splashed up from the floor, patchy
+        t = (y - (DRIP_H - 24)) / 24
+        for x in range(DRIP_W):
+            add(x, y, 0.55 * t * t * (0.5 + 0.5 * n3(x + 3 * y)) * (0.4 + 0.6 * leak(x)))
+    return [[dither4(GRIME_DRIP * v, x, y) for x, v in enumerate(row)] for y, row in enumerate(G)]
 
 
 def brushed(seed):
@@ -230,7 +508,8 @@ def png(path, rows, bits=8):
     else:
         color = 2 if len(rows[0][0]) == 3 else 6
         raw = b''.join(b'\0' + bytes(c for px in row for c in px) for row in rows)
-    path.write_bytes(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', N, N, bits, color, 0, 0, 0))
+    w, h = len(rows[0]), len(rows)
+    path.write_bytes(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, bits, color, 0, 0, 0))
                      + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
     print('wrote', path)
 
@@ -238,7 +517,16 @@ def png(path, rows, bits=8):
 b = lambda v: max(0, min(255, round(v * 255)))
 out = Path(__file__).resolve().parent.parent / 'textures'
 out.mkdir(exist_ok=True)
-for shape in (vent, slits, plain, light, cover):
+P = patch_grime()
+png(out / 'grime.png', [[(b(v),) * 3 for v in row] for row in P])
+print(f'  grime: patches cover {sum(map(sum, P)) / GRIME_N / GRIME_N:.0%} on average (applied per tile in the game)')
+rng = random.Random('muzzle flash')
+frames = [[muzzle_flash(random.Random(f'flash {v}'), st) for v in range(FLASH_VARIANTS)] for st in (0, 1)]
+png(out / 'muzzle_flash.png', [sum((f[y] for f in row), []) for row in frames for y in range(FLASH_N)])  # variants across, stages down
+D = drip_grime()
+png(out / 'grime_drip.png', [[(b(v),) * 3 for v in row] for row in D])
+print(f'  drip grime: streaks cover {sum(map(sum, D)) / DRIP_W / DRIP_H:.0%} of the walls on average')
+for shape in (vent, vent_patch, slits, slits_strapped, plain, plain_bolted, plain_welded, light, slitlight, sidelight, sidelight_left, cover, cover_hatch, walllight):
     name = shape.__name__
     _, var_x, var_y = downsample(*brushed(name))  # scratch heights stay out of the normal map (see top)
     alpha = lambda var: [[math.sqrt(BASE_ALPHA ** 2 + 2 * v) for v in row] for row in var]  # LEAN/Toksvig
@@ -280,10 +568,16 @@ for shape in (vent, slits, plain, light, cover):
     png(out / f'{name}_a.png', [[aniso(x, y) for x in range(N)] for y in range(N)])
     if any(len(t) > 6 for row in T for t in row):
         png(out / f'{name}_e.png', [[t[6] if len(t) > 6 else (0, 0, 0) for t in row] for row in T])
+    if getattr(shape, 'parallax', False):
+        depth = lambda v: (b(min(max((BUMP - v) / PARALLAX_RANGE, 0), 1)),) * 3  # plate (BUMP px) = 0
+        png(out / f'{name}_depth.png', [[depth(v) for v in row] for row in H])
+        png(out / f'{name}_ccn.png', [[clearcoat_wl(x, y)[1] for x in range(N)] for y in range(N)])
+        png(out / f'{name}_ccm.png', [[(round(clearcoat_wl(x, y)[0] * (1 - 0.8 * cover_dirt(x, y))), b(cover_dirt(x, y)),
+                                        clearcoat_wl(x, y)[0]) for x in range(N)] for y in range(N)])
 
     # Still clearly brushed: at least 2× smoother along the brush than across
     pairs = sorted((alpha_y[y][x], alpha_x[y][x]) for y in range(N) for x in range(N) if brush[y][x])
     ay_med, ax_med = pairs[len(pairs) // 2][0], sorted(p[1] for p in pairs)[len(pairs) // 2]
     print(f'  {name}: height {lo:.2f}..{hi:.2f} px, alpha across {ay_med:.3f} / along {ax_med:.3f} = {ay_med / ax_med:.1f}×,'
-          f' grime {sum(map(sum, G)) / N / N:.0%} average')
+          f' edge grime {sum(map(sum, G)) / N / N:.0%} average')
     assert ay_med / ax_med >= 2, 'brush lines must be at least 2× smoother along than across'
