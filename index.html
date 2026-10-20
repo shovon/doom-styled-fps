@@ -2,26 +2,40 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Runner</title>
+<title>Sprite Doom</title>
 <style>
 body{margin:0;overflow:hidden}
+canvas{image-rendering:pixelated}
 #ui{position:fixed;top:8px;left:8px;right:8px;color:#fff;font:13px sans-serif;text-shadow:0 1px 2px #000;pointer-events:none}
 #stats{margin-top:4px;font-family:ui-monospace,monospace}
+#start{position:fixed;inset:0;display:grid;place-items:center;color:#fff;font:bold 28px sans-serif;text-shadow:0 2px 6px #000;pointer-events:none}
+#crosshair{position:fixed;left:50%;top:50%;width:4px;height:4px;margin:-2px 0 0 -2px;background:#fff;box-shadow:0 0 2px #000;pointer-events:none}
+#ammo{position:fixed;right:16px;bottom:12px;color:#fff;font:bold 28px ui-monospace,monospace;text-shadow:0 2px 4px #000;pointer-events:none}
+#credit{position:fixed;left:8px;bottom:6px;color:#fff;opacity:.7;font:11px sans-serif;text-shadow:0 1px 2px #000;pointer-events:none}
 </style>
 <script type="importmap">
 {"imports":{"three":"https://unpkg.com/three@0.170.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.170.0/examples/jsm/"}}
 </script>
 </head>
 <body>
-<div id="ui"><div id="hud">WASD move · Shift walk · drag to orbit · C first person · B bounds · F freeze sprite · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · R distance LOD · H sprite shadows · = / - add/remove 10 demons</div>
+<div id="ui"><div id="hud">WASD move · Shift sprint · mouse look · click fire · R reload · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · = / - add/remove 10 demons</div>
 <div id="stats"></div></div>
+<div id="start">Click to play</div>
+<div id="crosshair"></div>
+<div id="ammo"></div>
+<div id="credit">Weapon: "M4 - FPS Weapon Animations Pack (v.1)" by BarcodeGames (sketchfab.com/barcodegames), CC-BY-4.0</div>
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
+RectAreaLightUniformsLib.init(); // rect area lights (the ceiling strips) need their lookup tables
 
 // ---------------------------------------------------------------------------
 // SpriteImpostor: renders a model off-screen into a small texture and shows it
@@ -279,17 +293,21 @@ class SpriteImpostor extends THREE.Group {
 }
 
 // ---------------------------------------------------------------------------
-// Demo scene
+// Demo: first-person, Doom-style. The world's demons are SpriteImpostors; your
+// weapon is the same trick drawn flat over the screen.
 // ---------------------------------------------------------------------------
-const WALK = 1.8, RUN = 5;   // player m/s — tune to stop foot sliding
-const FACING = Math.PI;      // Soldier.glb faces -Z; use 0 for +Z-facing models
-const DEMON_WALK = 1.4;      // NPC demon m/s — tune to stop foot sliding
+const MOVE = 4.5, SPRINT = 7.5;  // player m/s
+const EYE_HEIGHT = 1.6;
+const DEMON_WALK = 1.33;     // NPC demon m/s: Orc Walk stride (1.65 m per 1.13 s cycle) × 0.91 leg scale
+const DEMON_FAST = 1.8;      // fast pace multiplier; speeds up the walk clip by the same factor, so feet still match
 const DEMON_FACING = 0;      // demon.glb facing offset (0 = faces +Z); set Math.PI if they walk backwards
 const RT_SIZES = [128, 256, 512, 64]; // sprite resolutions cycled with P (first is the default)
 let rtSizeIdx = 0;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(devicePixelRatio);
+// 1 canvas pixel per CSS pixel, even on Retina: a quarter of the shading work, and with 64 px textures, low-res
+// sprites and a 240 px weapon, there's no detail to lose. The browser scales the canvas up, crisp (see CSS).
+renderer.setPixelRatio(1);
 renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -299,14 +317,20 @@ renderer.info.autoReset = false;     // count every render call in a frame, not 
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xa8bccf);
-scene.fog = new THREE.Fog(0xa8bccf, 25, 90);
+// Scary: no ambient. The room environment (the even fill light, and what metal reflects) is off, so only
+// the light strips and muzzle flashes light anything; the distance fades into black, not sky blue.
+// The sprite stage and the gun copy this intensity. Raise it a hair (say 0.02) for a sliver of fill.
+scene.background = new THREE.Color(0x000000);
+scene.fog = new THREE.Fog(0x000000, 25, 90);
 scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment()).texture;
-scene.environmentIntensity = 0.5;
+scene.environmentIntensity = 0;
 
 const sunOffset = new THREE.Vector3(8, 15, 6);
-const sun = new THREE.DirectionalLight(0xfff2e0, 2.5);
-sun.castShadow = true;
+// The arena is roofed (ceiling below), so no sunlight gets in: intensity 0, and no shadow pass to pay for.
+// The sprite stage and the gun copy this intensity. Inside, light comes from the strip lights and muzzle
+// flashes. For daylight again: 2.5 and castShadow = true.
+const sun = new THREE.DirectionalLight(0xfff2e0, 0);
+sun.castShadow = false;
 sun.shadow.mapSize.set(2048, 2048);
 Object.assign(sun.shadow.camera, { left: -15, right: 15, top: 15, bottom: -15 });
 scene.add(sun, sun.target);
@@ -331,85 +355,415 @@ const flashes = Array.from({ length: 4 }, () => {
   return { world, sprite, ttl: 0 };
 });
 // ponytail: pool of 4; shots beyond 4 simultaneous flashes don't light anything. Raise it if that shows.
-function muzzleFlash(muzzle) {
+function muzzleFlash(position) {
   const f = flashes.find((f) => f.ttl <= 0);
   if (!f) return;
-  muzzle.getWorldPosition(f.world.position);
-  f.sprite.position.copy(f.world.position);
+  f.world.position.copy(position);
+  f.sprite.position.copy(position);
   f.world.intensity = f.sprite.intensity = FLASH_INTENSITY;
   f.ttl = FLASH_TIME;
 }
 
-// UE-ish prototype floor
-const floor = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardMaterial({ color: 0x8a8a8a, roughness: 0.9 }));
-floor.rotation.x = -Math.PI / 2;
-floor.receiveShadow = true;
-const grid = new THREE.GridHelper(400, 400, 0x5a5a5a, 0x6e6e6e);
-grid.position.y = 0.01;
-scene.add(floor, grid);
+// Floor: 400 m square of 2 m steel tiles, each picked at random from FLOOR_TILES by weight. PBR sets authored by
+// tools/plate_textures.py; every map is point-sampled up close so highlights land per texel (the chunky
+// "realistic pixel art" look). One InstancedMesh per tile type = one draw call each.
+const FLOOR_TILES = { plain: 0.3, cover: 0.15, vent: 0.25, slits: 0.25, light: 0.05 }, TILE = 2, TILES = 200; // name: share of tiles (blank plates, bare or covered: 45%)
+// Tiles that glow, and how hard: emissiveIntensity > 1 is brighter than white in the HDR buffer, before ACES
+// tone mapping. It glows in the dark and under a flash, but lights nothing else (that needs real lights).
+// 5 puts the lens centre at ~3× white (luminance): over BLOOM_THRESHOLD, still LED-blue rather than blown out.
+const TILE_GLOW = { light: 5 };
+const texLoader = new THREE.TextureLoader();
+const loadMap = (file, colorSpace = THREE.NoColorSpace) => {
+  const t = texLoader.load(`textures/${file}.png`);
+  t.colorSpace = colorSpace; // albedo and emissive are colour; normal/ORM are data and stay linear
+  t.magFilter = THREE.NearestFilter; // mipmaps still keep the distance from shimmering
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+};
+const tileGeo = new THREE.PlaneGeometry(TILE, TILE).rotateX(-Math.PI / 2);
+const tileWeights = Object.values(FLOOR_TILES);
+const tilePick = Array.from({ length: TILES * TILES }, () => {
+  let r = Math.random() * tileWeights.reduce((a, w) => a + w, 0), type = 0;
+  while (type < tileWeights.length - 1 && (r -= tileWeights[type]) > 0) type++;
+  return type;
+});
+const tilePos = (cell, y = 0) =>
+  new THREE.Vector3(((cell % TILES) - TILES / 2 + 0.5) * TILE, y, (Math.floor(cell / TILES) - TILES / 2 + 0.5) * TILE);
+const tileMats = {}; // name → material, shared by the floor and the arena wall
+Object.keys(FLOOR_TILES).forEach((name, type) => {
+  const orm = loadMap(`${name}_orm`);
+  // Physical, not Standard, for the per-texel specular strength (ORM alpha): it zeroes the ~4% sheen every
+  // non-metal has, so the black holes stay black even under a muzzle flash
+  const mat = new THREE.MeshPhysicalMaterial({
+    map: loadMap(name, THREE.SRGBColorSpace), normalMap: loadMap(`${name}_n`),
+    aoMap: orm, roughnessMap: orm, metalnessMap: orm, specularIntensityMap: orm,
+    metalness: 1, // the maps multiply these factors, and metalness defaults to 0 (= no metal at all)
+    // Brushed steel: rougher across the brush lines than along them, so highlights streak across the lines
+    anisotropy: 1, anisotropyMap: loadMap(`${name}_a`),
+    envMapIntensity: 0.47, // metal has no diffuse: reflections are most of what you see. Tuned with the
+    // stainless base colour (0.56 linear) to keep the floor as bright as the old darker plate at 0.8
+    ...(TILE_GLOW[name] && { emissive: 0xffffff, emissiveMap: loadMap(`${name}_e`, THREE.SRGBColorSpace), emissiveIntensity: TILE_GLOW[name] }),
+    shadowSide: THREE.DoubleSide, // single-sided wall tiles still cast shadows whichever way they face the sun
+  });
+  tileMats[name] = mat;
+  const cells = tilePick.flatMap((t, i) => (t === type ? [i] : []));
+  const mesh = new THREE.InstancedMesh(tileGeo, mat, cells.length);
+  const m = new THREE.Matrix4();
+  cells.forEach((cell, i) => mesh.setMatrixAt(i, m.makeTranslation(tilePos(cell))));
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+});
+
+// Arena wall: a square ARENA m out each way, on the floor's tile seams, WALL_ROWS tiles high. The same 2 m
+// tiles as the floor, stood up facing inward in alternating columns of cover plates and lights. Single-sided:
+// you can't get out to see the back (the player is kept inside, below).
+const ARENA = 32, WALL_ROWS = 2;
+const WALL_TILES = ['cover', 'light']; // alternate along the wall, same all the way up
+const wallCells = Object.fromEntries(WALL_TILES.map((n) => [n, []]));
+const wallGeo = new THREE.PlaneGeometry(TILE, TILE); // faces +Z, texture X along the wall, Y up
+for (const [nx, nz] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) { // each wall's inward normal
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.atan2(nx, nz));
+  const count = (2 * ARENA) / TILE;
+  for (let k = 0; k < count; k++) {
+    const along = (k - count / 2 + 0.5) * TILE;
+    for (let r = 0; r < WALL_ROWS; r++) {
+      const pos = new THREE.Vector3(nx ? -nx * ARENA : along, (r + 0.5) * TILE, nz ? -nz * ARENA : along);
+      wallCells[WALL_TILES[k % 2]].push({ pos, q, normal: new THREE.Vector3(nx, 0, nz) });
+    }
+  }
+}
+for (const name of WALL_TILES) {
+  const cells = wallCells[name], one = new THREE.Vector3(1, 1, 1), m = new THREE.Matrix4();
+  const mesh = new THREE.InstancedMesh(wallGeo, tileMats[name], cells.length);
+  cells.forEach((c, i) => mesh.setMatrixAt(i, m.compose(c.pos, c.q, one)));
+  mesh.castShadow = mesh.receiveShadow = true;
+  scene.add(mesh);
+}
+
+// Ceiling: closes the arena on top of the wall, tiles facing down in a checkerboard of slit vents and plain,
+// with a light tile every CEIL_LIGHT_EVERY tiles each way (in place of a vent)
+const CEILING_TILES = ['slits', 'plain', 'light'], CEIL_LIGHT_EVERY = 4;
+const ceilingGeo = new THREE.PlaneGeometry(TILE, TILE).rotateX(Math.PI / 2); // faces down
+const ceilLightTiles = []; // where the ceiling lights are, just under the ceiling
+{
+  const count = (2 * ARENA) / TILE, cells = Object.fromEntries(CEILING_TILES.map((n) => [n, []]));
+  for (let i = 0; i < count; i++) for (let j = 0; j < count; j++) {
+    const p = new THREE.Vector3((i - count / 2 + 0.5) * TILE, WALL_ROWS * TILE, (j - count / 2 + 0.5) * TILE);
+    const lit = i % CEIL_LIGHT_EVERY === CEIL_LIGHT_EVERY / 2 && j % CEIL_LIGHT_EVERY === CEIL_LIGHT_EVERY / 2;
+    cells[lit ? 'light' : CEILING_TILES[(i + j) % 2]].push(p);
+    if (lit) ceilLightTiles.push(p.clone().setY(p.y - 0.02));
+  }
+  for (const name of CEILING_TILES) {
+    const mesh = new THREE.InstancedMesh(ceilingGeo, tileMats[name], cells[name].length), m = new THREE.Matrix4();
+    cells[name].forEach((p, i) => mesh.setMatrixAt(i, m.makeTranslation(p)));
+    scene.add(mesh);
+  }
+}
+
+// Strip lights: the light tiles' glow on their surroundings. ~2000 light tiles is far too many real lights,
+// so a fixed pool follows the nearest ones (fixed count = no shader recompiles), mirrored into the sprite
+// stage like the flashes. Each fades out toward the pool's edge (the next-nearest tile left out, or
+// STRIP_REACH), so a light handing over to another tile is already at zero: no popping.
+const STRIP_POOL = 8, STRIP_REACH = 14, STRIP_FADE = 4; // lights, metres, metres
+const STRIP_COLOR = 0x96d2ff, STRIP_INTENSITY = 2, STRIP_RANGE = 5, STRIP_HEIGHT = 0.25; // match LIGHT in the generator
+const lightType = Object.keys(FLOOR_TILES).indexOf('light');
+const stripTiles = [
+  ...tilePick.flatMap((t, cell) => (t === lightType ? [tilePos(cell, STRIP_HEIGHT)] : [])),
+  ...wallCells.light.map((c) => c.pos.clone().addScaledVector(c.normal, STRIP_HEIGHT)), // just off the wall
+];
+const stripLights = Array.from({ length: STRIP_POOL }, () => {
+  const world = new THREE.PointLight(STRIP_COLOR, 0, STRIP_RANGE, 2);
+  const sprite = world.clone();
+  scene.add(world);
+  stage.add(sprite);
+  return { world, sprite };
+});
+// Moves a pool of { world, sprite } lights onto the tiles nearest the camera, fading each out toward the
+// pool's edge so a light hands over to another tile at zero
+function updatePool(tiles, lights, reach, fade, intensity) {
+  const near = [];
+  for (const p of tiles) {
+    const d = p.distanceTo(camera.position);
+    if (d < reach) near.push({ d, p });
+  }
+  near.sort((a, b) => a.d - b.d);
+  const edge = Math.min(reach, near[lights.length]?.d ?? Infinity);
+  lights.forEach(({ world, sprite }, i) => {
+    const n = near[i];
+    if (n) { world.position.copy(n.p); sprite.position.copy(n.p); }
+    world.intensity = sprite.intensity = n ? intensity * THREE.MathUtils.clamp((edge - n.d) / fade, 0, 1) : 0;
+  });
+}
+
+// Ceiling lights: rect area lights, the strip's own shape (1.6 × 0.2 m, the lens on the tile), shining down
+// only: soft, shaped highlights instead of a point's pinprick. Pricier per pixel than a point light and no
+// shadows, so again a pool over the nearest; not in the sprites' light mask (no `distance`), so a demon's
+// sprite picks up changes on its next pose step.
+const CEIL_POOL = 8, CEIL_REACH = 20, CEIL_FADE = 6, CEIL_INTENSITY = 60;
+const ceilLights = Array.from({ length: CEIL_POOL }, () => {
+  const world = new THREE.RectAreaLight(STRIP_COLOR, 0, 1.6, 0.2);
+  world.rotation.x = -Math.PI / 2; // it emits along its -Z: straight down, long side along X like the tile
+  const sprite = world.clone();
+  scene.add(world);
+  stage.add(sprite);
+  return { world, sprite };
+});
 
 const boxMat = new THREE.MeshStandardMaterial({ color: 0xd9d9d9, roughness: 0.6 });
 for (let i = 0; i < 40; i++) {
   const s = 1 + Math.random() * 3;
   const b = new THREE.Mesh(new THREE.BoxGeometry(s, s, s), boxMat);
-  b.position.set((Math.random() - 0.5) * 80, s / 2, (Math.random() - 0.5) * 80);
+  b.position.set((Math.random() - 0.5) * 2 * (ARENA - 4), s / 2, (Math.random() - 0.5) * 2 * (ARENA - 4)); // inside the wall
   b.castShadow = b.receiveShadow = true;
   scene.add(b);
 }
 
-const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 200);
-camera.position.set(0, 2.5, 5);
-const controls = new OrbitControls(camera, renderer.domElement);
-Object.assign(controls, { enablePan: false, enableDamping: true, minDistance: 2, maxDistance: 12, maxPolarAngle: Math.PI / 2 - 0.05 });
+// First-person camera: click to capture the mouse
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(0, EYE_HEIGHT, 0);
 
-// First person (C): mouse-look with pointer lock, eye at the player's head, own sprite hidden
-const EYE_HEIGHT = 1.6;
+// Post: the world renders into an HDR buffer, anything brighter than BLOOM_THRESHOLD (emissive strips, hot
+// metal glints) bleeds a glow, then OutputPass applies the renderer's ACES tone mapping and sRGB.
+// No MSAA on the HDR buffer: an off-screen half-float MSAA resolve cost about as much as the whole scene, and
+// hard edges suit the pixel art. Bloom runs at the canvas's resolution: with the render capped at 1× density
+// that's already a quarter of the Retina pixels (an extra half-res bloom on top looked too blocky).
+// Threshold 2.5: with ambient off nothing but the lens centres (and the odd light glint) gets that bright.
+// With the room environment on, polished metal reflected it at up to ~40× and needed 10.
+const BLOOM_STRENGTH = 0.6, BLOOM_RADIUS = 0.4, BLOOM_THRESHOLD = 2.5;
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, {
+  type: THREE.HalfFloatType,
+}));
+composer.setSize(innerWidth, innerHeight);
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), BLOOM_STRENGTH, BLOOM_RADIUS, BLOOM_THRESHOLD);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
 const look = new PointerLockControls(camera, renderer.domElement);
-let firstPerson = false;
-renderer.domElement.addEventListener('click', () => { if (firstPerson && !look.isLocked) look.lock(); }); // re-grab after Esc
-function setFirstPerson(on) {
-  firstPerson = on;
-  player.hidden = on;
-  controls.enabled = !on;
-  camera.getWorldDirection(fwd).setY(0).normalize();
-  if (on) {
-    camera.rotation.set(0, Math.atan2(-fwd.x, -fwd.z), 0, 'YXZ'); // level gaze, same heading as the orbit camera
-    look.lock();
-  } else {
-    look.unlock();
-    camera.position.copy(player.model.position).addScaledVector(fwd, -5).y += 2.5; // back behind the player
-  }
-}
+const startEl = document.getElementById('start');
+renderer.domElement.addEventListener('click', () => { if (!look.isLocked) look.lock(); });
+look.addEventListener('lock', () => (startEl.style.display = 'none'));
+look.addEventListener('unlock', () => { startEl.style.display = ''; trigger = false; });
 
 const opts = {
   stage, resolution: RT_SIZES[0], snaps: 16, pitchSnaps: 8, distance: 5, animFps: 12,
-  stepped: true, snap: true, lockDist: true, real: false, bounds: false, spriteShadows: false, lod: true, lodNear: 8, lodFalloff: 0.25, sun, flashLights: flashes.map((f) => f.sprite),
+  stepped: true, snap: true, lockDist: true, real: false, bounds: false, spriteShadows: false,
+  lod: true, lodNear: 8, lodFalloff: 0.25, sun, flashLights: [...flashes, ...stripLights].map((l) => l.sprite),
 };
 
-let demonGltf, player, playerActions, current;
-const npcs = []; // { imp, target }
+// ---------------------------------------------------------------------------
+// Weapon "viewmodel": arms + M4 rendered off-screen from the rig's own camera joint, at low
+// resolution, then drawn flat over the screen. It has its own little world (gunScene); world
+// lights are carried into it through view space, since your eye is the camera in both worlds.
+// ---------------------------------------------------------------------------
+const GUN_RES = 240;          // weapon render height in pixels (width follows the screen's aspect)
+const GUN_FOV = 60;
+const RELOAD_SPEED = 2.5;    // reload clips play this much faster (3.6 s → 1.45 s): the demons don't wait
+const MAG = 30, FIRE_INTERVAL = 0.075; // rounds per magazine, seconds between shots (800 rpm, mid M4A1 range)
+const BOB = 0.04;             // weapon bob size, in screen units (2 = full screen height)
 
-function makeCharacter(model) {
-  model.traverse((o) => { if (o.isMesh) o.castShadow = false; }); // blob shadows in both modes, so V compares fairly
-  const mixer = new THREE.AnimationMixer(model);
-  const imp = new SpriteImpostor(model, mixer, opts);
-  scene.add(imp);
-  return imp;
+const gunScene = new THREE.Scene();
+gunScene.environment = scene.environment;
+gunScene.environmentIntensity = scene.environmentIntensity;
+const gunSun = new THREE.DirectionalLight(sun.color, sun.intensity);
+gunScene.add(gunSun, gunSun.target);
+const gunFlashes = flashes.map((f) => { const l = f.world.clone(); gunScene.add(l); return l; });
+// The strip lights too: with no ambient they're all that lights the gun between shots. Like the pose, they
+// update when the weapon re-renders (stepped), not every frame.
+const gunStrips = stripLights.map((s) => { const l = s.world.clone(); gunScene.add(l); return l; });
+const gunCeil = ceilLights.map((c) => { const l = c.world.clone(); gunScene.add(l); return l; });
+const gunCam = new THREE.PerspectiveCamera(GUN_FOV, 1, 0.01, 10);
+const gunRT = new THREE.WebGLRenderTarget(1, 1, {
+  type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
+});
+const hudScene = new THREE.Scene(), hudCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const gunQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({
+  map: gunRT.texture, transparent: true, premultipliedAlpha: true, depthTest: false, depthWrite: false,
+}));
+hudScene.add(gunQuad);
+function sizeGun() {
+  const w = Math.round((GUN_RES * innerWidth) / innerHeight);
+  gunRT.setSize(w, GUN_RES);
+  gunCam.aspect = w / GUN_RES;
+  gunCam.updateProjectionMatrix();
+  if (gun) gun.dirty = true;
 }
+
+const muzzleSprite = new THREE.Mesh(new THREE.PlaneGeometry(0.22, 0.22), new THREE.MeshBasicMaterial({
+  map: (() => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const g = c.getContext('2d'), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(255,255,220,1)');
+    gr.addColorStop(0.3, 'rgba(255,190,80,0.9)');
+    gr.addColorStop(1, 'rgba(255,90,0,0)');
+    g.fillStyle = gr;
+    g.fillRect(0, 0, 64, 64);
+    return new THREE.CanvasTexture(c);
+  })(),
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+}));
+muzzleSprite.visible = false;
+gunScene.add(muzzleSprite);
+
+let gun = null;      // { root, mixer, actions, joint, muzzle, ammo, busy, cooldown, animAcc, lastLights, dirty, flashUntil }
+let trigger = false; // left mouse held
+const _toGun = new THREE.Matrix4(), _gs = new THREE.Vector3(), _mw = new THREE.Vector3();
+const _tgp = new THREE.Vector3(), _tgq = new THREE.Quaternion();
+
+function setupGun(g) {
+  // The pack's clips are slices of one long timeline (Fire's keys sit at 7.5–8.3 s); move each to start at 0
+  for (const clip of g.animations) {
+    const start = Math.min(...clip.tracks.map((t) => t.times[0]));
+    clip.tracks.forEach((t) => t.shift(-start));
+    clip.resetDuration();
+  }
+  const root = g.scene;
+  // Skinned meshes get their culling sphere from the pose they're first drawn in. Draw starts with the
+  // arms below the screen, so the gloves were culled for good afterwards. The weapon is always in view.
+  root.traverse((o) => { if (o.isSkinnedMesh) o.frustumCulled = false; });
+  gunScene.add(root);
+  root.updateMatrixWorld(true);
+  // No muzzle bone: take the front-most vertices of the rifle body as the barrel tip
+  const main = root.getObjectByName('Main_M4_D_0'), mainJoint = root.getObjectByName('Main_j_049');
+  const pos = main.geometry.attributes.position, v = new THREE.Vector3(), tip = new THREE.Vector3();
+  let maxZ = -Infinity, n = 0;
+  for (let i = 0; i < pos.count; i++) maxZ = Math.max(maxZ, v.fromBufferAttribute(pos, i).applyMatrix4(main.matrixWorld).z);
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).applyMatrix4(main.matrixWorld);
+    if (v.z > maxZ - 0.01) { tip.add(v); n++; }
+  }
+  const muzzle = new THREE.Object3D();
+  mainJoint.add(muzzle);
+  muzzle.position.copy(mainJoint.worldToLocal(tip.divideScalar(n)));
+
+  const mixer = new THREE.AnimationMixer(root);
+  const actions = Object.fromEntries(g.animations.map((c) => {
+    const a = mixer.clipAction(c);
+    a.setLoop(THREE.LoopOnce);
+    a.clampWhenFinished = true; // every clip ends in the ready pose, so holding the last frame = idle
+    return [c.name, a];
+  }));
+  actions.Reload.timeScale = actions.Reload_Empty.timeScale = RELOAD_SPEED;
+  gun = {
+    root, mixer, actions, muzzle, joint: root.getObjectByName('FPS_Camera_j_01'),
+    ammo: MAG, busy: true, cooldown: 0, animAcc: 1 / opts.animFps, lastLights: -1, dirty: true, flashUntil: 0,
+  };
+  mixer.addEventListener('finished', (e) => {
+    if (e.action === actions.Reload || e.action === actions.Reload_Empty) gun.ammo = MAG;
+    if (e.action !== actions.Fire) gun.busy = false;
+    updateAmmo();
+  });
+  playGun('Draw');
+  sizeGun();
+  updateAmmo();
+}
+
+function playGun(name) {
+  // Hard cut: all clips start from the ready pose, and stopping the rest keeps clamped clips from blending in
+  for (const a of Object.values(gun.actions)) if (a !== gun.actions[name]) a.stop();
+  gun.actions[name].reset().play();
+}
+
+function tryFire(now) {
+  if (!gun || gun.busy || gun.cooldown > 0) return;
+  if (gun.ammo === 0) return reload();
+  gun.ammo--;
+  // Carry leftover time into the next shot so the rate isn't rounded up to whole frames (capped, so a
+  // long pause doesn't bank a burst)
+  gun.cooldown = Math.max(gun.cooldown, -0.05) + FIRE_INTERVAL;
+  playGun('Fire');
+  // Muzzle in gun space → view space → world: lights the floor, the demons' sprites, and (mapped back) the gun
+  gun.root.updateMatrixWorld(true);
+  gun.muzzle.getWorldPosition(_mw).applyMatrix4(gunCam.matrixWorldInverse).applyMatrix4(camera.matrixWorld);
+  muzzleFlash(_mw);
+  gun.flashUntil = now + 0.06;
+  updateAmmo();
+}
+
+function reload() {
+  if (!gun || gun.busy || gun.ammo === MAG) return;
+  gun.busy = true;
+  playGun(gun.ammo === 0 ? 'Reload_Empty' : 'Reload');
+}
+
+// Returns 1 if it re-rendered the weapon texture this frame (for stats)
+function updateGun(dt, now) {
+  if (!gun) return 0;
+  gun.cooldown -= dt;
+  gun.animAcc += dt;
+  const posed = !opts.stepped || gun.animAcc >= 1 / opts.animFps; // same stepped animation as the demons
+  if (posed) { gun.mixer.update(gun.animAcc); gun.animAcc = 0; }
+
+  let lights = 0; // which flash lights reach your eye; a change means a re-render
+  flashes.forEach((f, i) => { if (f.world.intensity > 0 && f.world.position.distanceTo(camera.position) < FLASH_RANGE + 1) lights |= 1 << i; });
+  if (!posed && lights === gun.lastLights && !gun.dirty) return 0;
+  gun.lastLights = lights;
+  gun.dirty = false;
+
+  gun.root.updateMatrixWorld(true);
+  gun.joint.matrixWorld.decompose(gunCam.position, gunCam.quaternion, _gs); // the animated camera joint is the eye
+  gunCam.updateMatrixWorld();
+
+  // World → gun space via the shared view space: sun direction and flash lights follow you into the gun's world
+  _toGun.multiplyMatrices(gunCam.matrixWorld, camera.matrixWorldInverse);
+  gunSun.target.position.copy(gunCam.position);
+  gunSun.position.copy(sunOffset).transformDirection(_toGun).multiplyScalar(10).add(gunCam.position);
+  flashes.forEach((f, i) => {
+    gunFlashes[i].position.copy(f.world.position).applyMatrix4(_toGun);
+    gunFlashes[i].intensity = f.world.intensity;
+  });
+  stripLights.forEach((s, i) => {
+    gunStrips[i].position.copy(s.world.position).applyMatrix4(_toGun);
+    gunStrips[i].intensity = s.world.intensity;
+  });
+  _toGun.decompose(_tgp, _tgq, _gs);
+  ceilLights.forEach((c, i) => { // area lights have a facing too
+    gunCeil[i].position.copy(c.world.position).applyMatrix4(_toGun);
+    gunCeil[i].quaternion.multiplyQuaternions(_tgq, c.world.quaternion);
+    gunCeil[i].intensity = c.world.intensity;
+  });
+
+  muzzleSprite.visible = now < gun.flashUntil;
+  if (muzzleSprite.visible) {
+    gun.muzzle.getWorldPosition(muzzleSprite.position);
+    muzzleSprite.lookAt(gunCam.position);
+    muzzleSprite.rotateZ(Math.random() * Math.PI);
+  }
+
+  renderer.setRenderTarget(gunRT);
+  renderer.render(gunScene, gunCam);
+  renderer.setRenderTarget(null);
+  return 1;
+}
+
+const ammoEl = document.getElementById('ammo');
+function updateAmmo() {
+  ammoEl.textContent = gun ? `${gun.ammo} / ${MAG}${gun.busy && gun.ammo < MAG ? '  reloading' : ''}` : '';
+}
+
+// ---------------------------------------------------------------------------
+// Demons
+// ---------------------------------------------------------------------------
+let demonGltf;
+const npcs = []; // { imp, walk, fire, target, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer }
+const _v = new THREE.Vector3();
 
 function addNpcs(n) {
   for (let i = 0; i < n; i++) {
     const model = cloneSkinned(demonGltf.scene);
-    model.position.set((Math.random() - 0.5) * 60, 0, (Math.random() - 0.5) * 60);
-    const imp = makeCharacter(model);
+    model.position.set((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
+    model.traverse((o) => { if (o.isMesh) o.castShadow = false; }); // blob/sprite shadows in both modes, so V compares fairly
+    const imp = new SpriteImpostor(model, new THREE.AnimationMixer(model), opts);
+    scene.add(imp);
     const clip = (name) => imp.mixer.clipAction(THREE.AnimationClip.findByName(demonGltf.animations, name));
     const walk = clip('Walk'), fire = clip('Fire');
     walk.play().time = Math.random() * walk.getClip().duration; // out of step with each other
     const npc = {
       imp, walk, fire, target: randomTarget(), muzzle: model.getObjectByName('muzzle'),
       shooter: Math.random() < 0.5, firing: false, timer: nextVolley(),
+      pace: 1, paceTarget: 1, paceTimer: 0, // demo: switches between normal and fast every few seconds
     };
-    imp.mixer.addEventListener('loop', (e) => { if (e.action === fire) muzzleFlash(npc.muzzle); }); // each shot
+    imp.mixer.addEventListener('loop', (e) => { if (e.action === fire) muzzleFlash(npc.muzzle.getWorldPosition(_v)); }); // each shot
     npcs.push(npc);
   }
 }
@@ -417,37 +771,36 @@ function removeNpcs(n) {
   for (const { imp } of npcs.splice(-n)) imp.dispose();
 }
 const nextVolley = () => 3 + Math.random() * 5; // seconds of walking between volleys
-const randomTarget = () => new THREE.Vector3((Math.random() - 0.5) * 60, 0, (Math.random() - 0.5) * 60);
+const randomTarget = () => new THREE.Vector3((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
 
 const loader = new GLTFLoader();
-Promise.all([loader.loadAsync('models/Soldier.glb'), loader.loadAsync('models/demon.glb')]).then(([g, demon]) => {
+Promise.all([
+  loader.loadAsync('models/demon.glb'), loader.loadAsync('models/demon_walk.glb'), loader.loadAsync('models/m4/scene.gltf'),
+]).then(([demon, demonWalk, m4]) => {
+  // demon_walk.glb: Mixamo "Orc Walk" retargeted onto the demon rig in Blender; replaces the built-in Walk
+  demon.animations = demon.animations.filter((c) => c.name !== 'Walk').concat(demonWalk.animations);
   demonGltf = demon;
-  player = makeCharacter(g.scene);
-  playerActions = Object.fromEntries(g.animations.map((c) => [c.name, player.mixer.clipAction(c)]));
-  play('Idle');
-  // Repeatable benchmark setups: ?n=100 spawns 100 demons, ?real starts in real-3D mode
+  setupGun(m4);
+  // ?n=100 spawns 100 demons (default 20), ?real starts in real-3D mode
   const params = new URLSearchParams(location.search);
-  addNpcs(Number(params.get('n')) || 0);
+  addNpcs(params.has('n') ? Number(params.get('n')) : 20);
   opts.real = params.has('real');
 });
 
-function play(name) {
-  if (current === name) return;
-  playerActions[name].reset().fadeIn(0.2).play();
-  playerActions[current]?.fadeOut(0.2);
-  current = name;
-}
-
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
 const keys = {};
 const hud = document.getElementById('hud'), HUD = hud.textContent;
+addEventListener('mousedown', (e) => { if (e.button === 0 && look.isLocked) trigger = true; });
+addEventListener('mouseup', (e) => { if (e.button === 0) trigger = false; });
 addEventListener('keydown', (e) => {
   keys[e.code] = true;
-  if (!player) return;
+  if (!gun) return;
+  if (e.code === 'KeyR') reload();
   if (e.code === 'KeyB') opts.bounds = !opts.bounds;
   if (e.code === 'KeyH') opts.spriteShadows = !opts.spriteShadows;
-  if (e.code === 'KeyF') player.freeze();
-  if (e.code === 'KeyC') setFirstPerson(!firstPerson);
-  if (e.code === 'KeyR') opts.lod = !opts.lod;
+  if (e.code === 'KeyO') opts.lod = !opts.lod;
   if (e.code === 'KeyV') opts.real = !opts.real;
   if (e.code === 'KeyN') opts.stepped = !opts.stepped;
   if (e.code === 'KeyL') opts.lockDist = !opts.lockDist;
@@ -455,18 +808,21 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyP') {
     rtSizeIdx = (rtSizeIdx + 1) % RT_SIZES.length;
     opts.resolution = RT_SIZES[rtSizeIdx];
-    for (const imp of [player, ...npcs.map((n) => n.imp)]) imp.setResolution(opts.resolution);
+    for (const { imp } of npcs) imp.setResolution(opts.resolution);
   }
   if (e.code === 'Equal') addNpcs(10);
   if (e.code === 'Minus') removeNpcs(10);
-  hud.textContent = HUD + `  |  ${firstPerson ? 'FIRST PERSON' : 'orbit'} · bounds ${opts.bounds ? 'ON' : 'off'} · frozen ${player.frozenAt ? 'ON' : 'off'} · showing ${opts.real ? 'REAL 3D' : 'sprites'} · anim ${opts.stepped ? opts.animFps + 'fps' : 'smooth'} · RT dolly ${opts.lockDist ? 'LOCKED' : 'follows'} · angles ${opts.snap ? opts.snaps + '×' + opts.pitchSnaps + ' snaps' : 'free'} · sprite ${opts.resolution}px${opts.lod ? ' (LOD)' : ''} · shadows ${opts.spriteShadows ? 'SPRITE' : 'blob'}`;
+  hud.textContent = HUD + `  |  bounds ${opts.bounds ? 'ON' : 'off'} · showing ${opts.real ? 'REAL 3D' : 'sprites'} · anim ${opts.stepped ? opts.animFps + 'fps' : 'smooth'} · RT dolly ${opts.lockDist ? 'LOCKED' : 'follows'} · angles ${opts.snap ? opts.snaps + '×' + opts.pitchSnaps + ' snaps' : 'free'} · sprite ${opts.resolution}px${opts.lod ? ' (LOD)' : ''} · shadows ${opts.spriteShadows ? 'SPRITE' : 'blob'}`;
 });
 addEventListener('keyup', (e) => (keys[e.code] = false));
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  sizeGun();
 });
+sizeGun();
 
 // --- Benchmark stats: averaged over half-second windows ---
 const statsEl = document.getElementById('stats');
@@ -476,14 +832,18 @@ function reportStats(cpuMs, sprites) {
   const now = performance.now();
   if (now - statStart < 500) return;
   const { calls, triangles } = renderer.info.render;
-  statsEl.textContent = `${npcs.length} demons + player (${opts.real ? 'REAL 3D' : 'sprites'}) · ` +
+  statsEl.textContent = `${npcs.length} demons (${opts.real ? 'REAL 3D' : 'sprites'}) · ` +
     `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps · CPU ${(statCpu / statFrames).toFixed(2)} ms/frame · ` +
     `${calls} draw calls · ${(triangles / 1000).toFixed(0)}k tris · ${(statSprites / statFrames).toFixed(1)} sprite renders/frame`;
   statFrames = statCpu = statSprites = 0; statStart = now;
 }
 
+// ---------------------------------------------------------------------------
+// Frame loop
+// ---------------------------------------------------------------------------
 const UP = new THREE.Vector3(0, 1, 0), fwd = new THREE.Vector3(), right = new THREE.Vector3(), move = new THREE.Vector3(), q = new THREE.Quaternion();
 const clock = new THREE.Clock();
+let bobPhase = 0, bobAmp = 0;
 
 function steer(model, dir, speed, dt, facing) { // dir: normalized XZ direction
   model.quaternion.slerp(q.setFromAxisAngle(UP, Math.atan2(dir.x, dir.z) + facing), 1 - Math.exp(-12 * dt));
@@ -492,63 +852,74 @@ function steer(model, dir, speed, dt, facing) { // dir: normalized XZ direction
 
 renderer.setAnimationLoop(() => {
   const t0 = performance.now();
-  const dt = Math.min(clock.getDelta(), 0.1);
+  const dt = Math.min(clock.getDelta(), 0.1), now = clock.elapsedTime;
   renderer.info.reset();
   let sprites = 0;
 
-  if (player) {
-    const m = player.model;
-    camera.getWorldDirection(fwd).setY(0).normalize();
-    right.crossVectors(fwd, UP);
-    move.set(0, 0, 0)
-      .addScaledVector(fwd, (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0))
-      .addScaledVector(right, (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0));
-    if (move.lengthSq() > 0) {
-      const walking = keys.ShiftLeft || keys.ShiftRight;
-      const before = m.position.clone();
-      steer(m, move.normalize(), walking ? WALK : RUN, dt, FACING);
-      camera.position.add(before.subVectors(m.position, before)); // camera rides along
-      play(walking ? 'Walk' : 'Run');
-    } else play('Idle');
+  // You: WASD relative to where you look, eye at a fixed height
+  camera.getWorldDirection(fwd).setY(0).normalize();
+  right.crossVectors(fwd, UP);
+  move.set(0, 0, 0)
+    .addScaledVector(fwd, (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0))
+    .addScaledVector(right, (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0));
+  const moving = move.lengthSq() > 0, sprinting = keys.ShiftLeft || keys.ShiftRight;
+  if (moving) camera.position.addScaledVector(move.normalize(), (sprinting ? SPRINT : MOVE) * dt);
+  camera.position.y = EYE_HEIGHT;
+  const reach = ARENA - 0.5; // the wall is solid: stop half a metre short of it
+  camera.position.x = THREE.MathUtils.clamp(camera.position.x, -reach, reach);
+  camera.position.z = THREE.MathUtils.clamp(camera.position.z, -reach, reach);
 
-    for (const npc of npcs) {
-      // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on
-      npc.timer -= dt;
-      if (npc.firing) {
-        if (npc.timer > 0) continue; // stand still while firing
-        npc.firing = false;
-        npc.timer = nextVolley();
-        npc.fire.fadeOut(0.2);
-        npc.walk.reset().fadeIn(0.2).play();
-      } else if (npc.shooter && npc.timer <= 0) {
-        npc.firing = true;
-        npc.timer = (2 + Math.floor(Math.random() * 3)) * npc.fire.getClip().duration; // Fire loops, so N shots
-        npc.walk.fadeOut(0.2);
-        npc.fire.reset().fadeIn(0.2).play();
-        muzzleFlash(npc.muzzle); // first shot; later ones come from the loop event
-        continue;
-      }
-      const p = npc.imp.model.position;
-      if (p.distanceToSquared(npc.target) < 1) npc.target = randomTarget();
-      steer(npc.imp.model, move.subVectors(npc.target, p).setY(0).normalize(), DEMON_WALK, dt, DEMON_FACING);
+  // Weapon bob: Doom's sideways sway + downward dip, snapped to whole weapon-sprite pixels
+  bobAmp += ((moving ? 1 : 0) - bobAmp) * (1 - Math.exp(-8 * dt));
+  bobPhase += dt * (sprinting ? 11 : 8);
+  const tx = 2 / gunRT.width, ty = 2 / gunRT.height;
+  gunQuad.position.x = Math.round((Math.cos(bobPhase) * BOB * bobAmp) / tx) * tx;
+  gunQuad.position.y = -Math.round((Math.abs(Math.sin(bobPhase)) * BOB * bobAmp) / ty) * ty;
+
+  if (trigger) tryFire(now);
+
+  for (const npc of npcs) {
+    // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on
+    npc.timer -= dt;
+    if (npc.firing) {
+      if (npc.timer > 0) continue; // stand still while firing
+      npc.firing = false;
+      npc.timer = nextVolley();
+      npc.fire.fadeOut(0.2);
+      npc.walk.reset().fadeIn(0.2).play();
+    } else if (npc.shooter && npc.timer <= 0) {
+      npc.firing = true;
+      npc.timer = (2 + Math.floor(Math.random() * 3)) * npc.fire.getClip().duration; // Fire loops, so N shots
+      npc.walk.fadeOut(0.2);
+      npc.fire.reset().fadeIn(0.2).play();
+      muzzleFlash(npc.muzzle.getWorldPosition(_v)); // first shot; later ones come from the loop event
+      continue;
     }
-
-    if (firstPerson) {
-      m.quaternion.setFromAxisAngle(UP, Math.atan2(fwd.x, fwd.z) + FACING); // body (and shadow) turns with your view
-      camera.position.copy(m.position).y += EYE_HEIGHT;
-    } else controls.target.copy(m.position).y += 1.2;
-    sun.position.copy(m.position).add(sunOffset); // box shadows follow the player
-    sun.target.position.copy(m.position);
+    if ((npc.paceTimer -= dt) <= 0) {
+      npc.paceTarget = Math.random() < 0.5 ? 1 : DEMON_FAST;
+      npc.paceTimer = 2 + Math.random() * 4;
+    }
+    npc.pace += (npc.paceTarget - npc.pace) * (1 - Math.exp(-3 * dt)); // ease between paces
+    npc.walk.timeScale = npc.pace;
+    const p = npc.imp.model.position;
+    if (p.distanceToSquared(npc.target) < 1) npc.target = randomTarget();
+    steer(npc.imp.model, move.subVectors(npc.target, p).setY(0).normalize(), DEMON_WALK * npc.pace, dt, DEMON_FACING);
   }
+
+  sun.position.copy(camera.position).add(sunOffset); // box shadows follow you
+  sun.target.position.copy(camera.position);
   for (const f of flashes) if (f.ttl > 0 && (f.ttl -= dt) <= 0) f.world.intensity = f.sprite.intensity = 0;
-  if (!firstPerson) controls.update();
+  updatePool(stripTiles, stripLights, STRIP_REACH, STRIP_FADE, STRIP_INTENSITY);
+  updatePool(ceilLightTiles, ceilLights, CEIL_REACH, CEIL_FADE, CEIL_INTENSITY);
   camera.updateMatrixWorld();
 
-  if (player) {
-    sprites += player.update(renderer, camera, dt);
-    for (const npc of npcs) sprites += npc.imp.update(renderer, camera, dt);
-  }
-  renderer.render(scene, camera);
+  for (const npc of npcs) sprites += npc.imp.update(renderer, camera, dt);
+  sprites += updateGun(dt, now);
+
+  composer.render(dt);
+  renderer.autoClear = false; // weapon goes flat on top of the world (no bloom on it)
+  renderer.render(hudScene, hudCam);
+  renderer.autoClear = true;
   reportStats(performance.now() - t0, sprites);
 });
 </script>
