@@ -11,6 +11,7 @@ canvas{image-rendering:pixelated}
 #start{position:fixed;inset:0;display:grid;place-items:center;color:#fff;font:bold 28px sans-serif;text-shadow:0 2px 6px #000;pointer-events:none}
 #crosshair{position:fixed;left:50%;top:50%;width:4px;height:4px;margin:-2px 0 0 -2px;background:#fff;box-shadow:0 0 2px #000;pointer-events:none}
 #ammo{position:fixed;right:16px;bottom:12px;color:#fff;font:bold 28px ui-monospace,monospace;text-shadow:0 2px 4px #000;pointer-events:none}
+#health{position:fixed;left:16px;bottom:30px;color:#fff;font:bold 28px ui-monospace,monospace;text-shadow:0 2px 4px #000;pointer-events:none}
 #credit{position:fixed;left:8px;bottom:6px;color:#fff;opacity:.7;font:11px sans-serif;text-shadow:0 1px 2px #000;pointer-events:none}
 </style>
 <script type="importmap">
@@ -18,11 +19,11 @@ canvas{image-rendering:pixelated}
 </script>
 </head>
 <body>
-<div id="ui"><div id="hud">WASD move · Shift sprint · Space jump · mouse look · click fire · R reload · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · = / - add/remove 10 demons</div>
+<div id="ui"><div id="hud">WASD move · Shift sprint · Space jump · mouse look · click fire · R reload · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · F depth of field · = / - add/remove 10 demons</div>
 <div id="stats"></div></div>
 <div id="start">Click to play</div>
 <div id="crosshair"></div>
-<div id="ammo"></div>
+<div id="ammo"></div><div id="health"></div>
 <div id="credit">Weapon: "M4 - FPS Weapon Animations Pack (v.1)" by BarcodeGames (sketchfab.com/barcodegames), CC-BY-4.0<br>Casing: "Bullet Case" by oscarherry3d (sketchfab.com/oscarherry3d), CC-BY-4.0</div>
 <script type="module">
 import * as THREE from 'three';
@@ -34,6 +35,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 RectAreaLightUniformsLib.init(); // rect area lights (the ceiling strips) need their lookup tables
 
@@ -59,8 +61,9 @@ const blobMat = (() => { // soft round contact shadow, one texture shared by eve
 const blobGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
 const silhouetteMat = new THREE.MeshBasicMaterial({ color: 0x000000 }); // shadow sprites only need the outline
 const _cs = new THREE.Vector3(), _rc = new THREE.Vector3(), _toCam = new THREE.Vector3(), _facing = new THREE.Vector3(), _center = new THREE.Vector3();
+const CORPSE_ELEVATION = THREE.MathUtils.degToRad(20); // a body's one view: this far above the horizontal
 const SPRITE_NEAR = 0.1, SPRITE_FAR = 200, SPRITE_DEPTH_BIAS = 0.1; // m: the RT camera's clip range; card depth pulled towards you
-const _dir = new THREE.Vector3(), _look = new THREE.Vector3();
+const _dir = new THREE.Vector3(), _look = new THREE.Vector3(), _bb = new THREE.Box3(), _bv3 = new THREE.Vector3();
 const _frustum = new THREE.Frustum(), _vp = new THREE.Matrix4(), _sphere = new THREE.Sphere();
 
 class SpriteImpostor extends THREE.Group {
@@ -77,6 +80,7 @@ class SpriteImpostor extends THREE.Group {
     this.lastKey = undefined;   // view + pose of the last sprite render; undefined = must re-render
     this.lastLights = 0;        // which flash lights were reaching it at the last render
     this.shadowKey = undefined; // same, for the shadow sprite
+    this.frontOnly = false;     // only ever drawn from straight in front (see update)
 
     // Render box from the bind pose (bone matrices start as zeros, so update them first)
     model.updateMatrixWorld(true);
@@ -85,6 +89,15 @@ class SpriteImpostor extends THREE.Group {
     const size = box.getSize(new THREE.Vector3());
     this.r = (Math.max(size.x, size.y, size.z) / 2) * 1.2; // +20% so swinging limbs stay inside
     this.centerY = box.getCenter(new THREE.Vector3()).y - model.position.y;
+    // The frame follows the pose (see refit): the bones' bounds, padded out to the flesh round them. The pad is
+    // whatever takes the bind pose's bone bounds out to the box above, so standing it frames exactly as it did; a
+    // pose reaching further (the death's fall, an arm thrown out) grows and moves the frame with it.
+    this.bones = [];
+    model.traverse((o) => o.isBone && this.bones.push(o));
+    this.rBase = this.r;
+    this.fit = new THREE.Vector3(0, this.centerY, 0); // the frame's centre, from the model's origin
+    this.pad = 0;
+    this.pad = this.rBase - this.boneBounds(new THREE.Vector3());
 
     // Nearest filtering = chunky pixels; no MSAA so sprite edges stay hard
     this.rt = new THREE.WebGLRenderTarget(opts.resolution, opts.resolution, {
@@ -138,6 +151,19 @@ class SpriteImpostor extends THREE.Group {
     this.add(this.card, this.blob, this.shadowCard);
   }
 
+  // The bones' bounding box: its centre (from the model's origin) into out; returns its half-size (largest axis)
+  boneBounds(out) {
+    this.model.updateMatrixWorld(true);
+    _bb.makeEmpty();
+    for (const b of this.bones) _bb.expandByPoint(b.getWorldPosition(_bv3));
+    _bb.getCenter(out).sub(this.model.position);
+    _bb.getSize(_bv3);
+    return Math.max(_bv3.x, _bv3.y, _bv3.z) / 2;
+  }
+  refit() { // on each new pose: the frame's centre and size from where the bones are now (never smaller than standing)
+    this.r = Math.max(this.rBase, this.boneBounds(this.fit) + this.pad);
+  }
+
   freeze() {
     this.frozenAt = this.frozenAt ? null : this.model.position.clone();
     this.lastKey = this.shadowKey = undefined;
@@ -181,7 +207,7 @@ class SpriteImpostor extends THREE.Group {
     // Stepped animation: hold each pose, then jump by the time banked since the last step
     this.animAcc += dt;
     const posed = !o.stepped || this.animAcc >= 1 / o.animFps;
-    if (posed) { this.mixer.update(this.animAcc); this.animAcc = 0; }
+    if (posed) { this.mixer.update(this.animAcc); this.animAcc = 0; this.refit(); }
 
     const at = this.frozenAt ?? m.position;
     this.blob.position.set(at.x, 0.02, at.z);
@@ -201,8 +227,7 @@ class SpriteImpostor extends THREE.Group {
     this.blob.visible = !o.spriteShadows;
     this.shadowCard.visible = o.spriteShadows;
 
-    const center = _center.copy(at);
-    center.y += this.centerY;
+    const center = _center.copy(at).add(this.fit);
     this.applyLod(camera, center);
     let renders = o.spriteShadows ? this.updateShadow(renderer, center, posed) : 0;
     if (this.hidden) { this.lastKey = undefined; return renders; } // no card, no sprite render
@@ -232,10 +257,12 @@ class SpriteImpostor extends THREE.Group {
       _toCam.subVectors(camera.position, center);
       _facing.set(0, 0, 1).applyQuaternion(m.quaternion);
       const yaw = Math.atan2(_facing.x, _facing.z), step = (2 * Math.PI) / o.snaps;
-      const azIdx = Math.round((Math.atan2(_toCam.x, _toCam.z) - yaw) / step);
+      // frontOnly (a corpse): always the one view, from straight in front of it and CORPSE_ELEVATION up, whichever
+      // side you're on and however high (Doom's one-angle bodies)
+      const azIdx = this.frontOnly ? 0 : Math.round((Math.atan2(_toCam.x, _toCam.z) - yaw) / step);
       const elStep = Math.PI / 2 / o.pitchSnaps; // rows from 0° up to (not including) 90°: straight down has no "up"
       const elIdx = Math.min(Math.max(Math.round(Math.atan2(_toCam.y, Math.hypot(_toCam.x, _toCam.z)) / elStep), 0), o.pitchSnaps - 1);
-      const az = yaw + azIdx * step, el = elIdx * elStep;
+      const az = yaw + azIdx * step, el = this.frontOnly ? CORPSE_ELEVATION : elIdx * elStep;
       const dist = o.lockDist ? o.distance : _toCam.length();
       cam.position.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)).multiplyScalar(dist).add(center);
       cam.lookAt(center);
@@ -320,11 +347,12 @@ class SpriteImpostor extends THREE.Group {
 // weapon is the same trick drawn flat over the screen.
 // ---------------------------------------------------------------------------
 const MOVE = 4.5, SPRINT = 7.5;  // player m/s
+const STEP_LENGTH = 1.8;         // m walked per footstep sound
 const EYE_HEIGHT = 1.6;
 const GRAVITY = 20, JUMP_HEIGHT = 1.0;     // m/s² (snappy, ~2× Earth), m: about 0.6 s in the air
 let jumpY = 0, jumpV = 0;                  // height above standing, vertical speed
 const DEMON_WALK = 1.33;     // NPC demon m/s: Orc Walk stride (1.65 m per 1.13 s cycle) × 0.91 leg scale
-const DEMON_FAST = 1.8;      // fast pace multiplier; speeds up the walk clip by the same factor, so feet still match
+const DEMON_PACE = 1.5, DEMON_FAST = 2.2; // normal and fast pace multipliers; the walk clip speeds up by the same factor, so feet still match
 const DEMON_FACING = 0;      // demon.glb facing offset (0 = faces +Z); set Math.PI if they walk backwards
 const RT_SIZES = [128, 256, 512, 64]; // sprite resolutions cycled with P (first is the default)
 let rtSizeIdx = 0;
@@ -343,16 +371,16 @@ document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 // Dim ambient: the room environment (the even fill light, and what metal reflects; a three.js AmbientLight
-// would skip metal, which has no diffuse) at a low 0.0075, so the arena reads while the ceiling lights, glowing strips
-// and muzzle flashes carry it. Tried: 0.1 too bright, 0.03 and 0.015 a little flat, 0 hides the demons in the dark. The sprite stage and the gun
-// copy this intensity.
+// would skip metal, which has no diffuse) at a low 0.015, so the arena reads while the ceiling lights, glowing strips
+// and muzzle flashes carry it. Tried: 0.1 too bright, 0.03 a little flat, 0.0075 too dark, 0 hides the demons in the
+// dark. The sprite stage and the gun copy this intensity.
 // Fog: thick and blood red. Fog isn't lit (it blends each pixel toward its colour by distance), so it's a
 // dark red that reads as murk, not a glow. Exponential-squared: ~half gone at 20 m, nearly solid by 40 m.
 const FOG_COLOR = 0x5c1010, FOG_DENSITY = 0.042;
 scene.background = new THREE.Color(FOG_COLOR);
 scene.fog = new THREE.FogExp2(FOG_COLOR, FOG_DENSITY);
 scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment()).texture;
-scene.environmentIntensity = 0.0075;
+scene.environmentIntensity = 0.015;
 
 const sunOffset = new THREE.Vector3(8, 15, 6);
 // The arena is roofed (ceiling below), so no sunlight gets in: intensity 0, and no shadow pass to pay for.
@@ -399,15 +427,21 @@ function muzzleFlash(position) {
 // name: share of tiles. Blank plates (bare or covered) stay 45%; each type keeps most of its share for the plain
 // version, with a structural variant or two taking the rest
 const FLOOR_TILES = {
-  plain: 0.18, plain_bolted: 0.06, plain_welded: 0.06, cover: 0.1, cover_hatch: 0.05,
-  vent: 0.19, vent_patch: 0.06, slits: 0.19, slits_strapped: 0.06, light: 0.05,
+  plain: 0.18, plain_bolted: 0.06, cover: 0.1, cover_hatch: 0.05,
+  vent: 0.19, vent_patch: 0.06, slits: 0.19, slits_strapped: 0.06, sidelight_left: 0, // the lamp: not at random (below)
+  plain_welded: 0, weld_end: 0, weld_corner: 0, weld_tee: 0, weld_cross: 0, // the weld seams: laid out as a maze (below)
+  glass_slits: 0, // glass panels onto the void under the floor (parallax mapped): not at random, one row (below)
 }, TILE = 2, TILES = 200;
+// The floor lights run in rows (east–west), every FLOOR_LIGHT_EVERY rows, like the wall's side-slit row: along the
+// row, a FLOOR_LAMP panel (one thin light slit down a side) with its slit on the right, one with it on the left, so
+// the two slits pair up at their shared edge, then a plain tile; and again
+const FLOOR_LIGHT_EVERY = 3, FLOOR_LAMP = 'sidelight_left';
 // Tiles that glow, and how hard: emissiveIntensity > 1 is brighter than white in the HDR buffer, before ACES
 // tone mapping. It glows in the dark and under a flash, but lights nothing else (that needs real lights).
 // 5 puts the lens centre at ~3× white (luminance): over BLOOM_THRESHOLD, still LED-blue rather than blown out.
 // Wall fixture: its frosted, diffusing cover dims and spreads the tube (measured peak ≈ 0.33 × glow), so it needs ~2×
 // the others' glow to clear the bloom threshold: 10 puts the cover's peak at ~3.3, like the other strips' lens centres.
-const TILE_GLOW = { light: 5, slitlight: 5, sidelight: 5, sidelight_left: 5, walllight: 10 };
+const TILE_GLOW = { light: 5, slitlight: 5, sidelight: 5, sidelight_left: 5, walllight: 10, glass_slits: 3 };
 // Fixture lighting. true: every static fixture baked into a light volume, read as one light per pixel (~3 ms/frame at
 // 1600×1000). false: real lights, pooled over the nearest, in the world as well as for the demon sprites and the
 // gun: points for the floor/wall strips and column slits, rect area lights for the ceiling strips.
@@ -422,7 +456,9 @@ const loadMap = (file, colorSpace = THREE.NoColorSpace) => {
 };
 const tileGeo = new THREE.PlaneGeometry(TILE, TILE).rotateX(-Math.PI / 2);
 const tileWeights = Object.values(FLOOR_TILES);
-const tilePick = Array.from({ length: TILES * TILES }, () => {
+const floorLightType = Object.keys(FLOOR_TILES).indexOf(FLOOR_LAMP);
+const tilePick = Array.from({ length: TILES * TILES }, (_, cell) => {
+  if (Math.floor(cell / TILES) % FLOOR_LIGHT_EVERY === 0 && cell % TILES % 3 < 2) return floorLightType; // a lamp row's slits
   let r = Math.random() * tileWeights.reduce((a, w) => a + w, 0), type = 0;
   while (type < tileWeights.length - 1 && (r -= tileWeights[type]) > 0) type++;
   return type;
@@ -452,7 +488,7 @@ function tileMat(name, key = name, { drip = false } = {}) {
     ...(TILE_GLOW[name] && { emissive: 0xffffff, emissiveMap: loadMap(`${name}_e`, THREE.SRGBColorSpace), emissiveIntensity: TILE_GLOW[name] }),
     shadowSide: THREE.DoubleSide, // single-sided wall tiles still cast shadows whichever way they face the sun
   });
-  addGrime(mat, drip);
+  addGrime(mat, drip, name === 'treadplate'); // the rubber has no holes or lenses to keep clean: dirt goes anywhere
   if (BAKE_FIXTURES) addBakedLight(mat);
   return (tileMats[key] = mat);
 }
@@ -462,35 +498,26 @@ function tileMat(name, key = name, { drip = false } = {}) {
 // of it (instance attribute grimeOffset, whole pixels so it stays on the tile's pixel grid). Composited like
 // the baked grime, a dielectric film: darker, rough, not metal, no brush streaks; only where the tile is bare
 // steel (its metalness), so holes, lenses and the light housing stay clean.
-// Walls, columns and the platform's sides instead get drip grime (textures/grime_drip.png): years of moisture
-// streaking down, read in world space (along the surface by its height, 32 px/m like the tiles, the texture 32 m
-// along × the 8 m wall), so the streaks always run down, whichever way a tile is turned, and carry on across rows.
+// Walls, columns and the platform's sides instead get drip grime (textures/grime_drip.png): moisture streaks. Read
+// the same way as the scuffs, a window per panel (the drip texture squeezed 4× across, so the streaks are dense),
+// each panel its own patch of streaks.
 const GRIME_TILE = 64 / 256; // a tile's window, in grime-texture UVs
 const grimeMap = loadMap('grime'), dripMap = loadMap('grime_drip');
 grimeMap.wrapS = grimeMap.wrapT = dripMap.wrapS = THREE.RepeatWrapping;
-const DRIP_SIZE = new THREE.Vector2(32, 8); // m: the drip texture's span along a wall, and up it
-function addGrime(mat, drip = false) {
+function addGrime(mat, drip = false, everywhere = false) {
+  // Its own program per variant: three.js keys programs by onBeforeCompile's source text, the same for every
+  // variant here, so otherwise whichever compiled first would be used for all of them
+  mat.customProgramCacheKey = () => `grime:${everywhere}`;
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.grimeMap = { value: drip ? dripMap : grimeMap };
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\nattribute vec2 grimeOffset;\nvarying vec2 vGrimeUv;')
-      .replace(drip ? '#include <worldpos_vertex>' : '#include <uv_vertex>', drip ? `#include <worldpos_vertex>
-  { // world space: across the surface (horizontally) and up it
-    vec4 gp = vec4(transformed, 1.0);
-    vec3 gn = objectNormal;
-    #ifdef USE_INSTANCING
-      gp = instanceMatrix * gp;
-      gn = mat3(instanceMatrix) * gn;
-    #endif
-    vec3 gw = (modelMatrix * gp).xyz;
-    gn = normalize(mat3(modelMatrix) * gn);
-    vGrimeUv = vec2(dot(gw.xz, normalize(vec2(-gn.z, gn.x) + 1e-6)), gw.y) / vec2(${DRIP_SIZE.x.toFixed(1)}, ${DRIP_SIZE.y.toFixed(1)});
-  }` : `#include <uv_vertex>\n  vGrimeUv = uv * ${GRIME_TILE.toFixed(4)} + grimeOffset;`);
+      .replace('#include <uv_vertex>', `#include <uv_vertex>\n  vGrimeUv = uv * ${GRIME_TILE.toFixed(4)} + grimeOffset;`);
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', '#include <common>\nuniform sampler2D grimeMap;\nvarying vec2 vGrimeUv;')
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
-  float grimePatch = texture(grimeMap, vGrimeUv).r * metalnessFactor;
-  diffuseColor.rgb = mix(diffuseColor.rgb, ${drip ? 'vec3(0.07, 0.045, 0.03)' : 'vec3(0.05, 0.046, 0.042)'}, grimePatch); // GRIME, GRIME_ROUGH in the generator (drips: rustier)
+  float grimePatch = texture(grimeMap, vGrimeUv).r * ${everywhere ? '1.0' : 'metalnessFactor'};
+  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.05, 0.046, 0.042), grimePatch); // GRIME, GRIME_ROUGH in the generator
   roughnessFactor = mix(roughnessFactor, 0.85, grimePatch);
   metalnessFactor *= 1.0 - grimePatch;`)
       .replace('#include <lights_physical_fragment>', `#include <lights_physical_fragment>
@@ -557,11 +584,21 @@ const withGrimeOffsets = (geo, count) => geo.clone().setAttribute('grimeOffset',
 // coverScatter: how much the cover diffuses what's behind it (0 = clear). Over the cover, 8 eye rays tilted by up
 // to that much (mostly across the ridges, the way a prismatic cover spreads light) are each marched into the
 // depth map and the colour and glow they land on averaged: deeper things blur more, like real frosted plastic.
-function addParallax(mat, depthFile, depth, { coverOpacity = 0, coverScatter = 0 } = {}) {
+// under: a two-span depth map (RG the first solid's top and bottom, BA the second's, over a floor at floorDepth),
+// so a ray can pass under things (a pipe, the plate it looks out from) to what's beneath; under is the glow of the
+// second span, floor the floor's; pipeRadius: the round things' radius (depth-map units), each shaded by where on
+// its round the ray hit. All its textures repeat: a ray running past the tile's edge finds more of the same.
+function addParallax(mat, depthFile, depth, { coverOpacity = 0, coverScatter = 0, under = null, floor = null, floorDepth = 1, pipeRadius = 1, lampHeight = 0.2,
+  wallOut = 0.2, plateDepth = 0, lampColor = new THREE.Color(), glassBlur = 0 } = {}) {
   const depthMap = loadMap(depthFile);
   depthMap.minFilter = THREE.NearestFilter; // read at full resolution only: crisp layers
   depthMap.generateMipmaps = false;
-  mat.customProgramCacheKey = () => 'parallax';
+  const underMap = under && loadMap(under, THREE.SRGBColorSpace), floorMap = floor && loadMap(floor, THREE.SRGBColorSpace);
+  if (under) {
+    mat.defines = { ...mat.defines, DUAL_PARALLAX: '' };
+    for (const t of [depthMap, underMap, floorMap, ...Object.values(mat).filter((v) => v?.isTexture)]) t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  }
+  mat.customProgramCacheKey = () => (under ? 'parallax:dual' : 'parallax');
   const before = mat.onBeforeCompile; // the grime layer
   mat.onBeforeCompile = (shader, renderer) => {
     before(shader, renderer);
@@ -569,6 +606,8 @@ function addParallax(mat, depthFile, depth, { coverOpacity = 0, coverScatter = 0
     shader.uniforms.parallaxDepth = { value: depth };
     shader.uniforms.coverOpacity = { value: coverOpacity };
     shader.uniforms.coverScatter = { value: coverScatter };
+    if (under) Object.assign(shader.uniforms, { parallaxUnder: { value: underMap }, parallaxFloor: { value: floorMap }, floorDepth: { value: floorDepth }, pipeRadius: { value: pipeRadius }, lampHeight: { value: lampHeight },
+      wallOut: { value: wallOut }, plateDepth: { value: plateDepth }, lampColor: { value: lampColor }, glassBlur: { value: glassBlur } });
     const uvs = ['vMapUv', 'vAoMapUv', 'vRoughnessMapUv', 'vMetalnessMapUv', 'vEmissiveMapUv', 'vSpecularIntensityMapUv', 'vAnisotropyMapUv'];
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>
@@ -576,7 +615,32 @@ uniform sampler2D parallaxMap;
 uniform float parallaxDepth;
 uniform float coverOpacity;
 uniform float coverScatter;
+#ifdef DUAL_PARALLAX
+uniform sampler2D parallaxUnder, parallaxFloor;
+uniform float floorDepth, pipeRadius, lampHeight, wallOut, plateDepth, glassBlur;
+uniform vec3 lampColor;
+float pomWhich = 0.0; // where the ray stopped: 0 the first span, 1 the second, 2 the floor, 3 a wall
+float pomLayer = 0.0; // how deep
+vec4 pomHit = vec4(0.0); // the spans there
+#endif
 vec2 parallaxUv(vec2 uv, vec3 v) { // v: toward the eye, tangent space
+#ifdef DUAL_PARALLAX
+  const float LAYERS = 48.0; // finer: the pipes are thin
+  vec2 stepUv = v.xy / max(v.z, 0.25) * parallaxDepth / LAYERS;
+  float layer = 0.0;
+  pomWhich = 2.0; // (if it runs out of steps: the floor)
+  vec4 d = textureLod(parallaxMap, uv, 0.0);
+  for (int i = 0; i < 48; i++) {
+    if (layer >= d.r && layer <= d.g) { pomWhich = 0.0; break; } // in the first span
+    if (layer >= d.b && layer <= d.a) { pomWhich = 1.0; break; } // in the second
+    if (layer >= floorDepth) { pomWhich = 2.0; break; }          // on the floor
+    if (layer > plateDepth && abs(uv.y - 0.5) > 0.5 + wallOut) { pomWhich = 3.0; break; } // a wall (the trench's sides, along the pipes)
+    uv -= stepUv;
+    layer += 1.0 / LAYERS;
+    d = textureLod(parallaxMap, uv, 0.0);
+  }
+  pomLayer = layer; pomHit = d;
+#else
   const float LAYERS = 24.0;
   vec2 stepUv = v.xy / max(v.z, 0.25) * parallaxDepth / LAYERS;
   float layer = 0.0, d = textureLod(parallaxMap, uv, 0.0).r;
@@ -586,9 +650,45 @@ vec2 parallaxUv(vec2 uv, vec3 v) { // v: toward the eye, tangent space
     layer += 1.0 / LAYERS;
     d = textureLod(parallaxMap, uv, 0.0).r;
   }
+#endif
   return uv;
 }`)
-      .replace('void main() {', `void main() {
+      .replace('void main() {', `#if defined( DUAL_PARALLAX ) && defined( USE_EMISSIVEMAP )
+// What one ray through the glass sees down in the void, and how its lamps light it. The void is a trench along the
+// pipes: open both ways along them, walled on the two sides parallel to them, wallOut in under the neighbouring
+// panels. A lamp strip runs along the top of each wall, under the neighbouring panel (out of sight but at a
+// slant), as long as this tile; its light falls off with distance (× the angle it reaches the floor at), so it
+// spills on along the trench and fades: computed at where the ray landed, in the tile's UVs unwrapped (the baked
+// glow is fully lit and repeats with the textures; this doesn't).
+vec3 voidGlow(vec2 uv0, vec3 v, vec2 dx, vec2 dy) {
+  vec2 uv = parallaxUv(uv0, v); // before wrapping
+  float l = 0.0;
+  for (int k = 0; k < 2; k++) {
+    vec2 lamp = vec2(clamp(uv.x, 0.0, 1.0), k == 0 ? -wallOut : 1.0 + wallOut); // its nearest point on the strip
+    l += 0.9 * pow(lampHeight / length(vec2(lampHeight, length(uv - lamp))), 3.0);
+  }
+  l = min(l + 0.04 * min(l * 4.0, 1.0), 1.0); // a little bounce light, where there's light to bounce
+  if (pomWhich > 2.5) { // a wall: its lamp along the top, glowing; below it steel, lit by its own lamp, darkening down
+    float below = pomLayer - plateDepth, along = 1.0 - smoothstep(1.0, 1.0 + lampHeight, abs(uv.x - 0.5) + 0.5);
+    if (below < 0.05 && along > 0.0) return lampColor * 6.0 * along;               // the lamp's lens
+    return lampColor * 0.56 * 3.0 * (0.06 + 0.5 * along * exp(-below * 6.0)); // the wall (STEEL, TILE_GLOW)
+  }
+  vec3 e;
+  if (pomWhich > 1.5) e = textureGrad(parallaxFloor, uv, dx, dy).rgb;        // the floor
+  else if (pomWhich > 0.5) e = textureGrad(parallaxUnder, uv, dx, dy).rgb;   // a pipe, under the frame
+  else e = textureGrad(emissiveMap, uv, dx, dy).rgb;                         // a pipe
+  vec2 span = pomWhich > 0.5 ? pomHit.ba : pomHit.rg;
+  bool pipe = pomWhich < 1.5 && span.x > 0.0 && span.y < 0.99;
+  e *= emissive * (pipe ? min(0.25 + 1.3 * l, 1.0) : l); // a pipe catches more (nearer the lamps, glossy paint)
+  if (pipe) { // shaded by where on its round the ray hit, as octagonal facets
+    float nUp = clamp(((span.x + span.y) * 0.5 - pomLayer) / pipeRadius, -1.0, 1.0); // its normal's up-component
+    float q = cos(round(acos(nUp) / (PI / 4.0)) * (PI / 4.0));                       // its facet's
+    e *= 0.12 + 0.88 * pow((q + 1.0) * 0.5, 1.6) + (q > 0.99 ? 0.25 : 0.0);
+  }
+  return e;
+}
+#endif
+void main() {
   vec2 pomDx = dFdx(vMapUv), pomDy = dFdy(vMapUv);
   vec3 pomN = normalize(vNormal), pomQ0 = dFdx(-vViewPosition), pomQ1 = dFdy(-vViewPosition);
   vec3 pomT = cross(pomQ1, pomN) * pomDx.x + cross(pomN, pomQ0) * pomDy.x;
@@ -597,6 +697,16 @@ vec2 parallaxUv(vec2 uv, vec3 v) { // v: toward the eye, tangent space
   vec3 pomV = normalize(vViewPosition);
   vec3 pomVt = normalize(vec3(dot(pomT, pomV) * pomS, dot(pomB, pomV) * pomS, dot(pomN, pomV))); // eye, tangent space
   vec2 pomUv0 = vMapUv; // the surface UV, kept for the cover's scattered rays
+  bool pomGlass = false; // this pixel looks through the glass
+#if defined( DUAL_PARALLAX ) && defined( USE_CLEARCOAT_NORMALMAP ) && defined( USE_CLEARCOATMAP )
+  if (texture(clearcoatMap, vMapUv).b > 0.5) { // through thick, rolled glass: the view bends at its rippled face (ripples
+    // along the pipes, so the void warps in bands parallel to them). Slope exaggerated ×2: real ripples this gentle
+    // shift things under a pixel at this resolution
+    vec3 pomGlassN = texture(clearcoatNormalMap, vMapUv).xyz * 2.0 - 1.0;
+    pomVt = -refract(-pomVt, normalize(vec3(pomGlassN.xy * 2.0, pomGlassN.z)), 1.0 / 1.5);
+    pomGlass = true;
+  }
+#endif
   vec2 pomUv = parallaxUv(vMapUv, pomVt);
   #undef texture2D
   #define texture2D(s, c) textureGrad(s, c, pomDx, pomDy)
@@ -604,8 +714,21 @@ ${uvs.map((u) => `  #define ${u} pomUv`).join('\n')}`)
       // after normal_fragment_begin, whose tangent frame needs the smooth UVs
       .replace('#include <normal_fragment_maps>', '#define vNormalMapUv pomUv\n#include <normal_fragment_maps>')
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+#if defined( DUAL_PARALLAX ) && defined( USE_EMISSIVEMAP )
+  if (pomGlass) { // what's down there, blurred by the thick glass: averaged over rays spread round the view
+    vec3 acc = voidGlow(pomUv0, pomVt, pomDx, pomDy);
+    for (int i = 0; i < 3; i++) { // (each ray is a whole march: few of them, the glass row is wide)
+      float a = float(i) * 2.0944 + 0.5, r = glassBlur * 0.8; // three round the view, a third of a turn apart
+      acc += voidGlow(pomUv0, normalize(pomVt + vec3(r * cos(a), r * sin(a), 0.0)), pomDx, pomDy);
+    }
+    totalEmissiveRadiance = acc / 4.0;
+    diffuseColor.rgb = vec3(0.0); // lit by the lamps only, not the room
+    metalnessFactor = 0.0;
+    roughnessFactor = 1.0;
+  }
+#endif
 #ifdef USE_CLEARCOATMAP
-  vec3 coverTexel = texture2D(clearcoatMap, vClearcoatMapUv).rgb; // the cover lies at the surface: unshifted UVs
+  vec4 coverTexel = texture2D(clearcoatMap, vClearcoatMapUv); // the cover lies at the surface: unshifted UVs
 #if defined( USE_MAP ) && defined( USE_EMISSIVEMAP )
   if (coverTexel.b > 0.5 && coverScatter > 0.0) { // diffusion: average what 8 scattered rays see behind the cover
     vec3 alb = vec3(0.0), em = vec3(0.0);
@@ -621,23 +744,15 @@ ${uvs.map((u) => `  #define ${u} pomUv`).join('\n')}`)
   }
 #endif
   float cover = coverTexel.b * coverOpacity, dirt = coverTexel.g;
-  diffuseColor.rgb = mix(mix(diffuseColor.rgb, vec3(0.8), cover), vec3(0.05, 0.046, 0.042), dirt); // GRIME (generator)
-  metalnessFactor *= (1.0 - cover) * (1.0 - dirt);
-  roughnessFactor = mix(roughnessFactor, 0.85, dirt);
-  totalEmissiveRadiance *= (1.0 - cover) * (1.0 - dirt);
+  float scratch = 1.0 - coverTexel.a; // scratches (an RGB map reads as A = 1: none): pale lines, catching the light
+  diffuseColor.rgb = mix(mix(mix(diffuseColor.rgb, vec3(0.8), cover), vec3(0.75), scratch * 0.7), vec3(0.05, 0.046, 0.042), dirt); // GRIME (generator)
+  metalnessFactor *= (1.0 - cover) * (1.0 - dirt) * (1.0 - scratch);
+  roughnessFactor = mix(mix(roughnessFactor, 0.6, scratch), 0.85, dirt);
+  totalEmissiveRadiance *= (1.0 - cover) * (1.0 - dirt) * (1.0 - 0.4 * scratch);
 #endif`);
   };
 }
 
-Object.keys(FLOOR_TILES).forEach((name, type) => {
-  const mat = tileMat(name);
-  const cells = tilePick.flatMap((t, i) => (t === type ? [i] : []));
-  const mesh = new THREE.InstancedMesh(withGrimeOffsets(tileGeo, cells.length), mat, cells.length);
-  const m = new THREE.Matrix4();
-  cells.forEach((cell, i) => mesh.setMatrixAt(i, m.compose(tilePos(cell), randomTurn(AXIS_Y, 4), ONE))); // quarter turns
-  mesh.receiveShadow = true;
-  scene.add(mesh);
-});
 
 // Arena wall: a square ARENA m out each way, on the floor's tile seams, WALL_ROWS tiles high. The same 2 m
 // tiles as the floor, stood up facing inward, one kind of row per WALL_ROW_KINDS (bottom to top): two rows
@@ -647,6 +762,7 @@ const ARENA = 32, WALL_ROWS = 4; // 8 m ceiling
 const WALL_ROW_KINDS = ['lights', 'lights', 'side', 'cover']; // light band at 0–4 m, side slits at 4–6 m
 const WALL_TILES = ['cover', 'walllight']; // alternate along the wall in the light rows
 // The wall's light fixture: a tube in a deep recess under a ridged clear cover, drawn with parallax mapping
+const WALL_STRIP_OFFSET = 0.6; // m off the wall: a wall lamp's glow (strip pool): further out than the floor's, so it doesn't hot-spot its own fixture
 const WALL_LIGHT_DEPTH = 6 / 64; // UV units: the generator's PARALLAX_RANGE (px) over the 64 px tile
 {
   const mat = tileMat('walllight', 'drip:walllight', { drip: true });
@@ -655,6 +771,23 @@ const WALL_LIGHT_DEPTH = 6 / 64; // UV units: the generator's PARALLAX_RANGE (px
     clearcoatRoughness: 0.08, // the clear cover: a glossy layer over the recess, its ridges in the normal map
   });
   addParallax(mat, 'walllight_depth', WALL_LIGHT_DEPTH, { coverOpacity: 0.2, coverScatter: 0.6 }); // a frosted cover
+}
+// Glass floor panels: a window of tinted glass in a steel frame, a lit lower floor deep under it (parallax), the
+// glass a glossy clearcoat with a little dirt round its rim
+const GLASS_DEPTH = 14 / 64; // UV units: the generator's glass parallax_range (GLASS_DEPTH + 2 px) over the 64 px tile
+for (const name of ['glass_slits']) {
+  const mat = tileMat(name);
+  Object.assign(mat, { clearcoat: 1, clearcoatMap: loadMap(`${name}_ccm`), clearcoatNormalMap: loadMap(`${name}_ccn`), clearcoatRoughness: 0.04 });
+  // its two extra parallax maps (under, floor) would take it past 16 textures: drop the frame's brush grain and its
+  // sheen mask (a 5 px frame barely shows either)
+  Object.assign(mat, { anisotropy: 0, anisotropyMap: null, specularIntensityMap: null });
+  addParallax(mat, `${name}_depth`, GLASS_DEPTH, { // clear glass: barely any haze, no scatter; the void under the floor
+    coverOpacity: 0.06, under: `${name}_under`, floor: `${name}_floor`, floorDepth: 12 / 14, pipeRadius: 2.5 / 14, // the generator's GLASS_DEPTH, PIPE_R over its range
+    lampHeight: 11 / 64, // the lamps' height over that floor (GLASS_DEPTH − 1 px), in the tile's UVs
+    wallOut: 4 / 64, plateDepth: 1 / 14, // the trench's walls: 4 px in under the neighbours; the frame plate's thickness (GLASS_PLATE)
+    lampColor: new THREE.Color().setRGB(126 / 255, 198 / 255, 228 / 255, THREE.SRGBColorSpace), // LIGHT through GLASS_TINT
+    glassBlur: 0.12, // how far its rays spread (tangent units): thick glass blurs what's under it
+  });
 }
 const wallCells = Object.fromEntries([...WALL_TILES, 'cover_hatch', 'sidelight_left'].map((n) => [n, []]));
 const HALF_TURN = new THREE.Quaternion().setFromAxisAngle(AXIS_Z, Math.PI); // in a wall tile's plane
@@ -692,7 +825,11 @@ const ceilLightTiles = []; // where the ceiling lights are, just under the ceili
 // block takes the colour of its nearest colour seed (7 scattered at random, every colour used at least once), so
 // the colours form a few irregular, contiguous regions. All four are scaled to the original blue LED's luminance,
 // so they read equally bright and all still clear the bloom threshold (which goes by luminance).
-const CEIL_COLORS = { green: [0.15, 1, 0.25], blue: [0.2, 0.45, 1], red: [1, 0.12, 0.08], white: [1, 1, 1] }; // linear hues
+// Now all white (add hues back, e.g. green: [0.15, 1, 0.25], blue: [0.2, 0.45, 1], red: [1, 0.12, 0.08], for sections).
+// The light they cast is CEIL_CAST of that: about what one of the red, green or blue lights put out, a third of white;
+// the lenses themselves stay at full brightness, so they still bloom.
+const CEIL_COLORS = { white: [1, 1, 1] }; // linear hues
+const CEIL_CAST = 1 / 3;
 const CEIL_SECTION = 16, CEIL_COLOR_SEEDS = 7; // m: a colour block; seeds
 const LED = new THREE.Color(0x96d2ff); // the light tile's baked LED colour (LIGHT in the generator), linear
 const luminance = (c) => 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
@@ -715,7 +852,7 @@ const ceilColors = Object.fromEntries(Object.entries(CEIL_COLORS).map(([k, v]) =
     const lit = i % CEIL_LIGHT_EVERY === CEIL_LIGHT_EVERY / 2 && j % CEIL_LIGHT_EVERY === CEIL_LIGHT_EVERY / 2;
     const key = lit ? `light:${sectionColor(p.x, p.z)}` : CEILING_TILES[(i + j) % 2];
     (cells[key] ??= []).push(p);
-    if (lit) ceilLightTiles.push(Object.assign(p.clone().setY(p.y - 0.02), { color: ceilColors[key.split(':')[1]] }));
+    if (lit) ceilLightTiles.push(Object.assign(p.clone().setY(p.y - 0.02), { color: ceilColors[key.split(':')[1]].clone().multiplyScalar(CEIL_CAST) }));
   }
   for (const [key, ps] of Object.entries(cells)) {
     if (!ps.length) continue;
@@ -735,15 +872,17 @@ const ceilColors = Object.fromEntries(Object.entries(CEIL_COLORS).map(([k, v]) =
 // carry thin light slits, alternating round the column between the ceiling and floor edges, each with a spot light
 // aimed away from it (see the spot pool).
 const COLUMN_SIDE = TILE, COLUMN_SPACING = 16; // m: face width; lattice step out from the centre
+const COLUMN_TINT = 0x35b8a0; // the bottom row of panels: a greenish-blue (teal) steel
 const COLUMNS = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([i, j]) => new THREE.Vector2(i, j).multiplyScalar(COLUMN_SPACING));
 const COLUMN_APOTHEM = COLUMN_SIDE / 2 / Math.tan(Math.PI / 8);          // centre → middle of a face
 const COLUMN_REACH = COLUMN_APOTHEM / Math.cos(Math.PI / 8) + 0.4;       // centre → corner, plus the player's body
 const slitTiles = []; // the columns' light slits: positions, each with .aim (where its spot points, relative)
+const columnLamps = []; // the columns' wall lamps (the walls' parallax fixture): where each one's glow sits
 {
   const panel = new THREE.PlaneGeometry(COLUMN_SIDE, TILE); // faces +Z
   const uv = panel.attributes.uv;
   for (let i = 0; i < uv.count; i++) uv.setX(i, (uv.getX(i) * COLUMN_SIDE) / TILE); // a face narrower than a tile shows part of a plate, not a squashed one
-  const panels = { plain: [], slitlight: [] }, m = new THREE.Matrix4();
+  const panels = {}, m = new THREE.Matrix4(); // by tile name, ':low' for the bottom row (tinted)
   const upsideDown = new THREE.Quaternion().setFromAxisAngle(AXIS_Z, Math.PI); // in the panel's plane
   for (const c of COLUMNS) for (let k = 0; k < 8; k++) {
     const a = (k * Math.PI) / 4, q = new THREE.Quaternion().setFromAxisAngle(AXIS_Y, a); // face k looks out at angle a
@@ -754,27 +893,106 @@ const slitTiles = []; // the columns' light slits: positions, each with .aim (wh
       // down), spot aimed up. Each slit sits 0.25 m from its edge; its spot hangs just off the face, tilted a
       // little outward, washing the column face and lighting the floor (or the ceiling) around it.
       const top = r === WALL_ROWS - 1 && k % 2 === 0, bottom = r === 0 && k % 2 === 1, slit = top || bottom;
-      panels[slit ? 'slitlight' : 'plain'].push(m.clone().compose(
+      const lamp = r === 1 && k % 2 === 0; // a wall lamp on the second panel up, every other face (over a plain one)
+      if (lamp) columnLamps.push(new THREE.Vector3(c.x, (r + 0.5) * TILE, c.y).addScaledVector(out, COLUMN_APOTHEM + WALL_STRIP_OFFSET));
+      (panels[(slit ? 'slitlight' : lamp ? 'walllight' : 'plain') + (r === 0 ? ':low' : '')] ??= []).push(m.clone().compose(
         new THREE.Vector3(c.x, (r + 0.5) * TILE, c.y).addScaledVector(out, COLUMN_APOTHEM), bottom ? q.clone().multiply(upsideDown) : q, ONE));
       if (slit) slitTiles.push(Object.assign(
         new THREE.Vector3(c.x, top ? (r + 1) * TILE - 0.25 : 0.25, c.y).addScaledVector(out, COLUMN_APOTHEM + 0.15),
         { aim: out.clone().multiplyScalar(1.5).setY(top ? -6 : 6) }));
     }
   }
-  for (const [name, mats] of Object.entries(panels)) {
-    const mesh = new THREE.InstancedMesh(withGrimeOffsets(panel, mats.length), tileMat(name, `drip:${name}`, { drip: true }), mats.length);
+  for (const [key, mats] of Object.entries(panels)) {
+    const [name, low] = key.split(':'), mat = tileMat(name, `drip:${key}`, { drip: true });
+    if (low) mat.color.set(COLUMN_TINT); // the bottom row: tinted steel, still metal (the tint colours its reflections)
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(panel, mats.length), mat, mats.length);
     mats.forEach((mm, i) => mesh.setMatrixAt(i, mm));
     scene.add(mesh);
   }
 }
 
+// Braced towers: four cheap supports on the edges, between the corner columns. A square of four corner posts,
+// floor to ceiling, an X brace across each face of each 2 m storey and a strut round every storey line: open
+// steelwork you see (and shoot) through. Each member is a box: { m: its matrix, size } — drawn, and shot at as a
+// convex solid (rayTowers).
+const TOWERS = [[0, -1], [0, 1], [-1, 0], [1, 0]].map(([i, j]) => new THREE.Vector2(i, j).multiplyScalar(COLUMN_SPACING));
+const TOWER_HALF = 0.75, TOWER_POST = 5 / 32, TOWER_BAR = 3 / 32; // m: post centre lines ± this; post section; bar section
+const TOWER_REACH = TOWER_HALF * Math.SQRT2 + 0.4; // centre → corner post, plus the player's body
+const TOWER_PARTS = [];
+const TOWER_LAMP_STOREY = WALL_ROWS - 2; // a strip light across each face, mid-way up the second storey from the top
+const towerLamps = []; // where each one's glow sits (the strip pool)
+{
+  const H = WALL_ROWS * TILE, span = 2 * TOWER_HALF, brace = Math.hypot(span, TILE), lean = Math.atan2(TILE, span);
+  const post = new THREE.Vector3(TOWER_POST, H, TOWER_POST), strut = new THREE.Vector3(span, TOWER_BAR, TOWER_BAR);
+  const bar = new THREE.Vector3(brace, TOWER_BAR, TOWER_BAR / 2);
+  const lamp = new THREE.Vector3(span - TOWER_POST - 0.1, 3 / 32, 2.5 / 32); // a housing between the posts, lens facing out
+  const add = (size, pos, q) => TOWER_PARTS.push({ size, m: new THREE.Matrix4().compose(pos, q, ONE) });
+  for (const c of TOWERS) {
+    for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) add(post, new THREE.Vector3(c.x + sx * TOWER_HALF, H / 2, c.y + sz * TOWER_HALF), new THREE.Quaternion());
+    for (let f = 0; f < 4; f++) { // each face: its outward normal at yaw f × 90°, its x along the face
+      const yaw = new THREE.Quaternion().setFromAxisAngle(AXIS_Y, f * Math.PI / 2), out = new THREE.Vector3(0, 0, 1).applyQuaternion(yaw);
+      const at = (y) => new THREE.Vector3(c.x, y, c.y).addScaledVector(out, TOWER_HALF);
+      for (let r = 0; r <= WALL_ROWS; r++) add(strut, at(THREE.MathUtils.clamp(r * TILE, TOWER_BAR / 2, H - TOWER_BAR / 2)), yaw);
+      for (let r = 0; r < WALL_ROWS; r++) for (const sign of [1, -1])
+        add(bar, at((r + 0.5) * TILE), yaw.clone().multiply(new THREE.Quaternion().setFromAxisAngle(AXIS_Z, sign * lean)));
+      const y = (TOWER_LAMP_STOREY + 0.5) * TILE; // the lamp: bolted on over the braces' crossing
+      add(lamp, at(y).addScaledVector(out, TOWER_BAR / 4 + lamp.z / 2), yaw);
+      towerLamps.push(at(y).addScaledVector(out, WALL_STRIP_OFFSET));
+    }
+  }
+  // drawn: one instanced box per member size, its uvs in tile units of each face's size (no stretched plate)
+  const mat = tileMat('plain', 'drip:plain', { drip: true });
+  for (const size of [post, strut, bar]) {
+    const parts = TOWER_PARTS.filter((p) => p.size === size), geo = new THREE.BoxGeometry(size.x, size.y, size.z), uv = geo.attributes.uv;
+    for (const g of geo.groups) {
+      const [w, h] = [[size.z, size.y], [size.z, size.y], [size.x, size.z], [size.x, size.z], [size.x, size.y], [size.x, size.y]][g.materialIndex];
+      for (let i = g.start / 1.5; i < (g.start + g.count) / 1.5; i++) uv.setXY(i, uv.getX(i) * w / TILE, uv.getY(i) * h / TILE);
+    }
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(geo, parts.length), mat, parts.length);
+    parts.forEach((p, i) => mesh.setMatrixAt(i, p.m));
+    scene.add(mesh);
+  }
+  { // the lamps: steel housings, the front face a glowing lens (brighter than white, so it blooms)
+    const parts = TOWER_PARTS.filter((p) => p.size === lamp), geo = new THREE.BoxGeometry(lamp.x, lamp.y, lamp.z);
+    const lens = new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x96d2ff, emissiveIntensity: 5 }); // STRIP_COLOR
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(geo, parts.length), [mat, mat, mat, mat, lens, mat], parts.length);
+    parts.forEach((p, i) => mesh.setMatrixAt(i, p.m));
+    scene.add(mesh);
+  }
+  // shot at: each member's six faces as planes n·p ≤ k
+  const ax = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()], at = new THREE.Vector3();
+  for (const p of TOWER_PARTS) {
+    p.m.extractBasis(...ax); at.setFromMatrixPosition(p.m);
+    p.planes = ax.flatMap((a, i) => {
+      const h = [p.size.x, p.size.y, p.size.z][i] / 2, d = a.dot(at);
+      return [[a.x, a.y, a.z, d + h], [-a.x, -a.y, -a.z, h - d]];
+    });
+  }
+}
+function rayTowers(o, dir) { // the nearest tower member a ray hits: { t, normal } or null
+  let best = null;
+  for (const c of TOWERS) {
+    // skip a tower the ray passes well clear of (in plan)
+    const ox = c.x - o.x, oz = c.y - o.z, a = dir.x * dir.x + dir.z * dir.z, t = a > 1e-9 ? (ox * dir.x + oz * dir.z) / a : 0;
+    if (Math.hypot(ox - dir.x * t, oz - dir.z * t) > TOWER_HALF * 2 && Math.hypot(ox, oz) > TOWER_HALF * 2) continue;
+    for (const p of TOWER_PARTS) {
+      if (Math.abs(p.m.elements[12] - c.x) > 1 || Math.abs(p.m.elements[14] - c.y) > 1) continue; // another tower's
+      const h = rayConvex(o, dir, p.planes);
+      if (h && (!best || h.t < best.t)) best = h;
+    }
+  }
+  return best;
+}
+
 // The centre platform: a regular octagon, two panels to a side (4 m sides, ~9.7 m across), half a panel (1 m) tall. Its sides are steel panels cut to half height (each shows half a plate); its top is plates on the 2 m
 // floor grid, each clipped to the octagon. You can jump up onto it (your jump just clears it); otherwise it's solid,
 // to you, the demons, shots and blood.
-const PLATFORM_SIDE = 2 * TILE, PLATFORM_H = TILE / 2, PLATFORM_STEP = 0.15; // m; m; how far short of the top still lands you on it
+const PLATFORM_SIDE = 2 * TILE, PLATFORM_H = TILE / 2, PLATFORM_STEP = 0.3; // m; m; how far short of a top still lands (or steps) you onto it: more than a stair's rise
 const PLATFORM_APOTHEM = PLATFORM_SIDE / 2 / Math.tan(Math.PI / 8); // centre → middle of a side
 const PLATFORM_FACES = Array.from({ length: 8 }, (_, k) => new THREE.Vector2(Math.sin(k * Math.PI / 4), Math.cos(k * Math.PI / 4))); // side k's outward normal (x, z)
-const PLATFORM_TILES = { plain: 0.6, plain_bolted: 0.2, plain_welded: 0.2 };
+const PLATFORM_TILES = { plain: 0.6, plain_bolted: 0.2, plain_welded: 0.2 }; // the sides; the top is tread plate
+const PLATFORM_STRIP_SQUARE = 3; // m: two strip lights set into the top, opposite sides of a square this size in the middle
+const platformLamps = []; // where their glow sits (the strip pool): two per strip
 // How far out from the centre a point is, measured across the nearest side (< PLATFORM_APOTHEM: over the platform);
 // the side's normal in _pf
 const _pf = new THREE.Vector2();
@@ -795,7 +1013,53 @@ function rayPlatform(o, dir) {
   };
   for (const n of PLATFORM_FACES) clip(n.x * dir.x + n.y * dir.z, PLATFORM_APOTHEM - (n.x * o.x + n.y * o.z));
   clip(dir.y, PLATFORM_H - o.y); clip(-dir.y, o.y);
-  return tIn <= tOut && tOut > 0 ? Math.max(tIn, 0) : Infinity;
+  const t = tIn <= tOut && tOut > 0 ? Math.max(tIn, 0) : Infinity;
+  return Math.min(t, ...STAIR_PIECES.map((p) => rayConvex(o, dir, p)?.t ?? Infinity));
+}
+// Stairs up the four sides square to the grid: a flight one tile wide, 4 rises of 25 cm to the top, 3 treads of
+// grating each two of the slit tile's rows deep (⅔ m), so the flight runs one tile out. Each step is a solid box
+// from the floor up: { n: the side's outward normal, t: along it, e0..e1: metres out from the side, h: its top }.
+const STAIR_SIDES = [0, 2, 4, 6], STAIR_RISE = PLATFORM_H / 4, STAIR_RUN = TILE / 3, STAIR_HALF = TILE / 2;
+const STAIR_BOXES = STAIR_SIDES.flatMap((k) => [0, 1, 2].map((j) => ({
+  n: PLATFORM_FACES[k], t: new THREE.Vector2(PLATFORM_FACES[k].y, -PLATFORM_FACES[k].x),
+  e0: j * STAIR_RUN, e1: (j + 1) * STAIR_RUN, h: PLATFORM_H - (j + 1) * STAIR_RISE,
+})));
+const stairLocal = (b, x, z) => [b.n.x * x + b.n.y * z - PLATFORM_APOTHEM, b.t.x * x + b.t.y * z]; // [out, along]
+const inStairBox = (b, x, z, pad = 0) => {
+  const [e, a] = stairLocal(b, x, z);
+  return e > b.e0 - pad && e < b.e1 + pad && Math.abs(a) < STAIR_HALF + pad;
+};
+const stairHeight = (x, z) => STAIR_BOXES.reduce((h, b) => (inStairBox(b, x, z) ? Math.max(h, b.h) : h), 0);
+function pushOutOfStairBox(p, b, pad) { // the shortest way out of one step's (padded) footprint
+  const [e, a] = stairLocal(b, p.x, p.z);
+  const ways = [[b.e1 + pad - e, b.n.x, b.n.y], [e - b.e0 + pad, -b.n.x, -b.n.y],
+    [STAIR_HALF + pad - a, b.t.x, b.t.y], [a + STAIR_HALF + pad, -b.t.x, -b.t.y]];
+  const [d, x, z] = ways.reduce((m, w) => (w[0] < m[0] ? w : m));
+  if (d > 0) { p.x += x * d; p.z += z * d; }
+}
+function pushOutOfStairs(p, pad) { // demons don't climb: the stairs are in their way like the platform
+  for (const b of STAIR_BOXES) if (inStairBox(b, p.x, p.z, pad)) pushOutOfStairBox(p, b, pad);
+}
+// The stairs are open (cheap): each tread a thin grating, slotted right through, carried between two slanted
+// stringers; no risers, nothing underneath. You still walk them as the solid steps above (no ducking under them),
+// but shots and sight lines see only the treads and stringers: each a convex solid, its faces' planes n·p ≤ k.
+const STAIR_TREAD = 3 / 32, STRINGER_W = 2 / 32, STRINGER_D = 0.35, STAIR_SLOPE = STAIR_RISE / STAIR_RUN; // m; m; m
+const STAIR_PIECES = STAIR_BOXES.map((b) => [ // the treads
+  [b.n.x, 0, b.n.y, PLATFORM_APOTHEM + b.e1], [-b.n.x, 0, -b.n.y, -PLATFORM_APOTHEM - b.e0],
+  [b.t.x, 0, b.t.y, STAIR_HALF], [-b.t.x, 0, -b.t.y, STAIR_HALF], [0, 1, 0, b.h], [0, -1, 0, STAIR_TREAD - b.h],
+]).concat(STAIR_BOXES.filter((b) => b.e0 === 0).flatMap(({ n, t }) => [1, -1].map((side) => { // the stringers
+  const lo = side > 0 ? STAIR_HALF : -STAIR_HALF - STRINGER_W, A = PLATFORM_APOTHEM, s = STAIR_SLOPE;
+  return [[t.x, 0, t.y, lo + STRINGER_W], [-t.x, 0, -t.y, -lo], [n.x, 0, n.y, A + 3 * STAIR_RUN], [-n.x, 0, -n.y, -A],
+    [0, -1, 0, 0], [s * n.x, 1, s * n.y, PLATFORM_H + s * A], [-s * n.x, -1, -s * n.y, STRINGER_D - PLATFORM_H - s * A]];
+})));
+function rayConvex(o, dir, planes) { // where a ray enters a convex solid: { t, normal } or null
+  let tIn = -Infinity, tOut = Infinity, nIn = null;
+  for (const [nx, ny, nz, k] of planes) {
+    const den = nx * dir.x + ny * dir.y + nz * dir.z, num = k - (nx * o.x + ny * o.y + nz * o.z);
+    if (Math.abs(den) < 1e-9) { if (num < 0) return null; } else if (den > 0) tOut = Math.min(tOut, num / den);
+    else if (num / den > tIn) { tIn = num / den; nIn = [nx, ny, nz]; }
+  }
+  return tIn <= tOut && tIn > 0 && nIn ? { t: tIn, normal: new THREE.Vector3(...nIn).normalize() } : null;
 }
 {
   const pick = (weights) => { let r = Math.random(); for (const [n, w] of Object.entries(weights)) if ((r -= w) <= 0) return n; return Object.keys(weights)[0]; };
@@ -835,8 +1099,8 @@ function rayPlatform(o, dir) {
       poly = out;
     }
     if (poly.length < 3) continue;
-    const g = (tops[pick(PLATFORM_TILES)] ??= { pos: [], uv: [], grime: [] });
-    const grime = [((Math.random() * 256) | 0) / 256, ((Math.random() * 256) | 0) / 256];
+    const g = (tops.treadplate ??= { pos: [], uv: [], grime: [] });
+    const grime = [i * GRIME_TILE % 1 + 1, -j * GRIME_TILE % 1 + 1]; // neighbouring windows: one sheet, its dirt unbroken
     for (let k = 1; k < poly.length - 1; k++) for (const [x, z] of [poly[0], poly[k + 1], poly[k]]) { // a fan, facing up
       g.pos.push(x, PLATFORM_H, z);
       g.uv.push((x - x0) / TILE, (z0 + TILE - z) / TILE);
@@ -851,7 +1115,183 @@ function rayPlatform(o, dir) {
     geo.setAttribute('grimeOffset', new THREE.Float32BufferAttribute(g.grime, 2)); // per vertex: one window per plate
     scene.add(new THREE.Mesh(geo, tileMat(name)));
   }
+  // Hazard band: yellow/black paint around the top's edge, 32 px/m like the tiles (one texture = 2 m of band,
+  // 4 diagonal stripes), with worn-through chips. Painted on, so it isn't metal and doesn't take the tile grime.
+  const W = 8, L = 64, px = new Uint8Array(L * W * 4);
+  for (let y = 0; y < W; y++) for (let x = 0; x < L; x++) {
+    const yellow = (x + y) % 16 < 8, chip = Math.random() < 0.06;
+    px.set(chip ? [70, 72, 70, 255] : yellow ? [226, 176, 18, 255] : [22, 22, 22, 255], (y * L + x) * 4);
+  }
+  const hazardMap = Object.assign(new THREE.DataTexture(px, L, W), {
+    colorSpace: THREE.SRGBColorSpace, wrapS: THREE.RepeatWrapping, generateMipmaps: true,
+    minFilter: THREE.LinearMipmapLinearFilter, anisotropy: renderer.capabilities.getMaxAnisotropy(), needsUpdate: true,
+  });
+  // The same band on the floor round each column's foot, just outside its faces. Rings: centre, inner and outer
+  // apothem (the stripes' v runs from the outer edge in), height.
+  const BAND = W / 32, pos = [], uv = [];
+  const rings = [[0, 0, PLATFORM_APOTHEM - BAND, PLATFORM_APOTHEM, PLATFORM_H],
+    ...COLUMNS.map((c) => [c.x, c.y, COLUMN_APOTHEM, COLUMN_APOTHEM + BAND, 0])];
+  for (const [cx, cz, a0, a1, y] of rings) for (const n of PLATFORM_FACES) {
+    const t = new THREE.Vector2(n.y, -n.x), h0 = a0 * Math.tan(Math.PI / 8), h1 = a1 * Math.tan(Math.PI / 8);
+    const c = [[a1, -h1, 0], [a1, h1, 0], [a0, h0, 1], [a0, -h0, 1]] // along n, along t, v
+      .map(([a, b, v]) => ({ x: cx + n.x * a + t.x * b, z: cz + n.y * a + t.y * b, u: b / 2, v }));
+    for (const k of [0, 1, 2, 0, 2, 3]) { pos.push(c[k].x, y, c[k].z); uv.push(c[k].u, c[k].v); }
+  }
+  const band = new THREE.BufferGeometry();
+  band.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  band.setAttribute('normal', new THREE.Float32BufferAttribute(pos.map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
+  band.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  scene.add(new THREE.Mesh(band, new THREE.MeshStandardMaterial({
+    map: hazardMap, roughness: 0.6, metalness: 0, side: THREE.DoubleSide, // either winding: it only faces up
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1, // painted on the top: drawn over it
+  })));
+  // Stairs (open: see STAIR_PIECES): the treads, a grating slab each (two rows of the slit tile, its full width,
+  // the slots cut through; the underside is the same top seen from below), its nosing in the hazard stripes; and
+  // the stringers, plain steel plate.
+  const SLIT_ROW = 1 / 6; // the slit tile's rows (the outer two are margin)
+  const plainSide = tileMat('plain', 'drip:plain', { drip: true });
+  const grating = Object.assign(tileMat('slits', 'tread:slits'), { alphaMap: loadMap('slits_cut'), alphaTest: 0.5, side: THREE.DoubleSide });
+  const nosing = new THREE.MeshStandardMaterial({ map: hazardMap, roughness: 0.6, metalness: 0 });
+  const tread = new THREE.BoxGeometry(TILE, STAIR_TREAD, STAIR_RUN), tuv = tread.attributes.uv;
+  for (const g of tread.groups) for (let i = g.start / 1.5; i < (g.start + g.count) / 1.5; i++) {
+    // per face (+x, −x, +y, −y, +z, −z): edges in tile units of their size, the top on its two slit rows, the
+    // nosing on the stripes' first rows
+    if (g.materialIndex === 2) tuv.setY(i, 1 - 3 * SLIT_ROW + tuv.getY(i) * 2 * SLIT_ROW);
+    else if (g.materialIndex === 4) tuv.setY(i, tuv.getY(i) * STAIR_TREAD * 32 / 8);
+    else {
+      const w = g.materialIndex < 2 ? STAIR_RUN : TILE;
+      tuv.setX(i, tuv.getX(i) * w / TILE); tuv.setY(i, tuv.getY(i) * STAIR_TREAD / TILE);
+    }
+  }
+  const treads = new THREE.InstancedMesh(withGrimeOffsets(tread, STAIR_BOXES.length),
+    [plainSide, plainSide, grating, new THREE.MeshBasicMaterial({ visible: false }), nosing, plainSide], STAIR_BOXES.length);
+  STAIR_BOXES.forEach((b, i) => {
+    const e = PLATFORM_APOTHEM + (b.e0 + b.e1) / 2;
+    treads.setMatrixAt(i, m.compose(new THREE.Vector3(b.n.x * e, b.h - STAIR_TREAD / 2, b.n.y * e),
+      new THREE.Quaternion().setFromAxisAngle(AXIS_Y, Math.atan2(b.n.x, b.n.y)), ONE)); // its +z out from the side
+  });
+  scene.add(treads);
+  // A stringer: drawn in (out from the side, up), its top along the treads' nosings, STRINGER_D deep, cut off
+  // level with the floor and the platform's side; extruded STRINGER_W across the flight
+  const run = 3 * STAIR_RUN, foot = (PLATFORM_H - STRINGER_D) / STAIR_SLOPE;
+  const plate = new THREE.ExtrudeGeometry(new THREE.Shape([[0, PLATFORM_H], [0, PLATFORM_H - STRINGER_D], [foot, 0], [run, 0],
+    [run, PLATFORM_H - run * STAIR_SLOPE]].map(([x, y]) => new THREE.Vector2(x, y))), { depth: STRINGER_W, bevelEnabled: false });
+  const puv = plate.attributes.uv;
+  for (let i = 0; i < puv.count; i++) puv.setXY(i, puv.getX(i) / TILE, puv.getY(i) / TILE); // metres → tiles
+  const stringerCount = STAIR_SIDES.length * 2, stringers = new THREE.InstancedMesh(withGrimeOffsets(plate, stringerCount), plainSide, stringerCount);
+  let si = 0;
+  for (const b of STAIR_BOXES.filter((b) => b.e0 === 0)) for (const side of [1, -1]) {
+    // basis: x out from the side, y up, z = x × y (= −t); extruded along z, so it starts at the far edge of its strip
+    const a = side > 0 ? STAIR_HALF + STRINGER_W : -STAIR_HALF;
+    m.makeBasis(new THREE.Vector3(b.n.x, 0, b.n.y), AXIS_Y, new THREE.Vector3(-b.t.x, 0, -b.t.y))
+      .setPosition(b.n.x * PLATFORM_APOTHEM + b.t.x * a, 0, b.n.y * PLATFORM_APOTHEM + b.t.y * a);
+    stringers.setMatrixAt(si++, m);
+  }
+  scene.add(stringers);
+  // Two strip lights set into the top, parallel: opposite sides of a square in the middle. A shallow steel
+  // housing, its top a glowing lens, barely proud of the plate (you walk over them).
+  const len = PLATFORM_STRIP_SQUARE, half = len / 2, strip = new THREE.BoxGeometry(len, 0.02, 3 / 32);
+  const lens = new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x96d2ff, emissiveIntensity: 5 }); // STRIP_COLOR
+  const strips = new THREE.InstancedMesh(withGrimeOffsets(strip, 2), [plainSide, plainSide, lens, plainSide, plainSide, plainSide], 2);
+  [-half, half].forEach((z, k) => {
+    strips.setMatrixAt(k, m.compose(new THREE.Vector3(0, PLATFORM_H + 0.01, z), new THREE.Quaternion(), ONE)); // along x
+    for (const x of [-half / 2, half / 2]) platformLamps.push(new THREE.Vector3(x, PLATFORM_H + 0.25, z)); // STRIP_HEIGHT above it
+  });
+  scene.add(strips);
+  // A red X painted on the middle: 2 m across, 32 px/m like everything else, bars ~25 cm wide, the paint worn
+  // through in places (to the rubber: the texture's cut-out)
+  const X_PX = 64, xPx = new Uint8Array(X_PX * X_PX * 4);
+  for (let y = 0; y < X_PX; y++) for (let x = 0; x < X_PX; x++) {
+    const paint = Math.min(Math.abs(x - y), Math.abs(x + y - (X_PX - 1))) / Math.SQRT2 < 4 && x > 1 && y > 1 && x < X_PX - 2 && y < X_PX - 2;
+    xPx.set([186, 28, 22, paint && Math.random() > 0.06 ? 255 : 0], (y * X_PX + x) * 4);
+  }
+  const xMap = Object.assign(new THREE.DataTexture(xPx, X_PX, X_PX), {
+    colorSpace: THREE.SRGBColorSpace, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter,
+    anisotropy: renderer.capabilities.getMaxAnisotropy(), needsUpdate: true,
+  });
+  const mark = new THREE.Mesh(new THREE.PlaneGeometry(X_PX / 32, X_PX / 32).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({
+    map: xMap, alphaTest: 0.5, roughness: 0.6, metalness: 0,
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1, // painted on the top: drawn over it
+  }));
+  mark.position.y = PLATFORM_H;
+  scene.add(mark);
 }
+
+// Glass floor: one row of glass panels across the arena, one tile out from the centre platform on its −z side (the
+// plain row between is where its stairs come down; the platform reaches z = −4.8, the stairs −6.8, this row −8..−10).
+// Laid unturned, so the pipes under them run along the row, one run under the whole of it.
+const GLASS_ROW = TILES / 2 - 5;
+for (let col = TILES / 2 - ARENA / TILE; col < TILES / 2 + ARENA / TILE; col++)
+  tilePick[GLASS_ROW * TILES + col] = Object.keys(FLOOR_TILES).indexOf('glass_slits');
+
+// Weld seams: the welded plates aren't scattered at random. Their seams join up into networks, the way plates
+// are welded along runs: grown like a maze (randomised depth-first search, the "recursive backtracker") on a
+// lattice of every other tile, a node each 4 m with a passage tile between, over the open floor (clear of the
+// platform, its stairs, the columns, the towers, the lamp rows and the wall). WELD_RUNS networks of up to
+// WELD_RUN_NODES nodes each; then each tile takes the piece (end, straight, corner, tee, cross) and quarter turn
+// that joins its seam to its neighbours'.
+const WELD_RUNS = 3, WELD_RUN_NODES = 14;
+const WELD_PIECES = { weld_end: 'W', plain_welded: 'WE', weld_corner: 'WN', weld_tee: 'WEN', weld_cross: 'WENS' }; // as drawn
+const weldTurn = new Map(); // cell → quarter turns about +Y
+{
+  const DIRS = { E: [1, 0], W: [-1, 0], N: [0, -1], S: [0, 1] }, BACK = { E: 'W', W: 'E', N: 'S', S: 'N' };
+  const TURN = { E: 'N', N: 'W', W: 'S', S: 'E' }; // a quarter turn about +Y (image N is −z)
+  const links = new Map(); // cell → its seam's directions
+  const at = (col, row) => row * TILES + col;
+  const open = (col, row) => {
+    const cell = at(col, row), p = tilePos(cell);
+    if (tilePick[cell] === floorLightType || Math.abs(Math.floor(cell / TILES) - GLASS_ROW) < 1 || links.has(cell)) return false; // not the lamps or the glass
+    if (Math.abs(p.x) > ARENA - TILE || Math.abs(p.z) > ARENA - TILE) return false;
+    if (platformDist(p.x, p.z) < PLATFORM_APOTHEM + TILE || STAIR_BOXES.some((b) => inStairBox(b, p.x, p.z, TILE))) return false;
+    return COLUMNS.every((c) => Math.hypot(p.x - c.x, p.z - c.y) > COLUMN_REACH + TILE)
+      && TOWERS.every((c) => Math.hypot(p.x - c.x, p.z - c.y) > TOWER_REACH + TILE);
+  };
+  const link = (col, row, d) => (links.get(at(col, row)) ?? links.set(at(col, row), new Set()).get(at(col, row))).add(d);
+  const nodes = [];
+  for (let row = 0; row < TILES; row += 2) for (let col = 0; col < TILES; col += 2) if (open(col, row)) nodes.push([col, row]);
+  for (let run = 0; run < WELD_RUNS; run++) {
+    const starts = nodes.filter(([c, r]) => !links.has(at(c, r)));
+    if (!starts.length) break;
+    const stack = [starts[(Math.random() * starts.length) | 0]];
+    links.set(at(...stack[0]), new Set());
+    for (let count = 1; stack.length && count < WELD_RUN_NODES;) {
+      const [c, r] = stack.at(-1);
+      const ways = Object.entries(DIRS).filter(([, [dc, dr]]) => open(c + dc, r + dr) && open(c + 2 * dc, r + 2 * dr));
+      if (!ways.length) { stack.pop(); continue; } // dead end: back up and branch from earlier
+      const [d, [dc, dr]] = ways[(Math.random() * ways.length) | 0];
+      link(c, r, d); link(c + dc, r + dr, BACK[d]); link(c + dc, r + dr, d); link(c + 2 * dc, r + 2 * dr, BACK[d]);
+      stack.push([c + 2 * dc, r + 2 * dr]); count++;
+    }
+  }
+  const names = Object.keys(FLOOR_TILES);
+  for (const [cell, dirs] of links) {
+    if (!dirs.size) continue; // a lone start with nowhere to go
+    const fits = [];
+    for (const [name, base] of Object.entries(WELD_PIECES)) {
+      let set = [...base];
+      for (let k = 0; k < 4; k++, set = set.map((d) => TURN[d])) if (set.length === dirs.size && set.every((d) => dirs.has(d))) fits.push([name, k]);
+    }
+    const [name, k] = fits[(Math.random() * fits.length) | 0];
+    tilePick[cell] = names.indexOf(name);
+    weldTurn.set(cell, k);
+  }
+}
+
+Object.keys(FLOOR_TILES).forEach((name, type) => {
+  const mat = tileMat(name);
+  const cells = tilePick.flatMap((t, i) => (t === type ? [i] : []));
+  const mesh = new THREE.InstancedMesh(withGrimeOffsets(tileGeo, cells.length), mat, cells.length);
+  const m = new THREE.Matrix4();
+  // quarter turns at random; a lamp's slit on its right (half turned), then on its left (as authored), meeting
+  const halfTurn = new THREE.Quaternion().setFromAxisAngle(AXIS_Y, Math.PI), noTurn = new THREE.Quaternion();
+  cells.forEach((cell, i) => mesh.setMatrixAt(i, m.compose(tilePos(cell),
+    type === floorLightType ? (cell % TILES % 3 === 0 ? halfTurn : noTurn)
+      : weldTurn.has(cell) ? new THREE.Quaternion().setFromAxisAngle(AXIS_Y, weldTurn.get(cell) * Math.PI / 2) // its seam joined up
+        : name.startsWith('glass') ? noTurn // unturned: the pipes under the glass line up from one panel to the next
+        : randomTurn(AXIS_Y, 4), ONE)));
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+});
 
 // Strip lights: the light tiles' glow on their surroundings. ~2000 light tiles is far too many real lights,
 // so a fixed pool follows the nearest ones (fixed count = no shader recompiles), mirrored into the sprite
@@ -862,11 +1302,14 @@ const STRIP_POOL = 8, STRIP_REACH = 14, STRIP_FADE = 4; // lights, metres, metre
 // the demon sprites and the gun.
 const STRIP_LIGHTS_IN_WORLD = false;
 const STRIP_COLOR = 0x96d2ff, STRIP_INTENSITY = 2, STRIP_RANGE = 5, STRIP_HEIGHT = 0.25; // match LIGHT in the generator
-const WALL_STRIP_OFFSET = 0.6; // m off the wall: further out than the floor's, so it doesn't hot-spot its own fixture
-const lightType = Object.keys(FLOOR_TILES).indexOf('light');
+const lightType = Object.keys(FLOOR_TILES).indexOf(FLOOR_LAMP);
 const stripTiles = [
-  ...tilePick.flatMap((t, cell) => (t === lightType ? [tilePos(cell, STRIP_HEIGHT)] : [])),
+  ...tilePick.flatMap((t, cell) => (t === lightType ? [tilePos(cell, STRIP_HEIGHT)] : []))
+    .filter((p) => Math.abs(p.x) < ARENA && Math.abs(p.z) < ARENA), // only those inside the arena can be seen
   ...wallCells.walllight.map((c) => c.pos.clone().addScaledVector(c.normal, WALL_STRIP_OFFSET)),
+  ...columnLamps,
+  ...towerLamps,
+  ...platformLamps,
 ];
 const stripLights = Array.from({ length: STRIP_POOL }, () => {
   const world = new THREE.PointLight(STRIP_COLOR, 0, STRIP_RANGE, 2);
@@ -1001,11 +1444,58 @@ const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, 
 composer.setSize(innerWidth, innerHeight);
 const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), BLOOM_STRENGTH, BLOOM_RADIUS, BLOOM_THRESHOLD);
 composer.addPass(new RenderPass(scene, camera));
+
+// Depth of field, gameplay style: no refocusing, just distance. Everything nearer than DOF_SHARP m is sharp; past it
+// the blur ramps up to DOF_MAX (a fraction of the screen's height) by DOF_SOFT m, so the far arena goes soft and
+// whatever you're fighting stays crisp. A gather over a golden-angle disc of DOF_TAPS samples, each counted only where its own blur reaches
+// this pixel, so a sharp thing doesn't smear into the blur round it. Reads the scene's depth: the composer's targets
+// carry a depth texture. Before bloom, so blurred lights bloom wider. The gun is drawn after it all, always sharp.
+const DOF_SHARP = 12, DOF_SOFT = 30, DOF_MAX = 0.004, DOF_TAPS = 24; // m; m; of the screen height; samples
+for (const rt of [composer.renderTarget1, composer.renderTarget2]) rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height);
+class DofPass extends ShaderPass {
+  render(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
+    this.uniforms.tDepth.value = readBuffer.depthTexture;
+    this.uniforms.uRes.value.set(readBuffer.width, readBuffer.height);
+    super.render(renderer, writeBuffer, readBuffer, deltaTime, maskActive);
+  }
+}
+const dof = new DofPass({
+  uniforms: {
+    tDiffuse: { value: null }, tDepth: { value: null }, uRes: { value: new THREE.Vector2(1, 1) },
+    uNear: { value: camera.near }, uFar: { value: camera.far },
+  },
+  vertexShader: `varying vec2 vUv;\nvoid main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    #include <packing>
+    uniform sampler2D tDiffuse, tDepth;
+    uniform vec2 uRes;
+    uniform float uNear, uFar;
+    varying vec2 vUv;
+    float viewDepth(vec2 uv) { return -perspectiveDepthToViewZ(texture2D(tDepth, uv).x, uNear, uFar); }
+    float coc(float z) { return smoothstep(${DOF_SHARP.toFixed(1)}, ${DOF_SOFT.toFixed(1)}, z) * ${DOF_MAX} * uRes.y; } // px
+    void main() {
+      vec4 base = texture2D(tDiffuse, vUv);
+      float c0 = coc(viewDepth(vUv));
+      if (c0 < 0.5) { gl_FragColor = base; return; } // in focus
+      vec3 sum = base.rgb;
+      float wsum = 1.0;
+      for (int i = 0; i < ${DOF_TAPS}; i++) {
+        float fi = float(i) + 0.5, r = sqrt(fi / ${DOF_TAPS}.0) * c0, a = fi * 2.39996;
+        vec2 uv = vUv + vec2(cos(a), sin(a)) * r / uRes;
+        float w = clamp(coc(viewDepth(uv)) - r + 1.0, 0.0, 1.0);
+        sum += texture2D(tDiffuse, uv).rgb * w;
+        wsum += w;
+      }
+      gl_FragColor = vec4(sum / wsum, base.a);
+    }`,
+});
+composer.addPass(dof);
+
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
 const look = new PointerLockControls(camera, renderer.domElement);
 const startEl = document.getElementById('start');
-renderer.domElement.addEventListener('click', () => { if (!look.isLocked) look.lock(); });
+renderer.domElement.addEventListener('click', () => { if (!look.isLocked) look.lock(); audio.resume(); }); // (browsers start audio on a click)
 look.addEventListener('lock', () => (startEl.style.display = 'none'));
 look.addEventListener('unlock', () => { startEl.style.display = ''; trigger = false; });
 
@@ -1042,8 +1532,12 @@ const gunRT = new THREE.WebGLRenderTarget(1, 1, {
   type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
 });
 const hudScene = new THREE.Scene(), hudCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+// The gun's image is already premultiplied (drawn over a clear, transparent target), so it's laid over the world as
+// such: colour + world × (1 − opacity). (three's premultipliedAlpha flag would multiply the colour by the opacity
+// again, which would black out the muzzle flash: light with no opacity, that's only added.)
 const gunQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({
-  map: gunRT.texture, transparent: true, premultipliedAlpha: true, depthTest: false, depthWrite: false,
+  map: gunRT.texture, transparent: true, depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
 }));
 hudScene.add(gunQuad);
 function sizeGun() {
@@ -1060,13 +1554,37 @@ function sizeGun() {
 // separate bangs with gaps, not a shape hanging off the barrel. Drawn into the gun's own render, so it's pixelated
 // with it; additive, screen-aligned so the flash hider's prongs point up.
 const GUN_FLASH_TIME = 0.045, GUN_BANG_TIME = 0.017, FLASH_VARIANTS = 4; // s; s; shapes in the sheet
-const flashSheet = loadMap('muzzle_flash', THREE.SRGBColorSpace);
+// The sheet is only heat (grey); here heat becomes light: faint deep red at the tips, orange, then white-hot and far
+// brighter than white (FLASH_GAIN) at the core. A flame is light, not stuff: it's added to whatever's behind it and
+// leaves the gun image's opacity alone, so where the gun image goes over the world it adds its light there too, and it
+// only reads as solid where it outshines what's behind it.
+const FLASH_GAIN = 3, FLASH_FALLOFF = 2.4; // core brightness; how fast the light drops off with heat (higher: dimmer arms)
+const flashSheet = loadMap('muzzle_flash');
 Object.assign(flashSheet, { minFilter: THREE.NearestFilter, generateMipmaps: false });
 flashSheet.repeat.set(1 / FLASH_VARIANTS, 1 / 2);
-const muzzleSprite = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.3), new THREE.MeshBasicMaterial({
-  map: flashSheet, color: new THREE.Color(1.6, 1.6, 1.6), // brighter than white: it's a flash
-  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+const muzzleSprite = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.3), new THREE.ShaderMaterial({
+  uniforms: { uHeat: { value: flashSheet } },
+  vertexShader: `
+    varying vec2 vUv;
+    uniform sampler2D uHeat;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D uHeat;
+    uniform vec2 uRepeat, uOffset;
+    varying vec2 vUv;
+    void main() {
+      float h = texture2D(uHeat, vUv * uRepeat + uOffset).r;
+      if (h <= 0.0) discard;
+      vec3 col = mix(vec3(0.7, 0.12, 0.02), vec3(1.0, 0.5, 0.12), smoothstep(0.15, 0.55, h)); // deep red → orange
+      col = mix(col, vec3(1.0, 0.92, 0.75), smoothstep(0.55, 0.95, h));                     // → white-hot
+      gl_FragColor = vec4(col * pow(h, ${FLASH_FALLOFF.toFixed(1)}) * ${FLASH_GAIN}.0, 0.0); // light only
+    }`,
+  transparent: true, depthWrite: false,
+  blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+  blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
 }));
+muzzleSprite.material.uniforms.uRepeat = { value: flashSheet.repeat };
+muzzleSprite.material.uniforms.uOffset = { value: flashSheet.offset };
 muzzleSprite.visible = false;
 gunScene.add(muzzleSprite);
 
@@ -1135,18 +1653,20 @@ function playGun(name) {
 // way to full, so it rattles hard from the first shot and a sustained burst only tops it up a little), on smooth
 // noise so it rattles rather than jitters. Applied to the
 // camera only for the render and undone straight after, so the mouse look never inherits it.
-const KICK_PER_SHOT = 0.006, KICK_RETURN = 14;                       // rad, 1/s spring back
+const KICK_PER_SHOT = 0.006, KICK_RETURN = 14, HIT_KICK = 0.05, HIT_KICK_RETURN = 9; // rad; 1/s: being shot                       // rad, 1/s spring back
 const TRAUMA_PER_SHOT = 0.8, TRAUMA_DECAY = 2.2, SHAKE_ANGLE = 0.012; // 0..1, per s, rad at full trauma
-let shakeKick = 0, shakeTrauma = 0;
+let shakeKick = 0, shakeTrauma = 0, hitKickYaw = 0, hitKickPitch = 0; // hitKick: a jolt from being shot (see demonShot)
 const _shakeE = new THREE.Euler(0, 0, 0, 'YXZ'), _shakeQ = new THREE.Quaternion(), _camQ = new THREE.Quaternion();
 const wobble = (t, seed) => 0.6 * Math.sin(t * 37 + seed) + 0.4 * Math.sin(t * 61 + seed * 2.3); // smooth, ~-1..1
 function shakeCamera(dt, now) { // returns false when there's nothing to apply
   shakeKick *= Math.exp(-KICK_RETURN * dt);
+  const back = Math.exp(-HIT_KICK_RETURN * dt);
+  hitKickYaw *= back; hitKickPitch *= back;
   shakeTrauma = Math.max(shakeTrauma - TRAUMA_DECAY * dt, 0);
   const s = SHAKE_ANGLE * shakeTrauma;
-  if (shakeKick < 1e-5 && s < 1e-5) return false;
+  if (shakeKick < 1e-5 && s < 1e-5 && Math.abs(hitKickYaw) + Math.abs(hitKickPitch) < 1e-5) return false;
   _camQ.copy(camera.quaternion);
-  _shakeE.set(shakeKick + s * wobble(now, 1), s * wobble(now, 2), 0.5 * s * wobble(now, 3)); // pitch (up), yaw, roll
+  _shakeE.set(shakeKick + hitKickPitch + s * wobble(now, 1), hitKickYaw + s * wobble(now, 2), 0.5 * s * wobble(now, 3)); // pitch (up), yaw, roll
   camera.quaternion.multiply(_shakeQ.setFromEuler(_shakeE));
   camera.updateMatrixWorld();
   return true;
@@ -1165,6 +1685,14 @@ const decalAttrs = { aSeed: 1, aBirth: 1, aStretch: 1, aKind: 1, aPixels: 2 };
 const decalGeo = new THREE.PlaneGeometry(2, 2); // faces +Z; per-instance scale makes it the stain's size
 for (const [name, n] of Object.entries(decalAttrs))
   decalGeo.setAttribute(name, new THREE.InstancedBufferAttribute(new Float32Array(DECAL_MAX * n).fill(name === 'aBirth' ? -1 : 0), n).setUsage(THREE.DynamicDrawUsage));
+// A 4×4 ordered (Bayer) dither threshold for a pixel, 0…1: the blood's fades and mixes go by it, pixel by pixel, so
+// they break up in a fixed cross-hatch (like the textures' grime) instead of blending smoothly
+const BAYER4 = `
+    float bayer4(vec2 p) {
+      int m[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
+      ivec2 i = ivec2(mod(p, 4.0));
+      return (float(m[i.y * 4 + i.x]) + 0.5) / 16.0;
+    }`;
 // The stain's shape: a wobbly round body, streaks breaking off its rim (the crown's fingers), a droplet on each tip
 // and satellites flung beyond, as a signed distance (< 0 inside) over −1…1. Costly (nine fingers, each a capsule and
 // two circles, blended), and it never changes, so DECAL_SHAPES variants are baked once into shapeRT (a
@@ -1225,7 +1753,7 @@ const decalMat = new THREE.ShaderMaterial({
       vDepth = -mv.z;
       gl_Position = projectionMatrix * mv;
     }`,
-  fragmentShader: SPLAT_SDF + `
+  fragmentShader: SPLAT_SDF + BAYER4 + `
     uniform float uTime, fogDensity;
     varying vec2 vUv, vPixels;
     varying float vSeed, vBirth, vStretch, vKind, vDepth;
@@ -1255,10 +1783,14 @@ const decalMat = new THREE.ShaderMaterial({
         }
       }
       if (d > 0.0) discard;
-      float dry = smoothstep(0.5, ${DECAL_DRY.toFixed(1)}, age);
-      vec3 tint = mix(vec3(0.62, 0.04, 0.06), vec3(0.28, 0.035, 0.035), dry);      // wet red → dried brown-red
-      tint *= step(-0.035, d) > 0.5 ? mix(0.85, 0.55, dry) : 1.0;                  // coffee ring: the rim darkens as it dries
-      float keep = (1.0 - smoothstep(${(DECAL_LIFE - 5).toFixed(1)}, ${DECAL_LIFE.toFixed(1)}, age)) * exp(-fogDensity * fogDensity * vDepth * vDepth);
+      // dithered, on the stain's own pixels: drying turns it from wet red to dried brown-red a pixel at a time (more
+      // of its pixels dry as it ages), and at the end of its life its pixels drop out the same way
+      float th = bayer4(floor(vUv * vPixels));
+      bool isDry = th < smoothstep(0.5, ${DECAL_DRY.toFixed(1)}, age);
+      vec3 tint = isDry ? vec3(0.28, 0.035, 0.035) : vec3(0.62, 0.04, 0.06);      // wet red or dried brown-red
+      tint *= step(-0.035, d) > 0.5 ? (isDry ? 0.55 : 0.85) : 1.0;                 // coffee ring: the rim darkens as it dries
+      if (th >= 1.0 - smoothstep(${(DECAL_LIFE - 5).toFixed(1)}, ${DECAL_LIFE.toFixed(1)}, age)) discard; // fading out
+      float keep = exp(-fogDensity * fogDensity * vDepth * vDepth);
       gl_FragColor = vec4(mix(vec3(1.0), tint, keep), 1.0);                         // multiply: 1 = no change
     }`,
 });
@@ -1485,6 +2017,8 @@ const _bv = new THREE.Vector3(), _bp = new THREE.Vector3(), _bn = new THREE.Vect
 // that face, its normal in _bn); null if nothing
 function gooSurface() {
   if (_bp.y <= 0.01) { _bp.y = 0; return 'floor'; }
+  const sh = stairHeight(_bp.x, _bp.z);
+  if (_bp.y <= sh) { _bp.y = sh; return 'floor'; } // a stair: onto its tread
   const pd = platformDist(_bp.x, _bp.z);
   if (pd < PLATFORM_APOTHEM && _bp.y <= PLATFORM_H) { // the platform: its top or a side, whichever it's nearer
     if (PLATFORM_H - _bp.y < PLATFORM_APOTHEM - pd) { _bp.y = PLATFORM_H; return 'floor'; }
@@ -1609,8 +2143,8 @@ scene.add(gooQuad);
 // thins towards the sheet's rim and as it ages, so the film tears into webbing and vanishes. Its uv
 // stretches with the sheet, so the web does too. Drawn on the blood's pixel grid, lit like the metaballs.
 const SHEET_MAX = 128, SHEET_LIFE = 0.6, SHEET_WIDTH = 0.8, SHEET_PAD = 0.05; // sheets, s, width / length, m beyond the ends
-const SHEET_SCALE = 4;
-const SHEET_LIGHT_MAX = 4; // the most light a sheet takes: generous (its dark red stays out of bloom), only stops extremes // how much bigger than its rope a sheet is drawn
+const SHEET_SCALE = 2; // how much bigger than its rope a sheet is drawn
+const SHEET_LIGHT_MAX = 4; // the most light a sheet takes: generous (its dark red stays out of bloom), only stops extremes
 const SHEET_CURL = 1.2, SHEET_CUP = 1.2; // the splat opens like a flower: the bottom hangs at the wound and it curves
 // out towards you, more the higher it goes (this many half-sizes nearer at the top) and at the upper sides; its shading
 // follows that bend, exaggerated by SHEET_CUP
@@ -1619,7 +2153,7 @@ const SHEET_THIN = 0.06, SHEET_THICK = 0.35; // paint thickness (web cells) from
 const SHEET_TRANSLUCENT = 0.1, SHEET_GLOSS = 120, SHEET_GLINT = 0.9; // light through thin paint; glint tightness, strength
 const SHEET_RELIEF = 1.5; // how tall the paint stands (in blood pixels per unit height): more, the deeper its shading
 const SHEET_EDGE = 0.75; // how far in from every contour the paint rises (share of a shape's depth: 1 is its middle)
-const SHEET_CELLS = 3.6, SHEET_WEB = 0.17; // web cells across the sheet's half-size; filament half-width (in cells), new
+const SHEET_CELLS = 2.4, SHEET_WEB = 0.17; // web cells across the sheet's half-size; filament half-width (in cells), new
 const SHEET_WARP = 0.6, SHEET_LUMPS = 0.6; // how far (in cells) smooth noise bends the web; how much strands swell and pinch
 const SHEET_FLOW = 3, SHEET_SPREAD = 0.5; // how fast (noise units/s) the warp flows, so the arms writhe; how far (in
 // cells, over its life) the pattern streams outwards from the centre
@@ -1975,8 +2509,8 @@ function rayWorld(o, dir) {
   if (dir.x > 0) take((ARENA - o.x) / dir.x, -1, 0, 0); else if (dir.x < 0) take((-ARENA - o.x) / dir.x, 1, 0, 0);
   if (dir.z > 0) take((ARENA - o.z) / dir.z, 0, 0, -1); else if (dir.z < 0) take((-ARENA - o.z) / dir.z, 0, 0, 1);
   for (const c of COLUMNS) { const h = rayOctagon(o, dir, c.x, c.y, COLUMN_APOTHEM, H); if (h && (!best || h.t < best.t)) best = h; }
-  const p = rayOctagon(o, dir, 0, 0, PLATFORM_APOTHEM, PLATFORM_H);
-  if (p && (!best || p.t < best.t)) best = p;
+  for (const h of [rayOctagon(o, dir, 0, 0, PLATFORM_APOTHEM, PLATFORM_H), ...STAIR_PIECES.map((p) => rayConvex(o, dir, p)), rayTowers(o, dir)])
+    if (h && (!best || h.t < best.t)) best = h;
   return best;
 }
 
@@ -2026,6 +2560,7 @@ function bakeCasings(gltf) {
 }
 const casePos = new Float32Array(CASE_MAX * 3), caseVel = new Float32Array(CASE_MAX * 3);
 const caseAngle = new Float32Array(CASE_MAX), caseSpin = new Float32Array(CASE_MAX), caseLife = new Float32Array(CASE_MAX);
+const caseLanded = new Uint8Array(CASE_MAX); // its drop sound played
 let caseNext = 0;
 const caseGeo = new THREE.InstancedBufferGeometry();
 {
@@ -2083,6 +2618,7 @@ function ejectCasing() { // out of the port: right of and a little below your ey
   caseAngle[i] = Math.random() * 2 * Math.PI;
   caseSpin[i] = (Math.random() < 0.5 ? -1 : 1) * (20 + Math.random() * 15);
   caseLife[i] = CASE_LIFE;
+  caseLanded[i] = 0;
 }
 function updateCasings(dt) {
   let n = 0;
@@ -2097,9 +2633,13 @@ function updateCasings(dt) {
     for (const c of [0, 2]) if (Math.abs(casePos[k + c]) > ARENA - 0.02) { // the walls
       casePos[k + c] = Math.sign(casePos[k + c]) * (ARENA - 0.02); caseVel[k + c] *= -0.4;
     }
-    const ground = (platformDist(casePos[k], casePos[k + 2]) < PLATFORM_APOTHEM ? PLATFORM_H : 0) + 0.008; // lying: its radius
+    const ground = (platformDist(casePos[k], casePos[k + 2]) < PLATFORM_APOTHEM ? PLATFORM_H : stairHeight(casePos[k], casePos[k + 2])) + 0.008; // lying: its radius
     if (casePos[k + 1] < ground) {
       casePos[k + 1] = ground;
+      if (!caseLanded[i]) { // its first landing: the clink (the sound has its own little bounces after)
+        caseLanded[i] = 1;
+        playShellDrop(Math.hypot(casePos[k] - camera.position.x, casePos[k + 2] - camera.position.z));
+      }
       if (caseVel[k + 1] < -0.6) { // a bounce: up a little, slowed, spinning less
         caseVel[k + 1] *= -CASE_BOUNCE; caseVel[k] *= 0.6; caseVel[k + 2] *= 0.6; caseSpin[i] *= 0.5;
       } else { // settled: slides to a stop on its side
@@ -2119,9 +2659,10 @@ function updateCasings(dt) {
 }
 
 // The flash's glow: the gun is drawn over the finished frame, after bloom, so its flash can't glow. A bright,
-// pixelated disc at the muzzle's place in the world (where its light goes) for the bang does: far over
-// BLOOM_THRESHOLD at its core, so the bloom pass spreads it round the barrel like any light.
-const HALO_SIZE = 0.3, HALO_PEAK = 9, HALO_PX = 12; // m across; core brightness; px across it
+// disc at the muzzle's place in the world (where its light goes) for the bang does: far over
+// BLOOM_THRESHOLD at its core, so the bloom pass spreads it round the barrel like any light. A smooth falloff, not
+// pixelated: it's the light, not a shape (so close to your eye, its pixels would be big glowing squares).
+const HALO_SIZE = 0.3, HALO_PEAK = 9; // m across; core brightness
 const halo = new THREE.Mesh(new THREE.PlaneGeometry(HALO_SIZE, HALO_SIZE), new THREE.ShaderMaterial({
   vertexShader: `
     varying vec2 vUv;
@@ -2134,8 +2675,7 @@ const halo = new THREE.Mesh(new THREE.PlaneGeometry(HALO_SIZE, HALO_SIZE), new T
   fragmentShader: `
     varying vec2 vUv;
     void main() {
-      vec2 q = (floor(vUv * ${HALO_PX}.0) + 0.5) / ${HALO_PX}.0 * 2.0 - 1.0; // its own chunky pixels
-      float g = max(1.0 - length(q), 0.0);
+      float g = max(1.0 - length(vUv * 2.0 - 1.0), 0.0);
       if (g <= 0.0) discard;
       gl_FragColor = vec4(vec3(1.0, 0.72, 0.38) * ${HALO_PEAK}.0 * g * g * g, 1.0);
     }`,
@@ -2236,7 +2776,7 @@ function shotHit() {
   for (const npc of npcs) {
     const { imp } = npc;
     const R = imp.r * 0.5;
-    _toC.copy(imp.model.position).setY(imp.model.position.y + imp.centerY).sub(o);
+    _toC.copy(imp.model.position).add(imp.fit).sub(o);
     const t = _toC.dot(dir), d2 = _toC.lengthSq() - t * t;
     if (t > 0 && d2 < (imp.r * imp.r)) near.push({ npc, t, out: t + Math.sqrt(Math.max(R * R - d2, 0)) });
   }
@@ -2248,6 +2788,7 @@ function shotHit() {
   }
   if (!hit) return null;
   if (rayPlatform(o, dir) < best) return null; // the platform's in the way
+  if ((rayTowers(o, dir)?.t ?? Infinity) < best) return null; // a tower's bar
   const Rc = COLUMN_APOTHEM / Math.cos(Math.PI / 8), a = dir.x * dir.x + dir.z * dir.z;
   for (const c of COLUMNS) {
     const ox = o.x - c.x, oz = o.z - c.y, b = 2 * (dir.x * ox + dir.z * oz), disc = b * b - 4 * a * (ox * ox + oz * oz - Rc * Rc);
@@ -2386,6 +2927,44 @@ function bloodOnBeforeCompile(shader) {
 #endif`);
 }
 
+// Sound: the rifle's report on every shot (sounds/rifle_shot.wav: freesound "assaultrifle2", trimmed to its crack and
+// 1.5 s of tail). At full auto the copies overlap into the burst; each a touch different in pitch and level, so it
+// doesn't machine-gun one identical sample. Web Audio: decoded once, started on the click that locks the pointer.
+const audio = new AudioContext();
+const shotOut = audio.createGain();
+shotOut.gain.value = 0.6;
+shotOut.connect(audio.destination);
+const sounds = {};
+const FOOTSTEPS = 11; // sounds/footstep_0..10.wav: single steps from "walking up the stairs" (freeeverythingxx)
+const GRUNTS = 5; // sounds/hurt_grunt_0..4.wav: from heckingfeck's royalty-free "male pain grunts" (its 0:00, 0:02, 0:03, 0:07, 0:13)
+const DEMON_GRUNTS = 4; // sounds/demon_grunt_0..3.wav: freesound "monster chase grunts" (its four)
+const DEMON_DEATHS = 4; // sounds/demon_death_0..3.wav: the four calls in dragon-studio "monster call"
+for (const name of ['rifle_shot', 'shell_drop', 'reload', 'demon_shot', ...Array.from({ length: DEMON_GRUNTS }, (_, k) => `demon_grunt_${k}`),
+  ...Array.from({ length: DEMON_DEATHS }, (_, k) => `demon_death_${k}`),
+  ...Array.from({ length: GRUNTS }, (_, k) => `hurt_grunt_${k}`),
+  ...Array.from({ length: FOOTSTEPS }, (_, k) => `footstep_${k}`)])
+  fetch(`sounds/${name}.wav`).then((r) => r.arrayBuffer()).then((b) => audio.decodeAudioData(b)).then((b) => (sounds[name] = b));
+function playSound(name, level, pitch) { // pitch: ± this fraction, at random
+  if (!sounds[name]) return;
+  const src = audio.createBufferSource(), gain = audio.createGain();
+  src.buffer = sounds[name];
+  src.playbackRate.value = 1 + (Math.random() * 2 - 1) * pitch;
+  gain.gain.value = level;
+  src.connect(gain).connect(shotOut);
+  src.start();
+}
+const playShot = () => playSound('rifle_shot', 0.85 + Math.random() * 0.15, 0.04);
+// A casing hitting the floor (sounds/shell_drop.wav: the first drop of freesound "bullet shells", its clink and its
+// little bounces after): once, on its first landing; quieter the further it fell from you
+const playShellDrop = (d) => playSound('shell_drop', (0.5 + Math.random() * 0.3) / (1 + d * 0.6), 0.08);
+// Footsteps: one of the steps at random, never the same twice running
+let lastStep = -1, stepDist = 0;
+function playStep(level) {
+  let k = (Math.random() * (FOOTSTEPS - 1)) | 0;
+  if (k >= lastStep) k++;
+  playSound(`footstep_${(lastStep = k % FOOTSTEPS)}`, level * (0.85 + Math.random() * 0.15), 0.05);
+}
+
 function tryFire(now) {
   if (!gun || gun.busy || gun.cooldown > 0) return;
   if (gun.ammo === 0) return reload();
@@ -2394,6 +2973,7 @@ function tryFire(now) {
   // long pause doesn't bank a burst)
   gun.cooldown = Math.max(gun.cooldown, -0.05) + FIRE_INTERVAL;
   playGun('Fire');
+  playShot();
   // Muzzle in gun space → view space → world: lights the floor, the demons' sprites, and (mapped back) the gun
   gun.root.updateMatrixWorld(true);
   gun.muzzle.getWorldPosition(_mw).applyMatrix4(gunCam.matrixWorldInverse).applyMatrix4(camera.matrixWorld);
@@ -2408,7 +2988,7 @@ function tryFire(now) {
   shakeKick += KICK_PER_SHOT;
   shakeTrauma = Math.min(shakeTrauma + TRAUMA_PER_SHOT, 1);
   const hit = shotHit();
-  if (hit) { burstBlood(hit); staggerNpc(hit.npc, hit.dir); paintWound(hit.npc, hit.entry); }
+  if (hit) { burstBlood(hit); paintWound(hit.npc, hit.entry); damageNpc(hit.npc, hit.dir); }
   else { // missed them: it hits the arena
     const dir = camera.getWorldDirection(_ray), w = rayWorld(camera.position, dir);
     if (w) spawnHole(_v.copy(camera.position).addScaledVector(dir, w.t), w.normal);
@@ -2420,6 +3000,9 @@ function reload() {
   if (!gun || gun.busy || gun.ammo === MAG) return;
   gun.busy = true;
   playGun(gun.ammo === 0 ? 'Reload_Empty' : 'Reload');
+  // sounds/reload.wav (dragon-studio "gun reload"): 1.5 s, magazine out at 0.56 s and in at 0.81 s, about the length
+  // of the sped-up reload clip, so it plays from the start, unvaried
+  playSound('reload', 0.6, 0);
 }
 
 // Returns 1 if it re-rendered the weapon texture this frame (for stats)
@@ -2484,6 +3067,122 @@ function updateGun(dt, now) {
 }
 
 const ammoEl = document.getElementById('ammo');
+// Getting shot: each demon shot (demonShot) can hit you. The chance falls off with distance (DEMON_ACCURACY at point
+// blank, down to a floor) and is cut a little while you're moving (DEMON_MOVING_AIM); a column or the platform in between blocks it. A hit takes
+// DEMON_DAMAGE off your health (shown bottom left; at 0 it stays at 0: there's no dying yet), kicks the view a
+// little, flicks a few specks of blood onto your view (hudFx) and shows a red arc round the centre of the screen,
+// pointing the way the shot came from.
+const PLAYER_HEALTH = 100, DEMON_DAMAGE = 4, DEMON_ACCURACY = 0.45, DEMON_ACCURACY_MIN = 0.1, DEMON_ACCURACY_FALLOFF = 0.015;
+const DEMON_MOVING_AIM = 0.8; // their hit chance while you move (share of it standing still)
+let playerHealth = PLAYER_HEALTH, playerMoving = false;
+const healthEl = document.getElementById('health');
+const updateHealth = () => (healthEl.textContent = `+ ${Math.max(Math.ceil(playerHealth), 0)}`);
+updateHealth();
+const _shotFrom = new THREE.Vector3(), _shotDir = new THREE.Vector3();
+function demonShot(npc) {
+  const from = npc.muzzle.getWorldPosition(_shotFrom);
+  muzzleFlash(from);
+  // its gun (sounds/demon_shot.wav: freesound "submachine gun", one shot and its tail), quieter the further off
+  demonVoice(npc, 'demon_shot', 0.9);
+  _shotDir.subVectors(camera.position, from);
+  const dist = _shotDir.length();
+  _shotDir.divideScalar(dist);
+  const w = rayWorld(from, _shotDir);
+  if (w && w.t < dist - 0.3) return; // something's in the way
+  let chance = Math.max(DEMON_ACCURACY - dist * DEMON_ACCURACY_FALLOFF, DEMON_ACCURACY_MIN);
+  if (playerMoving) chance *= DEMON_MOVING_AIM;
+  if (Math.random() >= chance) return;
+  playerHealth = Math.max(playerHealth - DEMON_DAMAGE, 0);
+  updateHealth();
+  // a jolt: the view knocked away from the shot (turned from its side, tipped up), springing back; and a shake
+  _hudV.copy(from).applyMatrix4(camera.matrixWorldInverse);
+  const side = Math.atan2(_hudV.x, -_hudV.z);
+  hitKickYaw += HIT_KICK * Math.sin(side); // from the right: the view's knocked left, and so on
+  hitKickPitch += HIT_KICK * 0.6;
+  shakeTrauma = Math.min(shakeTrauma + 0.7, 1);
+  hudHit(from);
+}
+// The view's own effects, drawn over everything (after the gun): blood specks that landed on your view, and arcs
+// pointing at what hit you. One full-screen pass, a few uniforms: HUD_SPECKS splats and HUD_ARCS arcs at most.
+const HUD_SPECKS = 12, HUD_ARCS = 4, SPECK_LIFE = 1.6, ARC_LIFE = 1.1; // s
+const hudFx = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+  uniforms: {
+    uRes: { value: new THREE.Vector2(1, 1) }, uTime: { value: 0 },
+    uSpecks: { value: Array.from({ length: HUD_SPECKS }, () => new THREE.Vector4(0, 0, 0, -1e3)) }, // x, y (0..1), size, birth
+    uArcs: { value: Array.from({ length: HUD_ARCS }, () => new THREE.Vector2(0, -1e3)) },             // angle, birth
+  },
+  vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `
+    uniform vec2 uRes;
+    uniform float uTime;
+    uniform vec4 uSpecks[${HUD_SPECKS}];
+    uniform vec2 uArcs[${HUD_ARCS}];
+    float hash(float n) { return fract(sin(n) * 43758.5453); }
+    void main() {
+      vec2 px = floor(gl_FragCoord.xy / 3.0) * 3.0 + 1.5; // 3 px blocks: the specks are pixel art
+      vec2 q = px / uRes.y; // in screen heights
+      vec4 col = vec4(0.0);
+      // specks: a blob and a couple of droplets, a drip running down slowly, fading out
+      for (int i = 0; i < ${HUD_SPECKS}; i++) {
+        vec4 s = uSpecks[i];
+        float age = uTime - s.w;
+        if (age < 0.0 || age > ${SPECK_LIFE.toFixed(2)}) continue;
+        vec2 c = vec2(s.x * uRes.x / uRes.y, s.y);
+        float r = s.z, d = length(q - c) - r;
+        for (int k = 0; k < 3; k++) {
+          float a = hash(s.w * 7.0 + float(i) * 3.1 + float(k)) * 6.283;
+          d = min(d, length(q - c - vec2(cos(a), sin(a)) * r * 1.8) - r * 0.35);
+        }
+        float run = min(age, 0.8) * r * 2.5; // the drip
+        vec2 dq = q - c; dq.y += r * 0.2;
+        if (dq.y < 0.0 && dq.y > -run && abs(dq.x) < r * 0.3) d = min(d, 0.0);
+        if (d < 0.0) {
+          float a = 0.85 * (1.0 - smoothstep(${(SPECK_LIFE * 0.6).toFixed(2)}, ${SPECK_LIFE.toFixed(2)}, age));
+          col = vec4(mix(vec3(0.45, 0.02, 0.03), vec3(0.25, 0.01, 0.015), smoothstep(0.0, ${SPECK_LIFE.toFixed(2)}, age)), max(col.a, a));
+        }
+      }
+      // arcs: a band round the centre, the way the shot came from (up the screen: ahead), red in its middle and
+      // fading out to its ends and as it ages
+      vec2 o = (gl_FragCoord.xy - uRes * 0.5) / uRes.y;
+      float rad = length(o), ang = atan(o.x, o.y); // 0 straight up the screen, clockwise
+      float band = 1.0 - smoothstep(0.0, 0.035, abs(rad - 0.2));
+      for (int i = 0; i < ${HUD_ARCS}; i++) {
+        float age = uTime - uArcs[i].y;
+        if (age < 0.0 || age > ${ARC_LIFE.toFixed(2)}) continue;
+        float da = abs(atan(sin(ang - uArcs[i].x), cos(ang - uArcs[i].x)));
+        float a = band * (1.0 - smoothstep(0.0, 0.6, da)) * (1.0 - smoothstep(0.0, ${ARC_LIFE.toFixed(2)}, age)) * 0.85;
+        if (a > col.a) col = vec4(0.85, 0.05, 0.04, a);
+      }
+      if (col.a <= 0.0) discard;
+      gl_FragColor = col;
+    }`,
+  transparent: true, depthTest: false, depthWrite: false,
+}));
+hudFx.frustumCulled = false;
+hudFx.renderOrder = 1; // over the gun
+hudScene.add(hudFx);
+let speckNext = 0, arcNext = 0;
+const _hudV = new THREE.Vector3();
+// You, hit: a grunt, one of GRUNTS at random (never the same twice running), at most one per GRUNT_GAP s so a volley
+// doesn't stack them
+const GRUNT_GAP = 0.45;
+let lastGrunt = -Infinity, lastGruntK = -1;
+function hudHit(from) {
+  const u = hudFx.material.uniforms, t = u.uTime.value;
+  if (audio.currentTime - lastGrunt >= GRUNT_GAP) {
+    let k = (Math.random() * (GRUNTS - 1)) | 0;
+    if (k >= lastGruntK) k++;
+    lastGrunt = audio.currentTime;
+    playSound(`hurt_grunt_${(lastGruntK = k % GRUNTS)}`, 0.7, 0.05);
+  }
+  for (let k = 0, n = 2 + ((Math.random() * 3) | 0); k < n; k++) { // a few specks, mostly towards the edges
+    const side = Math.random() < 0.5 ? -1 : 1;
+    u.uSpecks.value[speckNext++ % HUD_SPECKS].set(0.5 + side * (0.2 + Math.random() * 0.28), 0.15 + Math.random() * 0.7, 0.006 + Math.random() * 0.012, t);
+  }
+  _hudV.copy(from).applyMatrix4(camera.matrixWorldInverse); // where it came from, in view space
+  u.uArcs.value[arcNext++ % HUD_ARCS].set(Math.atan2(_hudV.x, -_hudV.z), t);
+}
+
 function updateAmmo() {
   ammoEl.textContent = gun ? `${gun.ammo} / ${MAG}${gun.busy && gun.ammo < MAG ? '  reloading' : ''}` : '';
 }
@@ -2492,7 +3191,40 @@ function updateAmmo() {
 // Demons
 // ---------------------------------------------------------------------------
 let demonGltf;
-const npcs = []; // { imp, walk, fire, target, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer, stagger, knock, shakeDir }
+// Demon footsteps: when each foot comes down in the walk clip, your footsteps pitched down (a bigger body), only from
+// demons within DEMON_STEP_RANGE m and falling off fast, so the nearest few carry. The moments are found once from the
+// clip itself: a stand-in plays it through, and a foot's down where its height drops into the bottom of its swing.
+const DEMON_STEP_RANGE = 20, DEMON_STEP_PITCH = 0.75;
+let demonFootfalls = []; // s into the walk clip
+function findFootfalls(gltf) {
+  const model = cloneSkinned(gltf.scene), mixer = new THREE.AnimationMixer(model);
+  const clip = THREE.AnimationClip.findByName(gltf.animations, 'Walk');
+  mixer.clipAction(clip).play();
+  const feet = ['foot.L', 'foot.R'].map((n) => model.getObjectByName(n) ?? model.getObjectByName(n.replace('.', '')));
+  if (feet.some((f) => !f)) return [];
+  const N = 120, ys = feet.map(() => []), p = new THREE.Vector3(), out = [];
+  for (let i = 0; i < N; i++) {
+    mixer.setTime((clip.duration * i) / N);
+    model.updateMatrixWorld(true);
+    feet.forEach((f, k) => ys[k].push(f.getWorldPosition(p).y));
+  }
+  for (const y of ys) {
+    const lo = Math.min(...y), hi = Math.max(...y), down = lo + (hi - lo) * 0.15;
+    for (let i = 0; i < N; i++) if (y[i] <= down && y[(i + N - 1) % N] > down) out.push((clip.duration * i) / N);
+  }
+  return out;
+}
+function demonSteps(npc, pace) { // after its walk has moved on this frame: did a foot come down?
+  const t = npc.walk.time, was = npc.walkWas ?? t;
+  npc.walkWas = t;
+  if (pace < 0.05 || npc.walk.getEffectiveWeight() < 0.5) return;
+  const crossed = (f) => (t >= was ? was < f && f <= t : f > was || f <= t); // (t wraps round at the loop)
+  for (const f of demonFootfalls) if (crossed(f)) {
+    const d = npc.imp.model.position.distanceTo(camera.position);
+    if (d < DEMON_STEP_RANGE) demonVoice(npc, `footstep_${(Math.random() * FOOTSTEPS) | 0}`, 0.5 / (1 + d * 0.15), DEMON_STEP_PITCH);
+  }
+}
+const npcs = []; // { imp, walk, fire, death, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer, stagger, knock, shakeDir, health, dead }
 const _v = new THREE.Vector3();
 
 function addNpcs(n) {
@@ -2506,15 +3238,21 @@ function addNpcs(n) {
     const imp = new SpriteImpostor(model, new THREE.AnimationMixer(model), opts);
     scene.add(imp);
     const clip = (name) => imp.mixer.clipAction(THREE.AnimationClip.findByName(demonGltf.animations, name));
-    const walk = clip('Walk'), fire = clip('Fire');
+    const walk = clip('Walk'), fire = clip('Fire'), death = clip('Death');
+    death.setLoop(THREE.LoopOnce, 1);
+    death.clampWhenFinished = true; // and stays lying there
     walk.play().time = Math.random() * walk.getClip().duration; // out of step with each other
     const npc = {
-      imp, walk, fire, target: randomTarget(), muzzle: model.getObjectByName('muzzle'), mesh, bloodRT,
+      imp, walk, fire, muzzle: model.getObjectByName('muzzle'), mesh, bloodRT,
       shooter: Math.random() < 0.5, firing: false, timer: nextVolley(),
-      pace: 1, paceTarget: 1, paceTimer: 0, // demo: switches between normal and fast every few seconds
+      pace: DEMON_PACE, paceTarget: DEMON_PACE, paceTimer: 0, // switches between normal and fast every few seconds
+      orbitR: AI_ORBIT[0] + Math.random() * (AI_ORBIT[1] - AI_ORBIT[0]),
+      orbitDir: Math.random() < 0.5 ? -1 : 1,
+      orbitTimer: 0, dodge: 0, dodgeSide: 1, // see thinkDemon
       stagger: 0, knock: new THREE.Vector3(), shakeDir: new THREE.Vector3(), // hit reaction (see staggerNpc)
+      health: DEMON_HEALTH, dead: false, death, // see damageNpc
     };
-    imp.mixer.addEventListener('loop', (e) => { if (e.action === fire) muzzleFlash(npc.muzzle.getWorldPosition(_v)); }); // each shot
+    imp.mixer.addEventListener('loop', (e) => { if (e.action === fire && !npc.dead) demonShot(npc); }); // each shot
     npcs.push(npc);
   }
 }
@@ -2522,26 +3260,23 @@ function removeNpcs(n) {
   for (const { imp, bloodRT, mesh } of npcs.splice(-n)) { imp.dispose(); bloodRT.dispose(); mesh.material.dispose(); }
 }
 const nextVolley = () => 3 + Math.random() * 5; // seconds of walking between volleys
-const randomTarget = () => { // anywhere on the floor, off the centre platform
-  const v = new THREE.Vector3();
-  do v.set((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
-  while (platformDist(v.x, v.z) < PLATFORM_APOTHEM + 1.5);
-  return v;
-};
 
 const loader = new GLTFLoader();
 Promise.all([
   loader.loadAsync('models/demon.glb'), loader.loadAsync('models/demon_walk.glb'), loader.loadAsync('models/m4/scene.gltf'),
-  loader.loadAsync('models/bullet_case/scene.gltf'),
-]).then(([demon, demonWalk, m4, bulletCase]) => {
+  loader.loadAsync('models/bullet_case/scene.gltf'), loader.loadAsync('models/demon_death.glb'),
+]).then(([demon, demonWalk, m4, bulletCase, demonDeath]) => {
   bakeCasings(bulletCase);
   // demon_walk.glb: Mixamo "Orc Walk" retargeted onto the demon rig in Blender; replaces the built-in Walk
   demon.animations = demon.animations.filter((c) => c.name !== 'Walk').concat(demonWalk.animations);
+  // demon_death.glb: Mixamo "Death From Back Headshot" retargeted the same way, grounded by the mesh
+  demon.animations.push(...demonDeath.animations);
   demonGltf = demon;
+  demonFootfalls = findFootfalls(demon);
   setupGun(m4);
-  // ?n=100 spawns 100 demons (default 20), ?real starts in real-3D mode
+  // ?n=100 spawns 100 demons (default 8), ?real starts in real-3D mode
   const params = new URLSearchParams(location.search);
-  addNpcs(params.has('n') ? Number(params.get('n')) : 20);
+  addNpcs(params.has('n') ? Number(params.get('n')) : 8);
   opts.real = params.has('real');
 });
 
@@ -2563,6 +3298,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyN') opts.stepped = !opts.stepped;
   if (e.code === 'KeyL') opts.lockDist = !opts.lockDist;
   if (e.code === 'KeyK') opts.snap = !opts.snap;
+  if (e.code === 'KeyF') dof.enabled = !dof.enabled;
   if (e.code === 'KeyP') {
     rtSizeIdx = (rtSizeIdx + 1) % RT_SIZES.length;
     opts.resolution = RT_SIZES[rtSizeIdx];
@@ -2570,7 +3306,7 @@ addEventListener('keydown', (e) => {
   }
   if (e.code === 'Equal') addNpcs(10);
   if (e.code === 'Minus') removeNpcs(10);
-  hud.textContent = HUD + `  |  bounds ${opts.bounds ? 'ON' : 'off'} · showing ${opts.real ? 'REAL 3D' : 'sprites'} · anim ${opts.stepped ? opts.animFps + 'fps' : 'smooth'} · RT dolly ${opts.lockDist ? 'LOCKED' : 'follows'} · angles ${opts.snap ? opts.snaps + '×' + opts.pitchSnaps + ' snaps' : 'free'} · sprite ${opts.resolution}px${opts.lod ? ' (LOD)' : ''} · shadows ${opts.spriteShadows ? 'SPRITE' : 'blob'}`;
+  hud.textContent = HUD + `  |  bounds ${opts.bounds ? 'ON' : 'off'} · showing ${opts.real ? 'REAL 3D' : 'sprites'} · anim ${opts.stepped ? opts.animFps + 'fps' : 'smooth'} · RT dolly ${opts.lockDist ? 'LOCKED' : 'follows'} · angles ${opts.snap ? opts.snaps + '×' + opts.pitchSnaps + ' snaps' : 'free'} · sprite ${opts.resolution}px${opts.lod ? ' (LOD)' : ''} · shadows ${opts.spriteShadows ? 'SPRITE' : 'blob'} · DoF ${dof.enabled ? 'ON' : 'off'}`;
 });
 addEventListener('keyup', (e) => (keys[e.code] = false));
 addEventListener('resize', () => {
@@ -2608,6 +3344,38 @@ let bobPhase = 0, bobAmp = 0;
 // It's still free to turn towards where it was heading, and to shoot (a volley carries on, and new ones start).
 const STAGGER_TIME = 0.35, KNOCK_SPEED = 0.8, KNOCK_DRAG = 10; // s, m/s per hit, 1/s
 const SHUDDER = 0.03, SHUDDER_RATE = 45; // m, rad/s
+// Health: DEMON_HEALTH hits. Each hit staggers it; the last one kills it: whatever it was doing stops, it plays
+// "Death From Back Headshot" (Mixamo, retargeted onto the demon rig: models/demon_death.glb) once, turned to face you,
+// and stays where it fell, lying there for good, drawn only from the front from then on. A body still bleeds and takes wounds when shot, but nothing else.
+const DEMON_HEALTH = 12;
+// A demon's voice: as it walks, a grunt every DEMON_GRUNT_EVERY s or so (at random within it), quieter the further
+// off; each demon pitched a little differently, so the pack doesn't all sound alike
+const DEMON_GRUNT_EVERY = [3, 8]; // s
+function demonVoice(npc, name, level, pitch = 1) {
+  npc.voice ??= 0.88 + Math.random() * 0.24;
+  const d = npc.imp.model.position.distanceTo(camera.position);
+  if (!sounds[name]) return;
+  const src = audio.createBufferSource(), gain = audio.createGain();
+  src.buffer = sounds[name];
+  src.playbackRate.value = pitch * npc.voice * (0.95 + Math.random() * 0.1);
+  gain.gain.value = level / (1 + d * 0.12);
+  src.connect(gain).connect(shotOut);
+  src.start();
+}
+function damageNpc(npc, dir) {
+  if (npc.dead) return;
+  if (--npc.health > 0) return staggerNpc(npc, dir);
+  npc.dead = true;
+  demonVoice(npc, `demon_death_${(Math.random() * DEMON_DEATHS) | 0}`, 1.0); // its death cry, one of the calls
+  npc.stagger = 0;
+  const m = npc.imp.model; // turns to face you as it dies, and from then on is only drawn from the front
+  m.quaternion.setFromAxisAngle(UP, Math.atan2(camera.position.x - m.position.x, camera.position.z - m.position.z) + DEMON_FACING);
+  npc.imp.frontOnly = true;
+  npc.firing = false;
+  npc.walk.fadeOut(0.15);
+  npc.fire.fadeOut(0.15);
+  npc.death.reset().fadeIn(0.15).play();
+}
 function staggerNpc(npc, dir) {
   npc.stagger = STAGGER_TIME;
   npc.shakeDir.set(dir.x, 0, dir.z).normalize();
@@ -2624,7 +3392,109 @@ function updateStagger(npc, dt) {
   npc.knock.multiplyScalar(Math.exp(-KNOCK_DRAG * dt));
   p.x = THREE.MathUtils.clamp(p.x, -ARENA + 0.5, ARENA - 0.5); p.z = THREE.MathUtils.clamp(p.z, -ARENA + 0.5, ARENA - 0.5);
   pushOutOfPlatform(p, 0.5);
-  steer(m, move.subVectors(npc.target, p).setY(0).normalize(), 0, dt, DEMON_FACING); // free to turn
+  pushOutOfStairs(p, 0.5);
+  pushOutOfColumns(p);
+  steer(m, move.subVectors(camera.position, p).setY(0).normalize(), 0, dt, DEMON_FACING); // free to turn: towards you
+}
+// Demons hunt you rather than wander. Each has its own distance from you (orbitR, somewhere in AI_ORBIT): further
+// out, it closes in on you (mostly straight at you, angling round a little); once there, it circles you one way or the
+// other (orbitDir, switching now and then); and if you close on it, inside its distance, it circles round you while
+// opening the gap back up, never backing straight off. When your aim
+// comes near it (its body within AI_AIM_MARGIN of your line of fire, in range), it breaks sideways off the line of
+// fire, fast, for a moment, the way it's already leaning, and a volley it's firing is abandoned. Columns, the centre
+// platform and the walls push it away as it nears them, plus a sideways nudge so it slides round them rather than
+// stalling against them; hard collision with them after. They keep apart from each other too: another demon within
+// AI_SPACING pushes it away (harder the closer), and two never overlap (AI_BODY). Shooters turn to face you to fire.
+const AI_ORBIT = [6, 12], AI_AIM_MARGIN = 1.3, AI_AIM_RANGE = 40; // m, m, m
+const AI_SPACING = 3, AI_BODY = 1.2; // m: how far apart demons like to keep; closest they ever get (centre to centre)
+const AI_DODGE_TIME = 0.5, AI_DODGE_SPEED = 1.6, AI_AVOID = 2; // s; pace multiplier while dodging; m an obstacle is felt from
+const _ai = new THREE.Vector3(), _aim = new THREE.Vector3(), _toMe = new THREE.Vector3(), _obs = new THREE.Vector3();
+const COLUMN_BODY = COLUMN_APOTHEM / Math.cos(Math.PI / 8) + 0.5; // a column's corner, plus a demon's body
+const TOWER_BODY = TOWER_HALF * Math.SQRT2 + 0.5; // a tower's corner post, plus a demon's body
+// Is your aim on this demon? (its body within AI_AIM_MARGIN of your line of fire); if so, which side of it it's on
+function aimedAt(p, centreY) {
+  camera.getWorldDirection(_aim);
+  _toMe.set(p.x, centreY, p.z).sub(camera.position);
+  const along = _toMe.dot(_aim);
+  if (along <= 0 || along > AI_AIM_RANGE) return 0;
+  _toMe.addScaledVector(_aim, -along); // off the line of fire, sideways
+  if (_toMe.length() > AI_AIM_MARGIN) return 0;
+  return Math.sign(_aim.z * _toMe.x - _aim.x * _toMe.z) || 1; // which side of the line it's on
+}
+// The direction a living demon wants to go, into out (unit, XZ); returns its pace multiplier for this frame
+function thinkDemon(npc, dt, out) {
+  const p = npc.imp.model.position;
+  if ((npc.orbitTimer -= dt) <= 0) { npc.orbitDir = Math.random() < 0.3 ? -npc.orbitDir : npc.orbitDir; npc.orbitTimer = 3 + Math.random() * 5; }
+  _ai.subVectors(camera.position, p).setY(0);
+  const dist = Math.max(_ai.length(), 1e-3);
+  _ai.divideScalar(dist); // towards you
+  const tx = -_ai.z * npc.orbitDir, tz = _ai.x * npc.orbitDir; // round you
+  const side = aimedAt(p, p.y + npc.imp.fit.y);
+  if (side && npc.dodge <= 0) {
+    npc.dodge = AI_DODGE_TIME; npc.dodgeSide = side;
+    if (npc.firing) { // aimed at: abandon the volley and move
+      npc.firing = false; npc.timer = nextVolley();
+      npc.fire.fadeOut(0.1); npc.walk.reset().fadeIn(0.1).play();
+    }
+  }
+  let pace = 1;
+  if (npc.dodge > 0) { // break sideways off your line of fire (perpendicular to it, the side it's on), a little forward
+    npc.dodge -= dt;
+    camera.getWorldDirection(_aim).setY(0).normalize();
+    out.set(-_aim.z * npc.dodgeSide * -1, 0, _aim.x * npc.dodgeSide * -1).addScaledVector(_ai, 0.2);
+    npc.orbitDir = Math.sign(out.x * tx + out.z * tz) || npc.orbitDir; // carry on round you that way after
+    pace = AI_DODGE_SPEED;
+  } else if (dist > npc.orbitR + 1) { // further out: close in on you, angling round a little
+    out.set(tx, 0, tz).multiplyScalar(0.35).add(_ai);
+  } else { // there or inside it: circle round you, opening the gap back up the closer it is
+    out.set(tx, 0, tz).addScaledVector(_ai, -THREE.MathUtils.clamp((npc.orbitR - dist) / 2, 0, 1) * 0.8);
+  }
+  out.normalize();
+  // obstacles: pushed away as it nears them, and nudged round them the way it's going
+  const avoid = (nx, nz, gap) => { // (nx, nz): unit, away from the obstacle; gap: m to its surface
+    if (gap >= AI_AVOID) return;
+    const k = (1 - gap / AI_AVOID) * 2.5, round = out.x * -nz + out.z * nx >= 0 ? 1 : -1;
+    out.x += (nx + -nz * round) * k; out.z += (nz + nx * round) * k;
+  };
+  for (const [c, r] of [...COLUMNS.map((c) => [c, COLUMN_BODY]), ...TOWERS.map((c) => [c, TOWER_BODY])]) {
+    _obs.set(p.x - c.x, 0, p.z - c.y);
+    const d = Math.max(_obs.length(), 1e-3);
+    avoid(_obs.x / d, _obs.z / d, d - r);
+  }
+  const pd = platformDist(p.x, p.z);
+  avoid(_pf.x, _pf.y, pd - PLATFORM_APOTHEM - 0.5);
+  for (const k of STAIR_SIDES) { // each flight: away from its nearest point
+    const b = STAIR_BOXES.find((s) => s.n === PLATFORM_FACES[k] && s.e0 === 0), [e, a] = stairLocal(b, p.x, p.z);
+    const de = e - THREE.MathUtils.clamp(e, 0, 3 * STAIR_RUN), da = a - THREE.MathUtils.clamp(a, -STAIR_HALF, STAIR_HALF);
+    const d = Math.hypot(de, da);
+    if (d > 1e-3) avoid((b.n.x * de + b.t.x * da) / d, (b.n.y * de + b.t.y * da) / d, d - 0.5);
+  }
+  for (const o of npcs) { // each other: pushed apart, harder the closer (the dead are left to lie)
+    if (o === npc || o.dead) continue;
+    const q = o.imp.model.position, dx = p.x - q.x, dz = p.z - q.z, d = Math.hypot(dx, dz);
+    if (d >= AI_SPACING || d < 1e-4) continue;
+    const k = (1 - d / AI_SPACING) * 2;
+    out.x += dx / d * k; out.z += dz / d * k;
+  }
+  for (const [nx, nz, gap] of [[-1, 0, ARENA - p.x], [1, 0, ARENA + p.x], [0, -1, ARENA - p.z], [0, 1, ARENA + p.z]]) avoid(nx, nz, gap - 0.6);
+  out.normalize();
+  return pace;
+}
+function pushApart(npc) { // two living demons never overlap: each moves half the overlap
+  const p = npc.imp.model.position;
+  for (const o of npcs) {
+    if (o === npc || o.dead) continue;
+    const q = o.imp.model.position, dx = p.x - q.x, dz = p.z - q.z, d = Math.hypot(dx, dz);
+    if (d >= AI_BODY || d < 1e-4) continue;
+    const k = (AI_BODY - d) / d / 2;
+    p.x += dx * k; p.z += dz * k; q.x -= dx * k; q.z -= dz * k;
+  }
+}
+function pushOutOfColumns(p) { // and the towers
+  for (const [c, r] of [...COLUMNS.map((c) => [c, COLUMN_BODY]), ...TOWERS.map((c) => [c, TOWER_BODY])]) {
+    const dx = p.x - c.x, dz = p.z - c.y, d = Math.hypot(dx, dz);
+    if (d < r && d > 1e-6) { p.x = c.x + dx / d * r; p.z = c.y + dz / d * r; }
+  }
 }
 function steer(model, dir, speed, dt, facing) { // dir: normalized XZ direction
   model.quaternion.slerp(q.setFromAxisAngle(UP, Math.atan2(dir.x, dir.z) + facing), 1 - Math.exp(-12 * dt));
@@ -2644,6 +3514,7 @@ renderer.setAnimationLoop(() => {
     .addScaledVector(fwd, (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0))
     .addScaledVector(right, (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0));
   const moving = move.lengthSq() > 0, sprinting = keys.ShiftLeft || keys.ShiftRight;
+  playerMoving = moving;
   if (moving) camera.position.addScaledVector(move.normalize(), (sprinting ? SPRINT : MOVE) * dt);
   // Jump: Space launches you at the speed that peaks at JUMP_HEIGHT; held, you hop again on landing
   // the centre platform: once your feet are (nearly) up to its top you stand on it, else it's a wall
@@ -2652,20 +3523,31 @@ renderer.setAnimationLoop(() => {
     if (jumpY >= PLATFORM_H - PLATFORM_STEP) floorY = PLATFORM_H;
     else pushOutOfPlatform(camera.position, 0.4);
   }
+  for (const b of STAIR_BOXES) if (inStairBox(b, camera.position.x, camera.position.z, 0.4)) { // the stairs: a step at a time
+    if (jumpY >= b.h - PLATFORM_STEP) floorY = Math.max(floorY, b.h);
+    else pushOutOfStairBox(camera.position, b, 0.4);
+  }
   const grounded = jumpY <= floorY;
   if (grounded && keys.Space) jumpV = Math.sqrt(2 * GRAVITY * JUMP_HEIGHT);
   jumpV -= GRAVITY * dt;
   jumpY = Math.max(jumpY + jumpV * dt, floorY);
+  const landing = jumpY === floorY && jumpV < -4; // came down from more than ~0.4 m
   if (jumpY === floorY && jumpV < 0) jumpV = 0;
+  // Footsteps: one every STEP_LENGTH m walked on the ground (so quicker when sprinting), a heavier one on landing
+  if (landing) { playStep(0.55); stepDist = 0; }
+  else if (moving && grounded) {
+    if ((stepDist += (sprinting ? SPRINT : MOVE) * dt) >= STEP_LENGTH) { stepDist -= STEP_LENGTH; playStep(sprinting ? 0.42 : 0.32); }
+  } else stepDist = STEP_LENGTH * 0.7; // standing (or in the air): setting off, the first step comes soon
   camera.position.y = EYE_HEIGHT + jumpY;
   const reach = ARENA - 0.5; // the wall is solid: stop half a metre short of it
   camera.position.x = THREE.MathUtils.clamp(camera.position.x, -reach, reach);
   camera.position.z = THREE.MathUtils.clamp(camera.position.z, -reach, reach);
-  for (const c of COLUMNS) { // columns are solid too: push out to their reach (a circle round the octagon)
+  for (const [c, reach] of [...COLUMNS.map((c) => [c, COLUMN_REACH]), ...TOWERS.map((c) => [c, TOWER_REACH])]) {
+    // columns and towers are solid too: push out to their reach (a circle round each)
     const dx = camera.position.x - c.x, dz = camera.position.z - c.y, d = Math.hypot(dx, dz);
-    if (d < COLUMN_REACH) {
-      const k = d > 1e-6 ? COLUMN_REACH / d : 0;
-      camera.position.x = c.x + (d > 1e-6 ? dx * k : COLUMN_REACH);
+    if (d < reach) {
+      const k = d > 1e-6 ? reach / d : 0;
+      camera.position.x = c.x + (d > 1e-6 ? dx * k : reach);
       camera.position.z = c.y + dz * k;
     }
   }
@@ -2680,11 +3562,17 @@ renderer.setAnimationLoop(() => {
   if (trigger) tryFire(now);
 
   for (const npc of npcs) {
+    if (npc.dead) continue; // lies where it fell
     if (npc.stagger > 0) updateStagger(npc, dt); // knocked back, but still free to turn and shoot
     // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on
     npc.timer -= dt;
     if (npc.firing) {
-      if (npc.timer > 0) continue; // stand still while firing
+      if (npc.timer > 0) { // stand still while firing, turned to you (unless you aim at it: thinkDemon breaks it off)
+        steer(npc.imp.model, move.subVectors(camera.position, npc.imp.model.position).setY(0).normalize(), 0, dt, DEMON_FACING);
+        if (!aimedAt(npc.imp.model.position, npc.imp.model.position.y + npc.imp.fit.y)) continue;
+        thinkDemon(npc, 0, move); // aimed at: it drops the volley and dodges (from next frame on)
+        continue;
+      }
       npc.firing = false;
       npc.timer = nextVolley();
       npc.fire.fadeOut(0.2);
@@ -2694,20 +3582,30 @@ renderer.setAnimationLoop(() => {
       npc.timer = (2 + Math.floor(Math.random() * 3)) * npc.fire.getClip().duration; // Fire loops, so N shots
       npc.walk.fadeOut(0.2);
       npc.fire.reset().fadeIn(0.2).play();
-      muzzleFlash(npc.muzzle.getWorldPosition(_v)); // first shot; later ones come from the loop event
+      demonShot(npc); // first shot; later ones come from the loop event
       continue;
     }
     if (npc.stagger > 0) continue; // no walking while staggered
     if ((npc.paceTimer -= dt) <= 0) {
-      npc.paceTarget = Math.random() < 0.5 ? 1 : DEMON_FAST;
+      npc.paceTarget = Math.random() < 0.5 ? DEMON_PACE : DEMON_FAST;
       npc.paceTimer = 2 + Math.random() * 4;
     }
     npc.pace += (npc.paceTarget - npc.pace) * (1 - Math.exp(-3 * dt)); // ease between paces
-    npc.walk.timeScale = npc.pace;
     const p = npc.imp.model.position;
-    if (p.distanceToSquared(npc.target) < 1) npc.target = randomTarget();
-    steer(npc.imp.model, move.subVectors(npc.target, p).setY(0).normalize(), DEMON_WALK * npc.pace, dt, DEMON_FACING);
-    pushOutOfPlatform(p, 0.5); // they walk round it
+    const pace = npc.pace * thinkDemon(npc, dt, move);
+    npc.walk.timeScale = pace;
+    demonSteps(npc, pace);
+    npc.nextGrunt ??= now + Math.random() * DEMON_GRUNT_EVERY[1]; // (spread out from the start)
+    if (now >= npc.nextGrunt) { // walking: now and then, a grunt
+      demonVoice(npc, `demon_grunt_${(Math.random() * DEMON_GRUNTS) | 0}`, 0.8);
+      npc.nextGrunt = now + DEMON_GRUNT_EVERY[0] + Math.random() * (DEMON_GRUNT_EVERY[1] - DEMON_GRUNT_EVERY[0]);
+    }
+    steer(npc.imp.model, move, DEMON_WALK * pace, dt, DEMON_FACING);
+    pushOutOfPlatform(p, 0.5); // hard collision: round the platform, its stairs and the columns, inside the walls
+    pushOutOfStairs(p, 0.5);
+    pushOutOfColumns(p);
+    pushApart(npc);
+    p.x = THREE.MathUtils.clamp(p.x, -ARENA + 0.5, ARENA - 0.5); p.z = THREE.MathUtils.clamp(p.z, -ARENA + 0.5, ARENA - 0.5);
   }
 
   sun.position.copy(camera.position).add(sunOffset); // shadows follow you
@@ -2727,6 +3625,8 @@ renderer.setAnimationLoop(() => {
   const shaken = shakeCamera(dt, now);
   drawBloodField();
   composer.render(dt);
+  hudFx.material.uniforms.uTime.value = now;
+  renderer.getDrawingBufferSize(hudFx.material.uniforms.uRes.value);
   renderer.autoClear = false; // weapon goes flat on top of the world (no bloom on it)
   renderer.render(hudScene, hudCam);
   renderer.autoClear = true;
