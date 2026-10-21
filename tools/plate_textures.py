@@ -12,6 +12,10 @@
   vent_patch  vent with a repair plate welded over part of the lattice (weld bead, heat-tint ring)
   slits_strapped  slits with two raised reinforcing straps across the slots
   cover_hatch  cover plate with a recessed lifting slot in the middle (an access panel)
+  treadplate  anti-slip pine-green rubber sheet: raised lozenges in a staggered grid, alternating ±45° (diamond plate)
+  slits_cut  slits' see-through mask (the stair treads)
+  glass_slits, glass_panels  a framed glass window onto the void under the floor: pipes over the slits / cover plate, on and on
+  weld_end, weld_corner, weld_tee, weld_cross  plain_welded's other pieces: the bead from the centre to the W / W+N / W+E+N / every edge
   walllight  plate with a deep recessed fixture: a glowing semi-cylindrical tube with metal end caps in a dark
          housing, under a clear cover embossed with ridges along the slot (built for parallax mapping)
 Tiles are self-contained (holes never cross the edge, a recessed seam runs round it) so any two can
@@ -73,10 +77,7 @@ DRIP_W, DRIP_H = 1024, 256              # px: the walls' drip grime, 32 m along 
 DRIP_SEAMS = (64, 128, 192)             # px down from the top: the tile rows' seams, ledges where water collects
 GRIME_DRIP = 0.95                       # how much the drip streaks contribute
 FLASH_N, FLASH_VARIANTS = 64, 4         # px per muzzle-flash frame; shots cycle through this many shapes
-FLASH_PALETTE = ((0.85, (255, 255, 235)), (0.65, (255, 236, 140)), (0.45, (255, 186, 60)),  # heat → colour, hottest
-                 (0.27, (240, 110, 24)), (0.12, (170, 40, 12)))                          # first; below: transparent
-FLASH_COVER = (1, 1, 0.75, 0.5, 0.25)    # share of each palette band's pixels kept (ordered dither): see-through wisps
-BAYER4 = ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))
+FLASH_LEVELS = 8                        # the flash's heat is stepped to this many levels (pixel art), not coloured here
 
 
 # Hole centres sit on whole pixels at whole-pixel spacing, so every hole rasterises identically. Rows are 10 px
@@ -131,6 +132,35 @@ def plain_welded(x, y):
     return math.inf, 0
 
 
+# The weld seam's other pieces, so the game can join seams up across the floor (it lays them out as a maze): the
+# bead runs from the plate's centre to the middle of each named edge (W/E: left/right, N/S: top/bottom of the image).
+# plain_welded is the straight one (W–E).
+WELD_EDGES = {'W': (0, N / 2), 'E': (N, N / 2), 'N': (N / 2, 0), 'S': (N / 2, N)}
+
+
+def welded(name, edges):
+    def shape(x, y):
+        px, py, c = x + 0.5, y + 0.5, N / 2
+        dy, along = math.inf, 0.0
+        for e in edges:  # nearest point on the bead's centre line (segments from the centre out)
+            ex, ey = WELD_EDGES[e]
+            t = max(0.0, min(1.0, ((px - c) * (ex - c) + (py - c) * (ey - c)) / ((ex - c) ** 2 + (ey - c) ** 2)))
+            d = math.hypot(px - c - t * (ex - c), py - c - t * (ey - c))
+            if d < dy: dy, along = d, (x if ey == c else y)
+        if dy < 1.6:
+            ripple = 0.85 + 0.15 * math.cos(2 * math.pi * along / 3)
+            return (128, 126, 122), 1 + 0.25 * math.sqrt(1 - (dy / 1.6) ** 2) * ripple, 1.0, 0.6, 1.0, 1.0
+        for edge, colour in HEAT_TINT:
+            if dy < edge: return colour, 1.0, 1.0, None, 1.0, 1.0
+        return math.inf, 0
+    shape.__name__ = name
+    return shape
+
+
+weld_end, weld_corner, weld_tee, weld_cross = (welded(n, e) for n, e in
+                                               (('weld_end', 'W'), ('weld_corner', 'WN'), ('weld_tee', 'WEN'), ('weld_cross', 'WENS')))
+
+
 LIGHT = (150, 210, 255)  # LED colour
 
 
@@ -165,6 +195,28 @@ def cover(x, y):
     return STEEL_SRGB, top, 1.0, None, 1.0, 1.0
 
 
+TREAD_SRGB = (1, 121, 111)  # pine green
+TREAD_STEP, TREAD_LEN, TREAD_R, TREAD_H = 64 / 6, 3.8, 1.6, 0.6  # px: lug spacing (an even count per tile); half-length; half-width; lift
+
+
+def treadplate(x, y):
+    """Diamond (tread) plate: raised lozenges, one per TREAD_STEP cell, alternate cells turned the other way (±45°),
+    so they cross-hatch the plate for grip. Pine-green rubber, moulded: not metal, a glossy sheen, the worn lug tops
+    a touch shinier than the sheet between them. No seam groove: it's cut from one big sheet, so tiles
+    run into each other unbroken."""
+    i, j = math.floor((x + 0.5) / TREAD_STEP), math.floor((y + 0.5) / TREAD_STEP)
+    cx, cy = (i + 0.5) * TREAD_STEP, (j + 0.5) * TREAD_STEP
+    s = 1 if (i + j) % 2 else -1  # which way this cell's lug leans
+    ux, uy = math.sqrt(0.5), s * math.sqrt(0.5)
+    px, py = x + 0.5 - cx, y + 0.5 - cy
+    t = max(-TREAD_LEN, min(TREAD_LEN, px * ux + py * uy))  # nearest point on the lug's spine
+    d = math.hypot(px - t * ux, py - t * uy)
+    if d < TREAD_R:  # the lug: a rounded ridge, highest along its spine
+        return TREAD_SRGB, 1 + TREAD_H * math.sqrt(1 - (d / TREAD_R) ** 2), 1.0, 0.28, 0.0, 1.0
+    if d < TREAD_R + 0.8: return TREAD_SRGB, 1.0, 0.8, 0.42, 0.0, 1.0  # the sheet right at its foot: shaded a little
+    return TREAD_SRGB, 1.0, 1.0, 0.36, 0.0, 1.0  # the sheet
+
+
 srgb = lambda l: round(255 * (12.92 * l if l <= 0.0031308 else 1.055 * l ** (1 / 2.4) - 0.055))
 STEEL_SRGB = tuple(srgb(c) for c in STEEL)
 
@@ -196,6 +248,120 @@ def walllight(x, y):
 
 
 walllight.parallax = True
+
+
+# Glass floor panels: a steel frame round a window of glass, looking down into the void under the floor: no pit, no
+# walls. It runs on under the neighbouring panels every way, the floor down there one of the arena's own plates
+# (slits, or cover: the real tile, at its own size, repeating), painted service pipes (yellow) running
+# through it side by side, on and on. Lamps under the neighbouring panels light it (a line under each edge of the
+# tile, out of sight), so it's brightest towards the window's edges, dimmer in the middle, and dark further off.
+# No real light reaches inside the parallax: the things down there are dark (unlit) but for their emissive, which
+# is baked here as if fully lit (the lamps' colour through the faintly green glass, shadows and all); the game
+# scales it by the lamps' falloff at where the ray actually lands (the textures repeat, so baked light would too). Drawn with parallax mapping, the glass a
+# clearcoat: the depth map holds two spans per texel (see layers in glass) over a floor at GLASS_DEPTH, and the
+# textures repeat, so a ray can go under the frame and past the tile's edge and find more of the same.
+GLASS_FRAME, GLASS_DEPTH = 5, 12.0          # px: the frame's width; the floor of the void below the plate (~37 cm)
+GLASS_PLATE = 1.0                           # px: the frame plate's thickness (the void runs on under it)
+GLASS_RIPPLE = 0.12                         # the glass's ripples: their slope (it's thick, rolled glass)
+GLASS_SCRATCHES = 16                        # scratch marks on each panel's glass
+GLASS_TINT = (215, 240, 228)                # the glass: a faint green, as thick glass is
+INCANDESCENT = (255, 185, 115)              # a warm bulb (LEDs: LIGHT)
+PIPE_RED, PIPE_YELLOW, PIPE_GREEN = (190, 38, 28), (228, 178, 30), (40, 150, 62)  # painted service pipes
+PIPE_R, PIPE_LIFT = 2.5, 1.5                # px: a pipe's radius (~16 cm across); its gap over the floor (on brackets)
+# Pipes through the void, side by side: (runs along 'x' or 'y', at px across, colour), the whole tile through (so
+# on and on). Round all the way round: a ray can pass under one. The same run under every glass panel (the game
+# lays them unturned), so the pipes line up from one window to the next.
+PIPES = (('x', 20, PIPE_YELLOW), ('x', 30, PIPE_YELLOW), ('x', 40, PIPE_YELLOW))  # all yellow
+
+
+def glass_window(x, y):  # px inside the window's edge (< 0: the frame)
+    return min(x, N - 1 - x, y, N - 1 - y) - GLASS_FRAME + 0.5
+
+
+def glass(name, source, light, pipes):
+    """source: the floor down there (a tile's shape function); pipes: what runs through (PIPES)."""
+    tint = tuple(l * g / 255 for l, g in zip(light, GLASS_TINT))  # the light, as seen through the glass
+
+    def plate(x, y):  # the source tile's finished texel, its seam groove too
+        t = source(x, y)
+        return seam(x, y, t if len(t) > 2 else texel(*t))
+
+    def pipe_at(x, y):  # → (paint, top px, bottom px) or None
+        for axis, at, paint in pipes:
+            d = (y if axis == 'x' else x) + 0.5 - at                                   # px from its centre line
+            if abs(d) < PIPE_R:
+                c, centre = math.sqrt(1 - (d / PIPE_R) ** 2), GLASS_DEPTH - PIPE_R - PIPE_LIFT
+                return paint, centre - PIPE_R * c, centre + PIPE_R * c
+
+    def pipe_glow(x, y, paint):  # fully lit, unshaded: the game shades it by where the ray hit its round
+        return tuple(round(p / 255 * k) for p, k in zip(paint, tint))
+
+    def floor_glow(x, y):  # the plate down there, shadowed under and beside the pipes
+        t, ao = plate(x, y), plate(x, y)[2]
+        for axis, at, _ in pipes:
+            d = abs((y if axis == 'x' else x) + 0.5 - at)
+            if d < PIPE_R + 1.5: ao *= 0.35 if d < PIPE_R else 0.55
+        return tuple(round(c / 255 * k * ao) for c, k in zip(t[0], tint)), t[0], ao  # fully lit (the game: the lamps)
+
+    def shape(x, y):  # the main maps: what a ray straight down meets first
+        if glass_window(x, y) < 0: return math.inf, 0                               # the frame: plain plate
+        h, p = (lambda depth: 1 - depth / BUMP), pipe_at(x, y)
+        if p: return tuple(round(c * 0.12) for c in p[0]), h(p[1]), 1.0, 0.35, 0.0, 1.0, pipe_glow(x, y, p[0])
+        glow, col, ao = floor_glow(x, y)
+        return tuple(round(c * 0.12) for c in col), h(GLASS_DEPTH), ao, 0.6, 0.0, 1.0, glow
+
+    # The depth map, two spans of solid per texel (px down; inf: none) over the floor at GLASS_DEPTH: under the
+    # window, a pipe (if one's there); under the frame, the frame's plate, then a pipe. under: the glow of that
+    # second span (a pipe under the frame); floor: the floor's glow, everywhere.
+    def layers(x, y):
+        p = pipe_at(x, y)
+        span = (p[1], p[2]) if p else (math.inf, math.inf)
+        return (0.0, GLASS_PLATE) + span if glass_window(x, y) < 0 else span + (math.inf, math.inf)
+
+    def under(x, y):
+        p = pipe_at(x, y)
+        return pipe_glow(x, y, p[0]) if p and glass_window(x, y) < 0 else (0, 0, 0)
+    shape.layers, shape.under, shape.floor = layers, under, lambda x, y: floor_glow(x, y)[0]
+    shape.parallax_range = GLASS_DEPTH + 2
+    shape.__name__, shape.parallax = name, True
+    def clearcoat(x, y):  # thick glass (it takes bullets and boots), rolled: ripples along the pipes, so it warps both
+        # the reflections and (the game refracts through it) the view down, in bands parallel to them
+        if glass_window(x, y) < 0: return 0, (128, 128, 255)
+        ny = GLASS_RIPPLE * (math.sin(2 * math.pi * y / 9) + 0.45 * math.sin(2 * math.pi * y / 4.3 + 1))
+        l = math.sqrt(ny * ny + 1)
+        return 255, (128, b(ny / l * 0.5 + 0.5), b(1 / l * 0.5 + 0.5))
+    shape.clearcoat = clearcoat
+
+    noise = []
+
+    def smudge(x, y):  # grime trodden on: soft patches (value_noise is defined further down: built on first use)
+        if not noise: noise.append(value_noise(random.Random(f'{name} smudges'), 16, N))
+        return noise[0](x, y)
+
+    def dirt(x, y):  # a little along the glass's rim (lightly: no dark border to give the void an edge), specks, smudges
+        f = glass_window(x, y)
+        if f < 0: return 0
+        speck = random.Random(f'{name} {x} {y}').random()
+        g = max(1 - f / 2.2, 0) * (0.15 + 0.2 * speck) + (0.4 if speck > 0.96 else 0)
+        g += 0.45 * min(max((smudge(x, y) - 0.55) / 0.25, 0), 1)
+        return min(int(min(g, 1) * 3 + ((0, 2), (3, 1))[y % 2][x % 2] / 4), 3) / 3
+    shape.cover_dirt = dirt
+
+    # Scratches: boots and dragged kit, fine 1 px lines, fading out at their ends (the game shows them pale, catching
+    # the room's light, and takes the gloss off the glass along them)
+    rng, marks = random.Random(f'{name} scratches'), {}
+    for _ in range(GLASS_SCRATCHES):
+        x0, y0, a = rng.uniform(GLASS_FRAME, N - GLASS_FRAME), rng.uniform(GLASS_FRAME, N - GLASS_FRAME), rng.uniform(0, math.pi)
+        length, k = rng.uniform(5, 18), rng.uniform(0.4, 1.0)
+        for i in range(int(length * 2) + 1):
+            t = i / (length * 2)
+            x, y = int(x0 + math.cos(a) * length * t), int(y0 + math.sin(a) * length * t)
+            if glass_window(x, y) >= 0: marks[x, y] = max(marks.get((x, y), 0), k * (0.5 + 0.5 * math.sin(math.pi * t)))
+    shape.scratch = lambda x, y: marks.get((x, y), 0)
+    return shape
+
+
+glass_slits, glass_panels = glass('glass_slits', slits, LIGHT, PIPES), glass('glass_panels', cover, INCANDESCENT, PIPES)
 
 
 def slitlight(x, y):
@@ -322,12 +488,12 @@ dither4 = lambda g, x, y: min(int(min(g, 1) * 3 + BAYER[y % 2][x % 2] / 4), 3) /
 
 def grime_mask(name, T):
     """0..1 baked grime per texel: dirt packed within a pixel of anything occluded (the AO channel marks the
-    cavities). Only on steel: holes and the lens stay clean."""
+    cavities). Only on steel (and the tread plate's rubber): holes and the lens stay clean."""
     M = [[0.0] * N for _ in range(N)]
     for y in range(N):
         for x in range(N):
             t = T[y][x]
-            if t[4] < 1 or t[5] < 1: continue
+            if (t[4] < 1 and name != 'treadplate') or t[5] < 1: continue
             edge = max(1 - T[(y + j) % N][(x + i) % N][2] for i in (-1, 0, 1) for j in (-1, 0, 1))
             M[y][x] = dither4(GRIME_EDGE * edge, x, y)
     return M
@@ -347,10 +513,10 @@ def patch_grime():
 def muzzle_flash(rng, stage):
     """One muzzle-flash frame, FLASH_N px, seen end-on from behind the gun: a white-hot core and flame prongs bursting
     out of the flash hider (an M4's birdcage vents up and to the sides, so the prongs favour the top half), their
-    edges ragged with noise. stage 0 is the bang (big, white-yellow); stage 1 the next instant (the core gone dim,
-    prongs shorter, broken and redder, a few sparks). Heat is posterised to FLASH_PALETTE: pixel art, hard edges, the
-    cooler bands dithered thinner (FLASH_COVER) so the scene shows through the flame's outer wisps,
-    no blending. Returns RGBA rows (transparent black outside)."""
+    edges ragged with noise. stage 0 is the bang (big, hot); stage 1 the next instant (the core gone dim, prongs
+    shorter, broken and cooler, a few sparks). It's only heat, 0…1 stepped to FLASH_LEVELS (grey; black: nothing):
+    the game turns heat into light, brighter than white at the core, and adds it to whatever's behind, as a flame
+    does, so it's see-through wherever it's dim. Returns grey rows."""
     c = FLASH_N / 2
     k = rng.randint(4, 6)
     prongs = []
@@ -376,12 +542,8 @@ def muzzle_flash(rng, stage):
                     h = max(h, (1 - t) ** 0.8 * (1 - da / (w * (1 - 0.7 * t) * 2.2)) * 1.1)
             h -= cool * (0.6 + 0.8 * noise(x * 2 + 7, y * 2 + 3) - 0.4) if stage else 0
             if stage and h < 0.12 and rng.random() < 0.012 and r < c * 0.9: h = 0.5  # sparks
-            px = (0, 0, 0, 0)
-            for (lo, col), cover in zip(FLASH_PALETTE, FLASH_COVER):
-                if h > lo:
-                    if (BAYER4[y % 4][x % 4] + 0.5) / 16 < cover: px = (*col, 255)  # the cooler bands thin out
-                    break
-            row.append(px)
+            v = round(min(max(h, 0), 1) * FLASH_LEVELS) / FLASH_LEVELS
+            row.append((round(v * 255),) * 3)
         rows.append(row)
     return rows
 
@@ -526,13 +688,14 @@ png(out / 'muzzle_flash.png', [sum((f[y] for f in row), []) for row in frames fo
 D = drip_grime()
 png(out / 'grime_drip.png', [[(b(v),) * 3 for v in row] for row in D])
 print(f'  drip grime: streaks cover {sum(map(sum, D)) / DRIP_W / DRIP_H:.0%} of the walls on average')
-for shape in (vent, vent_patch, slits, slits_strapped, plain, plain_bolted, plain_welded, light, slitlight, sidelight, sidelight_left, cover, cover_hatch, walllight):
+for shape in (vent, vent_patch, slits, slits_strapped, plain, plain_bolted, plain_welded, light, slitlight, sidelight, sidelight_left, cover, cover_hatch, walllight, treadplate, weld_end, weld_corner, weld_tee, weld_cross, glass_slits, glass_panels):
     name = shape.__name__
     _, var_x, var_y = downsample(*brushed(name))  # scratch heights stay out of the normal map (see top)
     alpha = lambda var: [[math.sqrt(BASE_ALPHA ** 2 + 2 * v) for v in row] for row in var]  # LEAN/Toksvig
     alpha_x, alpha_y = alpha(var_x), alpha(var_y)
     # A shape gives (distance to a hole, its radius), or a finished texel for features that aren't holes
-    T = [[seam(x, y, s if len(s) > 2 else texel(*s)) for x in range(N) for s in [shape(x, y)]] for y in range(N)]
+    edge = (lambda x, y, t: t) if shape is treadplate else seam  # tread plate is one sheet: no tile seams
+    T = [[edge(x, y, s if len(s) > 2 else texel(*s)) for x in range(N) for s in [shape(x, y)]] for y in range(N)]
     brush = [[T[y][x][3] is None for x in range(N)] for y in range(N)]
     H = [[BUMP * T[y][x][1] for x in range(N)] for y in range(N)]  # height in pixel units: the pressed features
     h = lambda x, y: H[y % N][x % N]  # wraps, so the normal map tiles seamlessly
@@ -566,18 +729,33 @@ for shape in (vent, vent_patch, slits, slits_strapped, plain, plain_bolted, plai
     png(out / f'{name}_n.png', [[normal(x, y) for x in range(N)] for y in range(N)])
     png(out / f'{name}_orm.png', [[orm(x, y) for x in range(N)] for y in range(N)])
     png(out / f'{name}_a.png', [[aniso(x, y) for x in range(N)] for y in range(N)])
+    if shape is slits:  # the stair treads' grating: the slots cut right through (white = metal, black = open)
+        png(out / 'slits_cut.png', [[(255 if T[y][x][1] >= 0.5 else 0,) * 3 for x in range(N)] for y in range(N)])
     if any(len(t) > 6 for row in T for t in row):
         png(out / f'{name}_e.png', [[t[6] if len(t) > 6 else (0, 0, 0) for t in row] for row in T])
     if getattr(shape, 'parallax', False):
-        depth = lambda v: (b(min(max((BUMP - v) / PARALLAX_RANGE, 0), 1)),) * 3  # plate (BUMP px) = 0
-        png(out / f'{name}_depth.png', [[depth(v) for v in row] for row in H])
-        png(out / f'{name}_ccn.png', [[clearcoat_wl(x, y)[1] for x in range(N)] for y in range(N)])
-        png(out / f'{name}_ccm.png', [[(round(clearcoat_wl(x, y)[0] * (1 - 0.8 * cover_dirt(x, y))), b(cover_dirt(x, y)),
-                                        clearcoat_wl(x, y)[0]) for x in range(N)] for y in range(N)])
+        rng_ = getattr(shape, 'parallax_range', PARALLAX_RANGE)
+        cc, dirt = getattr(shape, 'clearcoat', clearcoat_wl), getattr(shape, 'cover_dirt', cover_dirt)
+        depth = lambda v: (b(min(max((BUMP - v) / rng_, 0), 1)),) * 3  # plate (BUMP px) = 0
+        if hasattr(shape, 'layers'):  # two spans of solid: RG the first's top and bottom, BA the second's; then a floor
+            png(out / f'{name}_depth.png', [[tuple(b(min(v / rng_, 1)) for v in shape.layers(x, y)) for x in range(N)] for y in range(N)])
+            png(out / f'{name}_under.png', [[shape.under(x, y) for x in range(N)] for y in range(N)])
+            png(out / f'{name}_floor.png', [[shape.floor(x, y) for x in range(N)] for y in range(N)])
+        else:
+            png(out / f'{name}_depth.png', [[depth(v) for v in row] for row in H])
+        png(out / f'{name}_ccn.png', [[cc(x, y)[1] for x in range(N)] for y in range(N)])
+        sc = getattr(shape, 'scratch', lambda x, y: 0)  # A: 255 − scratch (an RGB map reads as A = 1: no scratches)
+        png(out / f'{name}_ccm.png', [[(round(cc(x, y)[0] * (1 - 0.8 * dirt(x, y)) * (1 - 0.5 * sc(x, y))), b(dirt(x, y)),
+                                        cc(x, y)[0]) + ((b(1 - sc(x, y)),) if hasattr(shape, 'scratch') else ())
+                                       for x in range(N)] for y in range(N)])
 
     # Still clearly brushed: at least 2× smoother along the brush than across
     pairs = sorted((alpha_y[y][x], alpha_x[y][x]) for y in range(N) for x in range(N) if brush[y][x])
+    if not pairs:  # nothing brushed (treadplate): rolled, not brushed
+        print(f'  {name}: height {lo:.2f}..{hi:.2f} px, unbrushed, edge grime {sum(map(sum, G)) / N / N:.0%} average')
+        continue
     ay_med, ax_med = pairs[len(pairs) // 2][0], sorted(p[1] for p in pairs)[len(pairs) // 2]
     print(f'  {name}: height {lo:.2f}..{hi:.2f} px, alpha across {ay_med:.3f} / along {ax_med:.3f} = {ay_med / ax_med:.1f}×,'
           f' edge grime {sum(map(sum, G)) / N / N:.0%} average')
-    assert ay_med / ax_med >= 2, 'brush lines must be at least 2× smoother along than across'
+    # (a parallax tile's brushed part is only its frame: too few texels for a fair median)
+    assert ay_med / ax_med >= 2 or getattr(shape, 'parallax', False), 'brush lines must be at least 2× smoother along than across'
