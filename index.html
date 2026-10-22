@@ -373,9 +373,25 @@ const RT_SIZES = [128, 256, 512, 64]; // sprite resolutions cycled with P (first
 let rtSizeIdx = 0;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-// 1 canvas pixel per CSS pixel, even on Retina: a quarter of the shading work, and with 64 px textures, low-res
-// sprites and a 240 px weapon, there's no detail to lose. The browser scales the canvas up, crisp (see CSS).
+// 1 canvas pixel per CSS pixel, even on Retina; the browser scales the canvas up, crisp (see CSS). That's for the
+// overlays (the lens blood, the hit arcs, the vignette, the weapon): the world itself is drawn at worldScale of it
+// (see composer).
 renderer.setPixelRatio(1);
+// The world (the scene, depth of field, bloom) at worldScale of the canvas's pixels per axis (½: a quarter of them),
+// scaled up crisp: every one of those passes' work shrinks with it, and with 64 px textures and low-res sprites
+// there's little detail to lose.
+// Frame rate: capped at FPS_CAP (on a faster display, its extra frames are skipped: twice the work for a game that
+// poses its demons at 12 fps).
+// Dynamic resolution: worldScale steps through WORLD_SCALES (whole fractions, so the crisp upscale's blocks are all one
+// size) to hold that. Measured by the time between frames (the GPU's own timers proved unreliable on Apple's driver):
+// over each SCALE_WINDOW s, a median past SLOW × the frame time is a step down; after upWait s on time, a step up
+// to try, kept if PROBE s stay on time, else back down and twice as long before the next try (to UP_WAIT_MAX).
+// The first SCALE_SETTLE s (loading, shaders compiling) don't count. ?scale= fixes it, to compare.
+const FPS_CAP = 60, FRAME_MS = 1000 / FPS_CAP;
+const WORLD_SCALES = [1 / 2, 1 / 3, 1 / 4];
+const SCALE_WINDOW = 0.5, SLOW = 1.3, UP_WAIT = 5, UP_WAIT_MAX = 60, PROBE = 2, SCALE_SETTLE = 3; // s; ×; s; s; s; s
+const fixedScale = Number(new URLSearchParams(location.search).get('scale')) || 0;
+let worldStep = 0, worldScale = fixedScale || WORLD_SCALES[0];
 renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -1453,18 +1469,18 @@ if (BAKE_FIXTURES) {
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 200);
 camera.position.set(0, EYE_HEIGHT, 8); // in front of the centre platform, which you face
 
-// Post: the world renders into an HDR buffer, anything brighter than BLOOM_THRESHOLD (emissive strips, hot
-// metal glints) bleeds a glow, then OutputPass applies the renderer's ACES tone mapping and sRGB.
+// Post: the world renders into an HDR buffer, everything bleeds a glow in proportion to its brightness (so only the
+// emissive strips and hot metal glints show one), then OutputPass applies the renderer's ACES tone mapping and sRGB.
 // No MSAA on the HDR buffer: an off-screen half-float MSAA resolve cost about as much as the whole scene, and
-// hard edges suit the pixel art. Bloom runs at the canvas's resolution: with the render capped at 1× density
-// that's already a quarter of the Retina pixels (an extra half-res bloom on top looked too blocky).
-// Threshold 2.5: with ambient off nothing but the lens centres (and the odd light glint) gets that bright.
-// With the room environment on, polished metal reflected it at up to ~40× and needed 10.
-const BLOOM_STRENGTH = 0.6, BLOOM_RADIUS = 0.4, BLOOM_THRESHOLD = 2.5;
+// hard edges suit the pixel art. Bloom runs at the world's resolution (see worldScale).
+// No threshold (it was 2.5): a threshold blooms a pixel fully or not at all, so a thin lamp seen at an angle (its
+// pixels' coverage rising and falling along it) bloomed only at its brightest pixels: a row of separate blobs. With
+// none, the glow follows the light smoothly; the strength is low to keep the dim room from hazing (0.25 hazed it).
+const BLOOM_STRENGTH = 0.15, BLOOM_RADIUS = 0.4, BLOOM_THRESHOLD = 0;
 const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, {
   type: THREE.HalfFloatType,
 }));
-composer.setSize(innerWidth, innerHeight);
+sizeWorld();
 const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), BLOOM_STRENGTH, BLOOM_RADIUS, BLOOM_THRESHOLD);
 composer.addPass(new RenderPass(scene, camera));
 
@@ -1478,7 +1494,44 @@ const DOF_SHARP = 12, DOF_SOFT = 30, DOF_MAX = 0.004, DOF_TAPS = 24; // m; m; of
 // stack. The same pass, its blur raised everywhere to HURT_BLUR (of the screen height) × the hurt, eased.
 const HURT_BLUR = 0.02, HURT_PER_HIT = 0.7, HURT_RECOVER = 1.0; // of the screen height; per hit (of 1); s
 let hurt = 0, dofOn = true; // dofOn: the distance blur (F); the pass runs while either is wanted
-for (const rt of [composer.renderTarget1, composer.renderTarget2]) rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height);
+// The world's targets sized to the window at worldScale (on a resize or a scale step), each with a depth texture
+// (depth of field reads it) at its size. three r170's setSize doesn't resize a depth texture: the old one would stay
+// at the old size (an incomplete framebuffer: nothing drawn), so a new one. setSize let go of the target when its size
+// changed, so the new one gets attached when it's next set up.
+function sizeWorld() {
+  composer.setPixelRatio(worldScale);
+  composer.setSize(innerWidth, innerHeight);
+  for (const rt of [composer.renderTarget1, composer.renderTarget2]) {
+    if (rt.depthTexture?.image.width === rt.width && rt.depthTexture.image.height === rt.height) continue;
+    rt.depthTexture?.dispose();
+    rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height);
+  }
+}
+const frameGaps = []; // ms between frames, this window
+let windowStart = 0, onTimeFor = 0, upWait = UP_WAIT, probeUntil = 0;
+function scaleWorld(time, gap) { // each frame (time: its rAF time, ms; gap: since the last, ms)
+  if (fixedScale || time < SCALE_SETTLE * 1000) return;
+  if (gap < 1000) frameGaps.push(gap); // (longer: the tab was hidden; a one-off hitch the median shrugs off)
+  if (time - windowStart < SCALE_WINDOW * 1000) return;
+  windowStart = time;
+  if (!frameGaps.length) return;
+  frameGaps.sort((a, b) => a - b);
+  const slow = frameGaps[frameGaps.length >> 1] > SLOW * FRAME_MS;
+  frameGaps.length = 0;
+  if (slow) {
+    if (probeUntil) upWait = Math.min(upWait * 2, UP_WAIT_MAX); // the step up didn't hold
+    onTimeFor = probeUntil = 0;
+    if (worldStep < WORLD_SCALES.length - 1) setWorldStep(worldStep + 1);
+  } else {
+    if (probeUntil && time >= probeUntil) { upWait = UP_WAIT; probeUntil = 0; } // it held
+    if ((onTimeFor += SCALE_WINDOW) >= upWait && worldStep > 0) {
+      setWorldStep(worldStep - 1);
+      probeUntil = time + PROBE * 1000;
+      onTimeFor = 0;
+    }
+  }
+}
+function setWorldStep(k) { worldStep = k; worldScale = WORLD_SCALES[k]; sizeWorld(); }
 class DofPass extends ShaderPass {
   render(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
     this.uniforms.tDepth.value = readBuffer.depthTexture;
@@ -1505,7 +1558,8 @@ const dof = new DofPass({
     void main() {
       vec4 base = texture2D(tDiffuse, vUv);
       float c0 = coc(viewDepth(vUv));
-      if (c0 < 0.5) { gl_FragColor = base; return; } // in focus
+      // alpha: how sharp it is (1: in focus, 0: blurred), for the upscale to the screen (crisp, or smooth: see OutputPass)
+      if (c0 < 0.5) { gl_FragColor = vec4(base.rgb, 1.0); return; } // in focus
       vec3 sum = base.rgb;
       float wsum = 1.0;
       for (int i = 0; i < ${DOF_TAPS}; i++) {
@@ -1515,22 +1569,39 @@ const dof = new DofPass({
         sum += texture2D(tDiffuse, uv).rgb * w;
         wsum += w;
       }
-      gl_FragColor = vec4(sum / wsum, base.a);
+      gl_FragColor = vec4(sum / wsum, 1.0 - smoothstep(0.5, 1.5, c0));
     }`,
 });
 composer.addPass(dof);
 
 composer.addPass(bloom);
+// the glow isn't blended into the world's pixels (the blocky upscale would cut its soft falloff into steps): the output
+// pass adds it at the screen's, smooth, from bloom's own (composited) target
+bloom.blendMaterial.visible = false;
 // the finished HDR scene (bloomed, before tone mapping), kept for the blood on the lens to see through (see hudFx)
 let sceneTex = null;
 composer.addPass(new (class extends OutputPass {
+  // The world's pixels scaled up to the canvas: crisp where it's sharp (each read from its texel's middle: blocks), smooth
+  // where depth of field blurred it (its alpha: see DofPass), so a blur's falloff isn't cut into steps; and the bloom's
+  // glow added, smooth, at the canvas's pixels
+  constructor() {
+    super();
+    this.uniforms.uSrcRes = { value: new THREE.Vector2() };
+    this.uniforms.tBloom = { value: bloom.renderTargetsHorizontal[0].texture };
+    this.material.fragmentShader = this.material.fragmentShader
+      .replace('uniform sampler2D tDiffuse;', 'uniform sampler2D tDiffuse, tBloom;\nuniform vec2 uSrcRes;')
+      .replace('gl_FragColor = texture2D( tDiffuse, vUv );', `
+        vec4 crisp = texture2D( tDiffuse, (floor(vUv * uSrcRes) + 0.5) / uSrcRes ), soft = texture2D( tDiffuse, vUv );
+        gl_FragColor = vec4(mix(soft.rgb, crisp.rgb, crisp.a) + texture2D( tBloom, vUv ).rgb, 1.0);`);
+  }
   render(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
     sceneTex = readBuffer.texture;
+    this.uniforms.uSrcRes.value.set(readBuffer.width, readBuffer.height);
     super.render(renderer, writeBuffer, readBuffer, deltaTime, maskActive);
   }
 })());
 const look = new PointerLockControls(camera, renderer.domElement);
-renderer.domElement.addEventListener('click', () => { if (!look.isLocked) look.lock(); audio.resume(); }); // (browsers start audio on a click)
+renderer.domElement.addEventListener('click', () => { if (!look.isLocked) look.lock(); audio.resume(); music.play().catch(() => {}); }); // (browsers start audio on a click)
 // Playing: just the crosshair, health, ammo and credits; paused (Esc, or not started): the menu, with the controls,
 // toggles and stats over the dimmed game
 look.addEventListener('lock', () => document.body.classList.add('playing'));
@@ -1676,6 +1747,8 @@ function setupGun(g) {
     if (e.action !== actions.Fire) gun.busy = false;
     updateAmmo();
   });
+  gun.blood = addGunBlood(root);
+  gun.splashes = []; // demon blood to paint on it (see splashGun)
   playGun('Draw');
   sizeGun();
   updateAmmo();
@@ -2443,7 +2516,7 @@ const FL_ELEVATION = [0.5, 1.2]; // rad, how steeply each gob is thrown up (from
 const FL_MAX_MOVE = 0.1 * FL_SPACING; // m, most a particle's moved per solver pass
 const FL_VISCOSITY = 0.3, FL_COHESION = 0.4, FL_EPS = 50 * (0.065 / FL_H) ** 2; // XSPH share per step; most density deficit pulled
 // in; relaxation (the constraint gradients grow as 1/reach², so it does too: tuned at a 0.065 m reach)
-const FL_GOBS = 6, FL_GOB_R = 0.025, FL_GOB_LEN = 0.15, FL_SPREAD = 0.35, FL_DECAL_EVERY = 16; // per hit, m, m, back slower by, 1 in
+const FL_GOBS = 4, FL_GOB_R = 0.025, FL_GOB_LEN = 0.15, FL_SPREAD = 0.35, FL_DECAL_EVERY = 16; // per hit, m, m, back slower by, 1 in
 // Stains: where a gob's splat lands, one big stain about its size: the stain's body is a quarter of its size (its
 // fingers reach ~0.6), so STAIN_SHARE of the drawn splat's half-size makes the body as wide as the splat's solid
 // centre (SHEET_CORE) and the fingers reach its arms; every FL_DECAL_EVERY'th stray particle leaves a small satellite
@@ -3144,7 +3217,9 @@ function updateBlood(dt) {
   decalMat.uniforms.fogDensity.value = scene.fog.density;
   gooMat.uniforms.uFogColor.value.copy(scene.fog.color);
   gooMat.uniforms.uFogDensity.value = scene.fog.density;
-  flAccum = Math.min(flAccum + dt, 2 * FL_STEP); // fixed steps; a long frame drops time rather than piling up steps
+  // fixed steps, at most one a frame: a slow frame drops time (the blood slows a little) rather than doubling up, which
+  // on a slow CPU made the next frame slower still
+  flAccum = Math.min(flAccum + dt, FL_STEP);
   for (; flAccum >= FL_STEP; flAccum -= FL_STEP) flStep(FL_STEP);
   bloodTick += dt;
   if (opts.stepped && bloodTick < 1 / BLOOD_FPS && !bloodFresh) return; // hold what's shown
@@ -3194,7 +3269,7 @@ function bloodLight(x, y, z, out, at, dirOut) {
 const _clear = new THREE.Color();
 function drawBloodField() {
   if (!gooQuad.visible) return;
-  const W = renderer.domElement.width, H = renderer.domElement.height;
+  const W = composer.renderTarget1.width, H = composer.renderTarget1.height; // (the world's pixels: it's drawn in there)
   fieldRT.setSize(Math.ceil(W / GOO_PIXEL), Math.ceil(H / GOO_PIXEL));
   lightRT.setSize(fieldRT.width, fieldRT.height);
   splatMat.uniforms.uMinPerZ.value = GOO_MIN_SPLAT * 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / fieldRT.height;
@@ -3546,10 +3621,12 @@ function updateMuzzleFx(dt, now) {
 // Where a shot from the centre of the view hits a demon: a ray against a sphere round each demon's body (its
 // sprite's bounding radius, at its centre height); the nearest wins, unless a column (in plan, a circle round its
 // corners) is in the way. A demon's sphere only nominates it: the hit is where the shot touches its actual animated
-// body (probeDepth). Returns the entry and exit wounds, the shot's direction and the demon hit, or null.
-const _ray = new THREE.Vector3(), _toC = new THREE.Vector3();
-function shotHit() {
-  const o = camera.position, dir = camera.getWorldDirection(_ray);
+// body (probeShot); a hit bursts blood, wounds and damages it, a miss leaves a hole in the arena.
+const _toC = new THREE.Vector3();
+// The shot, fired now: the demons it passes near are probed (probeShot); the hit (or the miss) lands when that's read
+// back, a frame or two later
+function fireShot() {
+  const o = camera.position.clone(), dir = camera.getWorldDirection(new THREE.Vector3());
   const near = []; // demons whose sphere the shot passes through, nearest first
   for (const npc of npcs) {
     const { imp } = npc;
@@ -3559,23 +3636,34 @@ function shotHit() {
     if (t > 0 && d2 < (imp.r * imp.r)) near.push({ npc, t, out: t + Math.sqrt(Math.max(R * R - d2, 0)) });
   }
   near.sort((p, q) => p.t - q.t);
-  let best = Infinity, hit = null;
-  for (const c of near) { // the first whose actual body the shot touches (between the legs isn't a hit)
-    const t = probeDepth(c.npc, o, dir);
-    if (t < best) { best = t; hit = c; break; }
-  }
-  if (!hit) return null;
-  if (rayPlatform(o, dir) < best) return null; // the platform's in the way
-  if ((rayTowers(o, dir)?.t ?? Infinity) < best) return null; // a tower's bar
+  near.length = Math.min(near.length, PROBE_MAX);
+  if (!near.length) return shotMissed(o, dir);
+  probeShot(near, o, dir).then((buf) => {
+    // the first whose actual body the shot touches (between the legs isn't a hit)
+    const k = near.findIndex((_, k) => buf[k * 4 + 3] > 0.5);
+    if (k < 0) return shotMissed(o, dir);
+    const best = buf[k * 4], c = near[k];
+    if (rayPlatform(o, dir) < best || (rayTowers(o, dir)?.t ?? Infinity) < best || rayColumns(o, dir) < best) return shotMissed(o, dir);
+    const hit = { entry: o.clone().addScaledVector(dir, best), exit: o.clone().addScaledVector(dir, Math.max(c.out, best + 0.1)), dir, npc: c.npc };
+    burstBlood(hit); splashLens(hit.entry); paintWound(hit.npc, hit.entry); damageNpc(hit.npc, hit.dir);
+  }, () => {});
+}
+function shotMissed(o, dir) { // it hits the arena
+  const w = rayWorld(o, dir);
+  if (w) spawnHole(_v.copy(o).addScaledVector(dir, w.t), w.normal);
+}
+// How far along the shot it first meets a column (their octagons, as circles round them), or Infinity
+function rayColumns(o, dir) {
   const Rc = COLUMN_APOTHEM / Math.cos(Math.PI / 8), a = dir.x * dir.x + dir.z * dir.z;
+  let best = Infinity;
   for (const c of COLUMNS) {
     const ox = o.x - c.x, oz = o.z - c.y, b = 2 * (dir.x * ox + dir.z * oz), disc = b * b - 4 * a * (ox * ox + oz * oz - Rc * Rc);
     if (disc > 0 && a > 1e-9) {
       const t0 = (-b - Math.sqrt(disc)) / (2 * a);
-      if (t0 > 0 && t0 < best) return null;
+      if (t0 > 0) best = Math.min(best, t0);
     }
   }
-  return { entry: o.clone().addScaledVector(dir, best), exit: o.clone().addScaledVector(dir, Math.max(hit.out, best + 0.1)), dir: dir.clone(), npc: hit.npc };
+  return best;
 }
 
 // Wounds: the shot's exact hit on a demon's animated body, and blood painted onto it. A ray against the 50k-triangle
@@ -3610,9 +3698,9 @@ const probeMat = new THREE.ShaderMaterial({
   fragmentShader: `varying vec3 vWorld;\nvoid main() { gl_FragColor = vec4(distance(vWorld, cameraPosition), 0.0, 0.0, 1.0); }`,
   side: THREE.DoubleSide,
 });
-const probeRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter });
+const PROBE_MAX = 8; // the most demons one shot probes (the nearest along it)
+const probeRT = new THREE.WebGLRenderTarget(PROBE_MAX, 1, { type: THREE.FloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter });
 const probeCam = new THREE.OrthographicCamera(-0.005, 0.005, 0.005, -0.005, 0.01, 200);
-const _probe = new Float32Array(4);
 // Renders a demon with its mesh's material swapped (its pose current) into target, cleared to transparent black
 // first or drawn over what's there; the renderer's state is put back after
 function renderDemon(npc, mat, target, cam, clear) {
@@ -3631,14 +3719,20 @@ function renderDemon(npc, mat, target, cam, clear) {
   renderer.autoClear = autoClear;
   renderer.setClearColor(_clearColor, alpha);
 }
-// How far along the shot (origin o, direction dir) it first touches this demon's body, or Infinity
-function probeDepth(npc, o, dir) {
+// How far along the shot (origin o, direction dir) it first touches each of these demons' bodies: each drawn into its
+// own texel of probeRT (alpha 1: touched; the first clears it all), read back without waiting for the GPU (a blocking
+// read stalled every shot until the GPU had finished all its queued work: painful on a slow one). Resolves to the texels.
+function probeShot(near, o, dir) {
   probeCam.position.copy(o);
   probeCam.lookAt(_v.copy(o).add(dir));
   probeCam.updateMatrixWorld();
-  renderDemon(npc, probeMat, probeRT, probeCam, true);
-  renderer.readRenderTargetPixels(probeRT, 0, 0, 1, 1, _probe);
-  return _probe[3] > 0.5 ? _probe[0] : Infinity;
+  near.forEach((c, k) => {
+    probeRT.viewport.set(k, 0, 1, 1);
+    renderDemon(c.npc, probeMat, probeRT, probeCam, k === 0);
+  });
+  probeRT.viewport.set(0, 0, PROBE_MAX, 1);
+  const buf = new Float32Array(PROBE_MAX * 4);
+  return renderer.readRenderTargetPixelsAsync(probeRT, 0, 0, PROBE_MAX, 1, buf).then(() => buf);
 }
 const woundMat = new THREE.ShaderMaterial({
   defines: { PAINT: '' },
@@ -3709,6 +3803,9 @@ function bloodOnBeforeCompile(shader) {
 // 1.5 s of tail). At full auto the copies overlap into the burst; each a touch different in pitch and level, so it
 // doesn't machine-gun one identical sample. Web Audio: decoded once, started on the click that locks the pointer.
 const audio = new AudioContext();
+// Music: sounds/dream_cheater.mp3 ("Dream Cheater"), looped at half volume; streamed by an <audio> element (8 minutes:
+// decoded whole into Web Audio it'd be ~170 MB), started with the rest of the sound on the first click
+const music = Object.assign(new Audio('sounds/dream_cheater.mp3'), { loop: true, volume: 0.5 });
 const shotOut = audio.createGain();
 shotOut.gain.value = 0.6;
 shotOut.connect(audio.destination);
@@ -3779,12 +3876,7 @@ function tryFire(now) {
   gun.flashFrame = -1; // a new shot: re-render now
   shakeKick += KICK_PER_SHOT;
   shakeTrauma = Math.min(shakeTrauma + TRAUMA_PER_SHOT, 1);
-  const hit = shotHit();
-  if (hit) { burstBlood(hit); splashLens(hit.entry); paintWound(hit.npc, hit.entry); damageNpc(hit.npc, hit.dir); }
-  else { // missed them: it hits the arena
-    const dir = camera.getWorldDirection(_ray), w = rayWorld(camera.position, dir);
-    if (w) spawnHole(_v.copy(camera.position).addScaledVector(dir, w.t), w.normal);
-  }
+  fireShot();
   updateAmmo();
 }
 
@@ -3810,6 +3902,7 @@ function updateGun(dt, now) {
   // the flash's frame: 0 the bang, 1 the next instant, -1 none; a change means a re-render
   const flashFrame = now < gun.flashUntil ? (now < gun.flashUntil - (GUN_FLASH_TIME - GUN_BANG_TIME) ? 0 : 1) : -1;
   if (flashFrame !== gun.flashFrame) { gun.flashFrame = flashFrame; gun.dirty = true; }
+  dryGunBlood(dt);
   if (!posed && lights === gun.lastLights && !gun.dirty) return 0;
   gun.lastLights = lights;
   gun.dirty = false;
@@ -3852,6 +3945,7 @@ function updateGun(dt, now) {
     flashSheet.offset.set((v + (m ? 1 : 0)) / FLASH_VARIANTS, gun.flashFrame === 0 ? 0.5 : 0);
   }
 
+  if (gun.splashes.length) paintGunBlood();
   renderer.setRenderTarget(gunRT);
   renderer.render(gunScene, gunCam);
   renderer.setRenderTarget(null);
@@ -3970,17 +4064,18 @@ const lensRT = [0, 1].map(() => new THREE.WebGLRenderTarget(1, 1, {
 const lensDrops = new THREE.ShaderMaterial({
   uniforms: { // shared with hudFx: hudHit writes the specks there
     uSpecks: hudFx.material.uniforms.uSpecks, uTime: hudFx.material.uniforms.uTime, uFlash: hudFx.material.uniforms.uFlash,
-    uScene: hudFx.material.uniforms.uScene,
+    uScene: hudFx.material.uniforms.uScene, uRes: hudFx.material.uniforms.uRes,
   },
   vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
   fragmentShader: `
     uniform float uTime, uFlash; // uFlash: your muzzle flash, now (0..1)
     uniform vec4 uSpecks[${HUD_SPECKS}];
     uniform sampler2D uScene; // the world behind, HDR (see sceneTex)
+    uniform vec2 uRes; // the canvas's pixels
     vec2 hash2(vec2 p) { return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
     float lum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
     void main() {
-      vec2 size = vec2(textureSize(uScene, 0)) / ${SPECK_PIXEL.toFixed(1)}; // this image's (about)
+      vec2 size = uRes / ${SPECK_PIXEL.toFixed(1)}; // this image's (about)
       vec2 uv = gl_FragCoord.xy / size, q = gl_FragCoord.xy / size.y; // 0..1; screen heights
       float texel = 1.0 / size.y;
       vec3 L = normalize(vec3(-0.25, 0.75, 0.6)), H = normalize(L + vec3(0.0, 0.0, 1.0)); // the ceiling lights: above
@@ -4106,6 +4201,155 @@ function splashLens(at) {
   if (_lensP.z > 1 || Math.abs(_lensP.x) > 1.2 || Math.abs(_lensP.y) > 1.2) return; // behind you, or out of view
   flickSpecks(Math.round(near * 3 + Math.random()), hudFx.material.uniforms.uTime.value + d / LENS_SPLASH_SPEED,
     0.5 + 0.35 * THREE.MathUtils.clamp(_lensP.x * 3, -1, 1));
+  if (d < GUN_SPLASH_RANGE) splashGun(at, 1 - d / GUN_SPLASH_RANGE);
+}
+
+// Demon blood on your gun and arms (only theirs: your own blood only ever reaches the lens). Each of the weapon's
+// materials (the hand, the glove, the rifle's parts, which share one texture, the bullets) gets a mask over its texture
+// (R: blood, G: the wet part of it, as the floor's), painted when a demon bursts within GUN_SPLASH_RANGE m and in view:
+// drops and splats flung onto the faces you can see (those facing up and back at you: blood from the front would land
+// on the side you never see), more on the burst's side of the screen, more the nearer it is. Wet it's glossy scarlet;
+// it dries dark and matte over GUN_BLOOD_DRY_TAU s and wears off over GUN_BLOOD_FADE s.
+const GUN_SPLASH_RANGE = 3, GUN_BLOOD_RES = 512; // m; px per material's mask
+const GUN_BLOOD_DROP = 0.006, GUN_BLOOD_SPLAT = 0.025; // m: the drops' and the splats' spacing (their grid's cells)
+const GUN_BLOOD_DRY_TAU = 20, GUN_BLOOD_FADE = 150, GUN_BLOOD_STEP = 0.5; // s; s; s between drying steps
+const gunPaint = new THREE.ShaderMaterial({
+  uniforms: { uView: { value: new THREE.Matrix4() }, uFrom: { value: new THREE.Vector3() }, uSide: { value: 0 },
+    uAmount: { value: 0 }, uSeed: { value: 0 } },
+  vertexShader: `
+    #include <common>
+    #include <skinning_pars_vertex>
+    uniform mat4 uView;
+    varying vec3 vView, vN;
+    void main() {
+      #include <skinbase_vertex>
+      #include <begin_vertex>
+      #include <beginnormal_vertex>
+      #include <skinnormal_vertex>
+      #include <skinning_vertex>
+      vView = (uView * modelMatrix * vec4(transformed, 1.0)).xyz; // in the eye's space
+      vN = mat3(uView) * mat3(modelMatrix) * objectNormal;
+      gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0); // where it is in the texture
+    }`,
+  fragmentShader: `
+    uniform vec3 uFrom; // the way the blood comes from (unit, eye space)
+    uniform float uSide, uAmount, uSeed; // the burst's side of the screen (−1…1); how much (0…1)
+    varying vec3 vView, vN;
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7)) + uSeed) * 43758.5453); }
+    // round drops on a grid of cells (cell m apart, as seen from where the blood comes from), one in a cell at
+    // chance 'odds', each its own size and spot
+    float drops(vec2 q, float cell, float odds) {
+      vec2 c = floor(q / cell);
+      float v = 0.0;
+      for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+        vec2 k = c + vec2(x, y);
+        if (hash(k) > odds) continue;
+        vec2 at = (k + 0.5 + (vec2(hash(k + 7.1), hash(k + 3.7)) - 0.5) * 0.8) * cell;
+        float r = cell * mix(0.15, 0.5, hash(k + 1.3) * hash(k + 1.3));
+        v = max(v, 1.0 - smoothstep(r * 0.7, r, length(q - at)));
+      }
+      return v;
+    }
+    void main() {
+      float face = dot(normalize(vN), uFrom);
+      if (face < 0.1) discard; // turned away from it
+      // as seen from where it comes from: a plane across its way
+      vec3 a = normalize(cross(uFrom, abs(uFrom.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0))), b = cross(uFrom, a);
+      vec2 q = vec2(dot(vView, a), dot(vView, b));
+      // more on the burst's side of the screen; patchy, not an even coat
+      float side = mix(0.35, 1.0, smoothstep(-0.4, 0.4, uSide * vView.x / max(-vView.z, 0.05)));
+      float patchy = smoothstep(0.3, 0.8, hash(floor(q / 0.05)));
+      float odds = uAmount * side * (0.3 + 0.7 * patchy);
+      float v = max(0.7 * drops(q, ${GUN_BLOOD_DROP.toFixed(3)}, odds * 0.45), drops(q + 0.37, ${GUN_BLOOD_SPLAT.toFixed(3)}, odds * 0.2));
+      if (v <= 0.0) discard;
+      gl_FragColor = vec4(v, v, 0.0, 1.0); // fresh: all wet
+    }`,
+  side: THREE.DoubleSide, depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendEquation: THREE.MaxEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+// drying: the wet part (G) shrinks fast, the blood itself (R) slowly
+const gunDryMat = new THREE.ShaderMaterial({
+  uniforms: { uKeep: { value: new THREE.Vector2(1, 1) } },
+  blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.ZeroFactor, blendDst: THREE.SrcColorFactor,
+  depthTest: false, depthWrite: false, vertexShader: fullQuadVS,
+  fragmentShader: `uniform vec2 uKeep; void main() { gl_FragColor = vec4(uKeep, 1.0, 1.0); }`,
+});
+const gunDryScene = fullQuad(gunDryMat);
+// The weapon's materials, each given a blood mask (cleared) and the shading for it: [{ rt, meshes }]
+function addGunBlood(root) {
+  const byMat = new Map();
+  root.traverse((o) => {
+    if (!o.isMesh || !o.material.map) return; // (the mask is read over the colour texture's layout)
+    if (!byMat.has(o.material)) byMat.set(o.material, { rt: bloodTarget(GUN_BLOOD_RES, GUN_BLOOD_RES), meshes: [] });
+    byMat.get(o.material).meshes.push(o);
+  });
+  const target = renderer.getRenderTarget(), alpha = renderer.getClearAlpha();
+  renderer.getClearColor(_clearColor);
+  renderer.setClearColor(0x000000, 0);
+  for (const [mat, { rt }] of byMat) {
+    renderer.setRenderTarget(rt);
+    renderer.clear();
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uGunBlood = { value: rt.texture };
+      shader.fragmentShader = 'uniform sampler2D uGunBlood;\n' + shader.fragmentShader.replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
+  vec2 gb = texture2D(uGunBlood, vMapUv).rg; // demon blood (see splashGun)
+  float gbOn = min(gb.r * 1.6, 1.0), gbWet = gb.r > 0.001 ? clamp(gb.g / gb.r, 0.0, 1.0) : 0.0;
+  // wet: scarlet where thin, deep red where thick, glossy; dried: dark brown-red, matte; not metal either way
+  vec3 gbCol = mix(vec3(0.09, 0.012, 0.008), mix(vec3(0.45, 0.015, 0.025), vec3(0.2, 0.004, 0.01), gb.r), gbWet);
+  diffuseColor.rgb = mix(diffuseColor.rgb, gbCol, gbOn);
+  roughnessFactor = mix(roughnessFactor, mix(0.75, 0.12, gbWet), gbOn);
+  metalnessFactor = mix(metalnessFactor, 0.0, gbOn);`);
+    };
+    mat.needsUpdate = true;
+  }
+  renderer.setRenderTarget(target);
+  renderer.setClearColor(_clearColor, alpha);
+  return [...byMat.values()];
+}
+const _gunTo = new THREE.Vector3();
+let gunBloodAt = -Infinity, gunDryWait = 0; // when it was last painted; s since the last drying step
+// A demon's burst at 'at', 'near' (0…1) how close: its blood onto your weapon, painted when it's next drawn (paintGunBlood),
+// in that pose
+function splashGun(at, near) {
+  if (!gun?.blood) return;
+  _gunTo.copy(at).applyMatrix4(camera.matrixWorldInverse).normalize(); // the burst, from your eye (view space: the gun's too)
+  gun.splashes.push({ x: _gunTo.x, near });
+  gun.dirty = true;
+}
+function paintGunBlood() { // in updateGun, posed and its eye placed, before it's drawn
+  const u = gunPaint.uniforms, target = renderer.getRenderTarget(), autoClear = renderer.autoClear;
+  u.uView.value.copy(gunCam.matrixWorldInverse);
+  renderer.autoClear = false;
+  for (const { x, near } of gun.splashes) {
+    u.uFrom.value.set(x * 0.5, 1, 0.7).normalize(); // from above, towards you, a little from its side
+    u.uSide.value = THREE.MathUtils.clamp(x * 3, -1, 1);
+    u.uAmount.value = near;
+    u.uSeed.value = Math.random() * 100;
+    for (const { rt, meshes } of gun.blood) {
+      renderer.setRenderTarget(rt);
+      for (const m of meshes) {
+        const keep = m.material, culled = m.frustumCulled;
+        m.material = gunPaint; m.frustumCulled = false;
+        renderer.render(m, gunCam);
+        m.material = keep; m.frustumCulled = culled;
+      }
+    }
+  }
+  gun.splashes.length = 0;
+  renderer.setRenderTarget(target);
+  renderer.autoClear = autoClear;
+  gunBloodAt = clock.elapsedTime;
+}
+function dryGunBlood(dt) { // every GUN_BLOOD_STEP s while there's blood on it (till it's all but worn off)
+  if (!gun.blood || clock.elapsedTime - gunBloodAt > 4 * GUN_BLOOD_FADE || (gunDryWait += dt) < GUN_BLOOD_STEP) return;
+  gunDryMat.uniforms.uKeep.value.set(Math.exp(-gunDryWait / GUN_BLOOD_FADE), Math.exp(-gunDryWait / GUN_BLOOD_DRY_TAU) * Math.exp(-gunDryWait / GUN_BLOOD_FADE));
+  gunDryWait = 0;
+  const target = renderer.getRenderTarget(), autoClear = renderer.autoClear;
+  renderer.autoClear = false;
+  for (const { rt } of gun.blood) { renderer.setRenderTarget(rt); renderer.render(gunDryScene, bloodCam); }
+  renderer.setRenderTarget(target);
+  renderer.autoClear = autoClear;
+  gun.dirty = true;
 }
 
 function updateAmmo() {
@@ -4253,7 +4497,7 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
-  composer.setSize(innerWidth, innerHeight);
+  sizeWorld();
   sizeGun();
 });
 sizeGun();
@@ -4267,7 +4511,7 @@ function reportStats(cpuMs, sprites) {
   if (now - statStart < 500) return;
   const { calls, triangles } = renderer.info.render;
   fpsEl.textContent = `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps`;
-  statsEl.textContent = `${npcs.length} demons (${opts.real ? 'REAL 3D' : 'sprites'}) · ` +
+  statsEl.textContent = `${npcs.length} demons (${opts.real ? 'REAL 3D' : 'sprites'}) · world 1/${Math.round(1 / worldScale)}${fixedScale ? ' (fixed)' : ''} · ` +
     `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps · CPU ${(statCpu / statFrames).toFixed(2)} ms/frame · ` +
     `${calls} draw calls · ${(triangles / 1000).toFixed(0)}k tris · ${(statSprites / statFrames).toFixed(1)} sprite renders/frame`;
   statFrames = statCpu = statSprites = 0; statStart = now;
@@ -4492,7 +4736,12 @@ function steer(model, dir, speed, dt, facing) { // dir: normalized XZ direction
   model.position.addScaledVector(dir, speed * dt);
 }
 
-renderer.setAnimationLoop(() => {
+let nextFrameAt = 0, lastFrameAt = 0;
+renderer.setAnimationLoop((time) => {
+  if (time < nextFrameAt - 1) return; // capped at FPS_CAP: too soon, skip this one of the display's frames
+  nextFrameAt = Math.max(nextFrameAt, time - FRAME_MS) + FRAME_MS; // (fallen behind: from now)
+  scaleWorld(time, time - lastFrameAt);
+  lastFrameAt = time;
   const t0 = performance.now();
   const dt = Math.min(clock.getDelta(), 0.1), now = clock.elapsedTime;
   renderer.info.reset();
