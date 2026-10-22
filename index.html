@@ -6,12 +6,17 @@
 <style>
 body{margin:0;overflow:hidden}
 canvas{image-rendering:pixelated}
-#ui{position:fixed;top:8px;left:8px;right:8px;color:#fff;font:13px sans-serif;text-shadow:0 1px 2px #000;pointer-events:none}
+#ui{position:fixed;top:8px;left:8px;right:8px;z-index:1;color:#fff;font:13px sans-serif;text-shadow:0 1px 2px #000;pointer-events:none}
+body.playing #start{display:none} /* the menu: only while paused (Esc) or before you start */
+body:not(.debug) #ui{display:none} /* the debug toggles and stats: only in debug mode (` or ?debug) */
 #stats{margin-top:4px;font-family:ui-monospace,monospace}
-#start{position:fixed;inset:0;display:grid;place-items:center;color:#fff;font:bold 28px sans-serif;text-shadow:0 2px 6px #000;pointer-events:none}
+#start{position:fixed;inset:0;display:grid;place-content:center;justify-items:center;gap:8px;background:rgba(0,0,0,.5);color:#fff;font:bold 28px sans-serif;text-shadow:0 2px 6px #000;pointer-events:none}
+#start small{font:14px sans-serif;opacity:.75}
 #crosshair{position:fixed;left:50%;top:50%;width:4px;height:4px;margin:-2px 0 0 -2px;background:#fff;box-shadow:0 0 2px #000;pointer-events:none}
 #ammo{position:fixed;right:16px;bottom:12px;color:#fff;font:bold 28px ui-monospace,monospace;text-shadow:0 2px 4px #000;pointer-events:none}
 #health{position:fixed;left:16px;bottom:30px;color:#fff;font:bold 28px ui-monospace,monospace;text-shadow:0 2px 4px #000;pointer-events:none}
+#fps{position:fixed;top:8px;left:8px;z-index:1;color:#fff;opacity:.8;font:12px ui-monospace,monospace;text-shadow:0 1px 2px #000;pointer-events:none}
+body.debug #fps{display:none} /* (the debug stats show it, there) */
 #credit{position:fixed;left:8px;bottom:6px;color:#fff;opacity:.7;font:11px sans-serif;text-shadow:0 1px 2px #000;pointer-events:none}
 </style>
 <script type="importmap">
@@ -19,10 +24,11 @@ canvas{image-rendering:pixelated}
 </script>
 </head>
 <body>
-<div id="ui"><div id="hud">WASD move · Shift sprint · Space jump · mouse look · click fire · R reload · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · F depth of field · = / - add/remove 10 demons</div>
+<div id="ui"><div id="hud">Debug (` to hide) · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · F depth of field · M cycle blood · I sprite debug · = / - add/remove 10 demons</div>
 <div id="stats"></div></div>
-<div id="start">Click to play</div>
+<div id="start"><div>Click to play</div><small>WASD move · Shift sprint · Space jump · mouse look · click fire · R reload</small><small>Esc: this menu</small></div>
 <div id="crosshair"></div>
+<div id="fps"></div>
 <div id="ammo"></div><div id="health"></div>
 <div id="credit">Weapon: "M4 - FPS Weapon Animations Pack (v.1)" by BarcodeGames (sketchfab.com/barcodegames), CC-BY-4.0<br>Casing: "Bullet Case" by oscarherry3d (sketchfab.com/oscarherry3d), CC-BY-4.0</div>
 <script type="module">
@@ -124,7 +130,9 @@ class SpriteImpostor extends THREE.Group {
         float sd = texture2D(uSpriteDepth, vMapUv).r;
         if (sd >= 1.0) discard; // nothing of the model here
         float zs = ${SPRITE_NEAR.toFixed(2)} * ${SPRITE_FAR.toFixed(1)} / (${SPRITE_FAR.toFixed(1)} - sd * ${(SPRITE_FAR - SPRITE_NEAR).toFixed(2)});
-        vec4 c = uProj * vec4(0.0, 0.0, -(uDepthRef.x + zs - uDepthRef.y - ${SPRITE_DEPTH_BIAS.toFixed(2)}), 1.0);
+        // (never nearer than your near plane: a demon right up against you puts its front, arm and gun, nearer than
+        // its middle is far, which went behind the camera, where the depth wraps round to the far end: it vanished)
+        vec4 c = uProj * vec4(0.0, 0.0, -max(uDepthRef.x + zs - uDepthRef.y - ${SPRITE_DEPTH_BIAS.toFixed(2)}, ${(SPRITE_NEAR * 1.05).toFixed(3)}), 1.0);
         gl_FragDepth = c.z / c.w * 0.5 + 0.5;`);
     };
     this.card = new THREE.Mesh(cardGeo, cardMat);
@@ -171,6 +179,12 @@ class SpriteImpostor extends THREE.Group {
 
   setResolution(n) {
     this.rt.setSize(n, n);
+    // A new depth texture at the new size. three r170's setSize resizes only the colour texture: if the old depth
+    // texture gets used (the card samples it) before the next sprite render, it's re-made at the old size, and once
+    // made it can't be resized, so the colour and depth no longer match. WebGL then refuses to draw into the sprite
+    // (an incomplete framebuffer), and the demon vanished until its next LOD step
+    this.rt.depthTexture.dispose();
+    this.rt.depthTexture = this.depthU.uSpriteDepth.value = new THREE.DepthTexture(n, n);
     this.shadowRt.setSize(n / 2, n / 2);
     this.lastKey = this.shadowKey = undefined;
   }
@@ -286,6 +300,7 @@ class SpriteImpostor extends THREE.Group {
     this.depthU.uDepthRef.value.y = -_rc.z;
     cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
     this.renderModel(renderer, this.rt, cam);
+    this.renderedAt = performance.now(); // (for the sprite debug view)
     return renders + 1;
   }
 
@@ -810,7 +825,9 @@ for (const [nx, nz] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) { // each wall's inwa
 }
 for (const name of Object.keys(wallCells)) {
   const cells = wallCells[name], m = new THREE.Matrix4();
-  const mesh = new THREE.InstancedMesh(withGrimeOffsets(wallGeo, cells.length), tileMat(name, `drip:${name}`, { drip: true }), cells.length);
+  const mat = tileMat(name, `drip:${name}`, { drip: true });
+  addWallBlood(mat); // (see wallBlood)
+  const mesh = new THREE.InstancedMesh(withGrimeOffsets(wallGeo, cells.length), mat, cells.length);
   cells.forEach((c, i) => mesh.setMatrixAt(i, m.compose(c.pos, c.q, ONE))); // c.q includes the tile's turn in its plane
   mesh.castShadow = mesh.receiveShadow = true;
   scene.add(mesh);
@@ -904,6 +921,7 @@ const columnLamps = []; // the columns' wall lamps (the walls' parallax fixture)
   }
   for (const [key, mats] of Object.entries(panels)) {
     const [name, low] = key.split(':'), mat = tileMat(name, `drip:${key}`, { drip: true });
+    addWallBlood(mat); // (see wallBlood)
     if (low) mat.color.set(COLUMN_TINT); // the bottom row: tinted steel, still metal (the tint colours its reflections)
     const mesh = new THREE.InstancedMesh(withGrimeOffsets(panel, mats.length), mat, mats.length);
     mats.forEach((mm, i) => mesh.setMatrixAt(i, mm));
@@ -1076,7 +1094,9 @@ function rayConvex(o, dir, planes) { // where a ray enters a convex solid: { t, 
     }
   });
   for (const [name, mats] of Object.entries(sides)) {
-    const mesh = new THREE.InstancedMesh(withGrimeOffsets(side, mats.length), tileMat(name, `drip:${name}`, { drip: true }), mats.length);
+    const mat = tileMat(name, `drip:${name}`, { drip: true });
+    addWallBlood(mat); // (see wallBlood: its sides' strip)
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(side, mats.length), mat, mats.length);
     mats.forEach((mm, i) => mesh.setMatrixAt(i, mm));
     scene.add(mesh);
   }
@@ -1113,7 +1133,9 @@ function rayConvex(o, dir, planes) { // where a ray enters a convex solid: { t, 
     geo.setAttribute('normal', new THREE.Float32BufferAttribute(g.pos.map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
     geo.setAttribute('uv', new THREE.Float32BufferAttribute(g.uv, 2));
     geo.setAttribute('grimeOffset', new THREE.Float32BufferAttribute(g.grime, 2)); // per vertex: one window per plate
-    scene.add(new THREE.Mesh(geo, tileMat(name)));
+    const mat = tileMat(name);
+    addTopBlood(mat); // (see topBloodMap)
+    scene.add(new THREE.Mesh(geo, mat));
   }
   // Hazard band: yellow/black paint around the top's edge, 32 px/m like the tiles (one texture = 2 m of band,
   // 4 diagonal stripes), with worn-through chips. Painted on, so it isn't metal and doesn't take the tile grime.
@@ -1279,6 +1301,7 @@ const weldTurn = new Map(); // cell → quarter turns about +Y
 
 Object.keys(FLOOR_TILES).forEach((name, type) => {
   const mat = tileMat(name);
+  if (name !== 'glass_slits') addFloorBlood(mat); // (glass: out of texture units; its landings stay stickers)
   const cells = tilePick.flatMap((t, i) => (t === type ? [i] : []));
   const mesh = new THREE.InstancedMesh(withGrimeOffsets(tileGeo, cells.length), mat, cells.length);
   const m = new THREE.Matrix4();
@@ -1451,6 +1474,10 @@ composer.addPass(new RenderPass(scene, camera));
 // this pixel, so a sharp thing doesn't smear into the blur round it. Reads the scene's depth: the composer's targets
 // carry a depth texture. Before bloom, so blurred lights bloom wider. The gun is drawn after it all, always sharp.
 const DOF_SHARP = 12, DOF_SOFT = 30, DOF_MAX = 0.004, DOF_TAPS = 24; // m; m; of the screen height; samples
+// Hurt: when you're hit the whole scene goes out of focus, near and far, and comes back over HURT_RECOVER s; hits
+// stack. The same pass, its blur raised everywhere to HURT_BLUR (of the screen height) × the hurt, eased.
+const HURT_BLUR = 0.02, HURT_PER_HIT = 0.7, HURT_RECOVER = 1.0; // of the screen height; per hit (of 1); s
+let hurt = 0, dofOn = true; // dofOn: the distance blur (F); the pass runs while either is wanted
 for (const rt of [composer.renderTarget1, composer.renderTarget2]) rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height);
 class DofPass extends ShaderPass {
   render(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
@@ -1462,17 +1489,19 @@ class DofPass extends ShaderPass {
 const dof = new DofPass({
   uniforms: {
     tDiffuse: { value: null }, tDepth: { value: null }, uRes: { value: new THREE.Vector2(1, 1) },
-    uNear: { value: camera.near }, uFar: { value: camera.far },
+    uNear: { value: camera.near }, uFar: { value: camera.far }, uDof: { value: 1 }, uHurt: { value: 0 },
   },
   vertexShader: `varying vec2 vUv;\nvoid main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `
     #include <packing>
     uniform sampler2D tDiffuse, tDepth;
     uniform vec2 uRes;
-    uniform float uNear, uFar;
+    uniform float uNear, uFar, uDof, uHurt;
     varying vec2 vUv;
     float viewDepth(vec2 uv) { return -perspectiveDepthToViewZ(texture2D(tDepth, uv).x, uNear, uFar); }
-    float coc(float z) { return smoothstep(${DOF_SHARP.toFixed(1)}, ${DOF_SOFT.toFixed(1)}, z) * ${DOF_MAX} * uRes.y; } // px
+    float coc(float z) { // px: the distance blur, or the hurt's (all over), whichever's more
+      return max(uDof * smoothstep(${DOF_SHARP.toFixed(1)}, ${DOF_SOFT.toFixed(1)}, z) * ${DOF_MAX}, uHurt * ${HURT_BLUR}) * uRes.y;
+    }
     void main() {
       vec4 base = texture2D(tDiffuse, vUv);
       float c0 = coc(viewDepth(vUv));
@@ -1492,12 +1521,22 @@ const dof = new DofPass({
 composer.addPass(dof);
 
 composer.addPass(bloom);
-composer.addPass(new OutputPass());
+// the finished HDR scene (bloomed, before tone mapping), kept for the blood on the lens to see through (see hudFx)
+let sceneTex = null;
+composer.addPass(new (class extends OutputPass {
+  render(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
+    sceneTex = readBuffer.texture;
+    super.render(renderer, writeBuffer, readBuffer, deltaTime, maskActive);
+  }
+})());
 const look = new PointerLockControls(camera, renderer.domElement);
-const startEl = document.getElementById('start');
 renderer.domElement.addEventListener('click', () => { if (!look.isLocked) look.lock(); audio.resume(); }); // (browsers start audio on a click)
-look.addEventListener('lock', () => (startEl.style.display = 'none'));
-look.addEventListener('unlock', () => { startEl.style.display = ''; trigger = false; });
+// Playing: just the crosshair, health, ammo and credits; paused (Esc, or not started): the menu, with the controls,
+// toggles and stats over the dimmed game
+look.addEventListener('lock', () => document.body.classList.add('playing'));
+// Debug mode (the toggle keys, their states and the stats, over the game): the backquote key switches it, ?debug starts in it
+if (new URLSearchParams(location.search).has('debug')) document.body.classList.add('debug');
+look.addEventListener('unlock', () => { document.body.classList.remove('playing'); trigger = false; });
 
 const opts = {
   stage, resolution: RT_SIZES[0], snaps: 16, pitchSnaps: 8, distance: 5, animFps: 12,
@@ -1680,7 +1719,7 @@ function shakeCamera(dt, now) { // returns false when there's nothing to apply
 // then dries over DECAL_DRY s, wet red to dark brown-red with the rim darkening first (the coffee-ring effect). On
 // a wall or column the stain runs: a drip grows down, fast then slowing, ending in a bead. Multiply-blended, so a
 // stain tints what's under it and is lit by whatever lights that: deep red under a light, unseen in the dark.
-const DECAL_MAX = 1536, DECAL_SPREAD = 0.06, DECAL_DRY = 8, DECAL_LIFE = 40; // decals (~10 s of full-auto), s, s, s
+const DECAL_MAX = 1536, DECAL_SPREAD = 0.06, DECAL_DRY = 25, DECAL_LIFE = 40; // decals (~10 s of full-auto), s, s, s
 const decalAttrs = { aSeed: 1, aBirth: 1, aStretch: 1, aKind: 1, aPixels: 2 };
 const decalGeo = new THREE.PlaneGeometry(2, 2); // faces +Z; per-instance scale makes it the stain's size
 for (const [name, n] of Object.entries(decalAttrs))
@@ -1707,16 +1746,18 @@ const SPLAT_SDF = `
       float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
       return length(pa - ba * h) - mix(ra, rb, h);
     }
+    // a paint splat (Splatoon's, thrown from a can): a big fat body, wobbling; thick arms flung off it, each ending in a
+    // round blob; and fat drops beyond
     float splatShape(vec2 p, float seed) {
       float ang = atan(p.y, p.x);
-      float d = length(p) - 0.25 * (1.0 + 0.15 * sin(ang * 3.0 + seed) + 0.1 * sin(ang * 7.0 + seed * 2.0));
+      float d = length(p) - 0.38 * (1.0 + 0.12 * sin(ang * 3.0 + seed) + 0.08 * sin(ang * 5.0 + seed * 2.0));
       for (int i = 0; i < 9; i++) {
         float fi = float(i) + seed * 10.0;
-        float a = hash1(fi) * 6.283, len = 0.3 + 0.3 * hash1(fi + 1.0);
+        float a = hash1(fi) * 6.283, len = 0.45 + 0.3 * hash1(fi + 1.0);
         vec2 dir = vec2(cos(a), sin(a)), tip = dir * len;
-        d = smin(d, sdCapsule(p, vec2(0.0), tip, 0.08, 0.015), 0.05);
-        d = smin(d, length(p - tip) - 0.03 - 0.02 * hash1(fi + 2.0), 0.03);
-        d = min(d, length(p - dir * (len + 0.08 + 0.15 * hash1(fi + 3.0))) - 0.01 - 0.015 * hash1(fi + 4.0));
+        d = smin(d, sdCapsule(p, vec2(0.0), tip, 0.13, 0.05), 0.08);
+        d = smin(d, length(p - tip) - 0.06 - 0.04 * hash1(fi + 2.0), 0.05);
+        d = min(d, length(p - dir * (len + 0.1 + 0.08 * hash1(fi + 3.0))) - 0.025 - 0.035 * hash1(fi + 4.0));
       }
       return d;
     }`;
@@ -1802,7 +1843,34 @@ const _dm = new THREE.Matrix4(), _dq = new THREE.Quaternion(), _dq2 = new THREE.
 const DECAL_FLAT = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
 // at: where it landed; normal: the wall's or column's outward face normal (null: the floor); v: its velocity
 // size (optional): the stain's radius outright, instead of from the drop's size and speed
+// Paint: on the blood maps a landing's stain is PAINT_SCALE times a sticker's (to PAINT_MAX m), and one bigger than
+// PAINT_SPRAY_FROM m throws PAINT_SPRAY smaller ones on around it: a can of red paint flung, not a drop
+const PAINT_SCALE = 1.5, PAINT_MAX = 1.2, PAINT_SPRAY_FROM = 0.4, PAINT_SPRAY = 3; // −, m, m, splats
 function spawnDecal(at, normal, v, dropSize, size = THREE.MathUtils.clamp(dropSize * (1.5 + 0.6 * v.length()), 0.06, 0.45)) {
+  // into the blood maps: as paint (see PAINT_SCALE), a big splat and, for a big one, a spray of smaller ones thrown on
+  // ahead of it along its travel
+  const onWall = normal && wallBloodAt(at), paint = Math.min(size * PAINT_SCALE, PAINT_MAX);
+  if (onWall) { // a wall or column (see wallBlood): the spray across it, to either side
+    stampWallBlood(onWall[0], onWall[1], paint);
+    for (let k = 0, n = paint > PAINT_SPRAY_FROM ? PAINT_SPRAY : 0; k < n; k++) {
+      const a = Math.random() * 2 * Math.PI, r = paint * (1 + 1.5 * Math.random());
+      stampWallBlood(onWall[0] + Math.cos(a) * r * BLOOD_PX, onWall[1] + Math.sin(a) * r * BLOOD_PX, paint * (0.2 + 0.3 * Math.random()));
+    }
+    return;
+  }
+  const top = !normal && onPlatformTop(at.x, at.y, at.z);
+  if (top || (!normal && onBloodFloor(at.x, at.y, at.z))) { // the floor (see bloodMap) or the platform's top: the spray thrown on forward
+    const stamp = top ? stampTopBlood : stampBlood;
+    const h = Math.hypot(v.x, v.z), stretch = THREE.MathUtils.clamp(v.length() / Math.max(Math.abs(v.y), 1e-3), 1, 3);
+    const ax = h < 1e-3 ? 1 : v.x / h, az = h < 1e-3 ? 0 : v.z / h;
+    stamp(at.x, at.z, ax, az, paint, stretch);
+    for (let k = 0, n = paint > PAINT_SPRAY_FROM ? PAINT_SPRAY : 0; k < n; k++) {
+      const a = (Math.random() - 0.5) * (h < 1e-3 ? 2 * Math.PI : 1.6), r = paint * (1 + 2 * Math.random()); // a fan ahead
+      const dx = ax * Math.cos(a) - az * Math.sin(a), dz = ax * Math.sin(a) + az * Math.cos(a);
+      stamp(at.x + dx * r, at.z + dz * r, dx, dz, paint * (0.15 + 0.3 * Math.random()), 1 + Math.random());
+    }
+    return;
+  }
   const i = decalNext++ % DECAL_MAX, speed = v.length(); // size: m, harder impacts spread wider
   let stretch = 1, kind = 0;
   if (normal) { // a wall or column: round, with a drip; the tall quad's centre sits two splat radii below the splat
@@ -1829,6 +1897,531 @@ function spawnDecal(at, normal, v, dropSize, size = THREE.MathUtils.clamp(dropSi
   set('aPixels', px * stretch, kind ? px * 3 : px);
 }
 
+// Blood maps (Splatoon's ink maps): blood on the arena's floor, walls and columns isn't stickers but paint in a
+// texture over each, BLOOD_PX texels a metre (one a surface pixel, so it lands on their pixel grid), never cleared.
+// R: how much blood (summed: splats that overlap merge into one pool, deeper where they pile up); G: how much of it's
+// still wet (also summed, then dried: multiplied down over time, by BLOOD_DRY_TAU). A landing stamps the stain's shape
+// (the stickers' baked splats: see shapeRT) in, added. The surfaces read it (addBlood): blood where there's any, its
+// colour by depth and wetness, glossy while wet, matte dried, bulged at its edges (a normal from how fast the depth
+// changes, so a pool's rim catches the light).
+// The floor's map (bloodMap) lies over the arena floor. The walls' and columns' (wallBlood) is an atlas of their
+// surfaces unwrapped: each wall a strip (along it × up), then a strip of the four columns, each its eight faces side by
+// side. On it the blood runs (see the flow): wet blood past what sticks drips down, leaving a film, its front a bead;
+// what runs off the bottom drains onto the floor's map at the base, where it pools.
+// The glass row (out of texture units) and everything else (platform, stairs, towers) keep the stickers.
+const BLOOD_PX = 32, BLOOD_RES = 2 * ARENA * BLOOD_PX, BLOOD_DRY_TAU = 10, BLOOD_DRY_STEP = 0.25; // texels/m, texels, s, s
+const BLOOD_STAMPS = 512; // most landings painted a frame, per map
+// The platform's top has its own map (topBloodMap), TOP_BLOOD_HALF m each way from the centre: the floor's would do,
+// but splats at the platform's foot would show on its top edge
+const TOP_BLOOD_HALF = 5.5, TOP_BLOOD_RES = 2 * TOP_BLOOD_HALF * BLOOD_PX;
+const bloodTarget = (w, h) => new THREE.WebGLRenderTarget(w, h, {
+  type: THREE.HalfFloatType, format: THREE.RGFormat, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter, depthBuffer: false });
+const bloodMap = bloodTarget(BLOOD_RES, BLOOD_RES), floorBloodTex = { value: bloodMap.texture };
+const topBloodMap = bloodTarget(TOP_BLOOD_RES, TOP_BLOOD_RES), topBloodTex = { value: topBloodMap.texture };
+const onPlatformTop = (x, y, z) => Math.abs(y - PLATFORM_H) < 0.02 && platformDist(x, z) < PLATFORM_APOTHEM;
+// the walls' and columns' atlas: WALL_BLOOD_ROWS texels a strip (the walls' height), 4 wall strips, the columns', then
+// the centre platform's sides (its eight side by side; only its bottom PLATFORM_H of the strip used)
+const WALL_BLOOD_ROWS = WALL_ROWS * TILE * BLOOD_PX, WALL_BLOOD_W = BLOOD_RES, WALL_BLOOD_H = 6 * WALL_BLOOD_ROWS;
+const FACE_PX = COLUMN_SIDE * BLOOD_PX, COLUMN_PX = 8 * FACE_PX; // a column face's texels across; a column's
+const PLAT_FACE_PX = PLATFORM_SIDE * BLOOD_PX; // a platform side's texels across
+const wallBloodRTs = [bloodTarget(WALL_BLOOD_W, WALL_BLOOD_H), bloodTarget(WALL_BLOOD_W, WALL_BLOOD_H)]; // ping-pong (the flow)
+let wallBloodCur = 0;
+const wallBloodTex = { value: wallBloodRTs[0].texture }; // the current one, shared by the materials
+// The flow: every BLOOD_FLOW_STEP s, a share (BLOOD_FLOW_RATE) of each texel's wet blood past what sticks (BLOOD_HOLD,
+// varied per texel column so it runs in separate streaks) moves one texel down. Dried blood doesn't run; the walls
+// dry slower than the floor (BLOOD_WALL_DRY_TAU), so drips run a metre or two before they stop
+const BLOOD_FLOW_STEP = 1 / 30, BLOOD_FLOW_RATE = 0.5, BLOOD_HOLD = 0.15, BLOOD_WALL_DRY_TAU = 12, BLOOD_WALL_IDLE = 40; // s, share, depth, s, s
+const glassType = Object.keys(FLOOR_TILES).indexOf('glass_slits');
+function onBloodFloor(x, y, z) { // the floor proper (not the platform's top or a stair), inside the arena, not glass
+  if (y > 0.01 || Math.abs(x) >= ARENA || Math.abs(z) >= ARENA) return false;
+  return tilePick[Math.floor(z / TILE + TILES / 2) * TILES + Math.floor(x / TILE + TILES / 2)] !== glassType;
+}
+// where a point on a wall or a column face is in the atlas (texels, x along, y up), or null: not one
+function wallBloodAt(p) {
+  if (p.y < 0 || p.y >= WALL_ROWS * TILE) return null;
+  const v = p.y * BLOOD_PX;
+  if (Math.abs(p.x) > ARENA - 0.05) return [(p.z + ARENA) * BLOOD_PX, (p.x > 0 ? 0 : 1) * WALL_BLOOD_ROWS + v];
+  if (Math.abs(p.z) > ARENA - 0.05) return [(p.x + ARENA) * BLOOD_PX, (p.z > 0 ? 2 : 3) * WALL_BLOOD_ROWS + v];
+  if (p.y < PLATFORM_H && Math.abs(platformDist(p.x, p.z) - PLATFORM_APOTHEM) < 0.05) { // a platform side (its normal: _pf)
+    const f = (Math.round(Math.atan2(_pf.x, _pf.y) / (Math.PI / 4)) + 8) % 8, a = f * Math.PI / 4;
+    const s = p.x * Math.cos(a) - p.z * Math.sin(a); // along it
+    return [f * PLAT_FACE_PX + (s + PLATFORM_SIDE / 2) * BLOOD_PX, 5 * WALL_BLOOD_ROWS + v];
+  }
+  for (let k = 0; k < COLUMNS.length; k++) {
+    const dx = p.x - COLUMNS[k].x, dz = p.z - COLUMNS[k].y, f = (Math.round(Math.atan2(dx, dz) / (Math.PI / 4)) + 8) % 8, a = f * Math.PI / 4;
+    if (Math.abs(dx * Math.sin(a) + dz * Math.cos(a) - COLUMN_APOTHEM) > 0.05) continue;
+    const s = dx * Math.cos(a) - dz * Math.sin(a); // along the face
+    return [k * COLUMN_PX + f * FACE_PX + (s + COLUMN_SIDE / 2) * BLOOD_PX, 4 * WALL_BLOOD_ROWS + v];
+  }
+  return null;
+}
+// Stamps: a stain's quad, local x along aAxis, aHalf its half-sizes (local units), placed at aCentre (clip space);
+// uScale takes local units to clip space (the floor's: metres; the atlas's: texels)
+function makeStamps(scaleX, scaleY) {
+  const geo = new THREE.InstancedBufferGeometry().copy(new THREE.PlaneGeometry(2, 2));
+  const attr = (name, n) => {
+    const a = new THREE.InstancedBufferAttribute(new Float32Array(BLOOD_STAMPS * n), n).setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute(name, a);
+    return a;
+  };
+  const attrs = [attr('aCentre', 2), attr('aAxis', 2), attr('aHalf', 2), attr('aSeed', 2)];
+  geo.instanceCount = 0;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uShapes: { value: shapeRT.texture }, uScale: { value: new THREE.Vector2(scaleX, scaleY) } },
+    blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+    depthTest: false, depthWrite: false,
+    vertexShader: `
+      uniform vec2 uScale;
+      attribute vec2 aCentre, aAxis, aHalf, aSeed;
+      varying vec2 vP;
+      varying float vSeed, vStretch;
+      void main() {
+        vP = position.xy; vSeed = aSeed.x; vStretch = aSeed.y;
+        vec2 w = aAxis * position.x * aHalf.x + vec2(-aAxis.y, aAxis.x) * position.y * aHalf.y;
+        gl_Position = vec4(aCentre + w * uScale, 0.0, 1.0);
+      }`,
+    fragmentShader: SPLAT_SDF + `
+      uniform sampler2D uShapes;
+      varying vec2 vP;
+      varying float vSeed, vStretch;
+      float splat(vec2 p, float seed) { // as the stickers' (see decalMat)
+        if (max(abs(p.x), abs(p.y)) > 0.98) return 1.0;
+        float k = floor(seed);
+        if (fract(seed) > 0.5) p.x = -p.x;
+        vec2 uv = (vec2(mod(k, ${DECAL_SHAPE_GRID}.0), floor(k / ${DECAL_SHAPE_GRID}.0)) + p * 0.5 + 0.5) / ${DECAL_SHAPE_GRID}.0;
+        return texture2D(uShapes, uv).r;
+      }
+      // footprints (vStretch < 0; vSeed: how much blood), over −1…1, x forward: −1 a boot (a sole and a heel),
+      // −2 a demon's claw (a pad and three toes)
+      float footprint(vec2 p, float kind) {
+        if (kind > -1.5) return min(length((p - vec2(0.25, 0.0)) / vec2(0.7, 0.85)) - 1.0, length((p - vec2(-0.68, 0.0)) / vec2(0.3, 0.7)) - 1.0);
+        float d = length((p - vec2(-0.45, 0.0)) / vec2(0.4, 0.55)) - 1.0;
+        for (int k = -1; k <= 1; k++) d = min(d, sdCapsule(p, vec2(-0.2, 0.0), vec2(0.9, 0.0) * cos(float(k) * 0.5) + vec2(0.0, float(k) * 0.55), 0.22, 0.08) / 0.3);
+        return d;
+      }
+      void main() {
+        if (vStretch < 0.0) { // a footprint: a thin film, a little of it wet
+          if (footprint(vP, vStretch) > 0.0) discard;
+          gl_FragColor = vec4(vSeed, vSeed * 0.6, 0.0, 1.0);
+          return;
+        }
+        float d = splat(vP, vSeed);
+        if (vStretch > 1.3) d = smin(d, sdCapsule(vP, vec2(0.0), vec2(0.85, 0.0), 0.12, 0.03), 0.06); // a slanted impact's tail
+        if (d > 0.0) discard;
+        float h = 0.15 + 0.85 * min(-d / 0.12, 1.0); // its depth: thin at the edges and in the fingers, full in the body
+        gl_FragColor = vec4(h, h, 0.0, 1.0); // all of it wet
+      }`,
+  });
+  const mesh = new THREE.Mesh(geo, mat), scn = new THREE.Scene();
+  mesh.frustumCulled = false;
+  scn.add(mesh);
+  let count = 0;
+  return {
+    // centre (clip), axis, half-sizes (local units), stretch (< 0: a footprint, see footprint), seed (a footprint's: its blood)
+    add(cx, cy, ax, ay, hx, hy, stretch, seed = Math.floor(Math.random() * DECAL_SHAPES) + Math.random() * 0.999) {
+      if (count >= BLOOD_STAMPS) return;
+      const k = count++;
+      attrs[0].array.set([cx, cy], k * 2);
+      attrs[1].array.set([ax, ay], k * 2);
+      attrs[2].array.set([hx, hy], k * 2);
+      attrs[3].array.set([seed, stretch], k * 2);
+    },
+    draw() { // into the current render target
+      if (!count) return false;
+      geo.instanceCount = count;
+      for (const a of attrs) a.needsUpdate = true;
+      renderer.render(scn, bloodCam);
+      count = 0;
+      return true;
+    },
+  };
+}
+const floorStamps = makeStamps(1 / ARENA, 1 / ARENA), wallStamps = makeStamps(2 / WALL_BLOOD_W, 2 / WALL_BLOOD_H);
+const topStamps = makeStamps(1 / TOP_BLOOD_HALF, 1 / TOP_BLOOD_HALF);
+// a stain on the floor: at x, z, its local x along (ax, az), size m, stretched along it
+function stampBlood(x, z, ax, az, size, stretch) { floorStamps.add(x / ARENA, z / ARENA, ax, az, size * stretch, size, stretch); }
+// on the platform's top (see topBloodMap)
+function stampTopBlood(x, z, ax, az, size, stretch) { topStamps.add(x / TOP_BLOOD_HALF, z / TOP_BLOOD_HALF, ax, az, size * stretch, size, stretch); }
+// a stain on a wall or column, at atlas texel (u, v), size m
+let wallIdle = Infinity; // s since blood last landed on a wall (the flow sleeps once it's all dry)
+function stampWallBlood(u, v, size) {
+  wallStamps.add(u / WALL_BLOOD_W * 2 - 1, v / WALL_BLOOD_H * 2 - 1, 1, 0, size * BLOOD_PX, size * BLOOD_PX, 1);
+  wallIdle = 0;
+}
+const fullQuad = (mat) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat), s = new THREE.Scene(); m.frustumCulled = false; s.add(m); return s; };
+const fullQuadVS = `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+// drying: G multiplied by uKeep (the blend: what's there × the source colour), R untouched
+const dryMat = new THREE.ShaderMaterial({
+  uniforms: { uKeep: { value: 1 } },
+  blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.ZeroFactor, blendDst: THREE.SrcColorFactor,
+  depthTest: false, depthWrite: false, vertexShader: fullQuadVS,
+  fragmentShader: `uniform float uKeep; void main() { gl_FragColor = vec4(1.0, uKeep, 1.0, 1.0); }`,
+});
+const dryScene = fullQuad(dryMat);
+// what flows out of an atlas texel down to the one below (R, and G: its wet share) in a flow step
+const FLOW_OUT = `
+    float bloodHold(ivec2 t) { // what sticks: varied per texel column (and strip), so it runs in streaks
+      return ${BLOOD_HOLD.toFixed(2)} * (0.5 + fract(sin(float(t.x) * 12.9898 + float(t.y / ${WALL_BLOOD_ROWS}) * 78.233) * 43758.5453));
+    }
+    vec2 flowOut(sampler2D src, ivec2 t) {
+      vec2 b = texelFetch(src, t, 0).rg;
+      float wet = clamp(b.g / max(b.r, 1e-4), 0.0, 1.0), out_ = max(b.r - bloodHold(t), 0.0) * ${BLOOD_FLOW_RATE.toFixed(2)} * wet;
+      return vec2(out_, out_ * wet);
+    }`;
+const flowMat = new THREE.ShaderMaterial({
+  uniforms: { uSrc: { value: null }, uKeep: { value: 1 } }, depthTest: false, depthWrite: false, vertexShader: fullQuadVS,
+  fragmentShader: `
+    uniform sampler2D uSrc;
+    uniform float uKeep;
+    ${FLOW_OUT}
+    void main() {
+      ivec2 t = ivec2(gl_FragCoord.xy);
+      vec2 b = texelFetch(uSrc, t, 0).rg - flowOut(uSrc, t);
+      if (t.y % ${WALL_BLOOD_ROWS} != ${WALL_BLOOD_ROWS - 1}) b += flowOut(uSrc, t + ivec2(0, 1)); // from above (its strip's)
+      gl_FragColor = vec4(b.r, b.g * uKeep, 0.0, 1.0);
+    }`,
+});
+const flowScene = fullQuad(flowMat);
+// the drain: each atlas column's bottom texel's outflow, painted onto the floor's map at the foot of its wall or
+// column face, a little puddle (BLOOD_DRAIN_PX across)
+const BLOOD_DRAIN_PX = 11, BLOOD_DRAIN = 0.35; // texels; share of the outflow each puddle texel gets
+const drainCount = 4 * WALL_BLOOD_W + COLUMNS.length * COLUMN_PX + 8 * PLAT_FACE_PX;
+const drainGeo = new THREE.BufferGeometry();
+drainGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(drainCount * 3), 3));
+drainGeo.setAttribute('aIdx', new THREE.Float32BufferAttribute(Float32Array.from({ length: drainCount }, (_, i) => i), 1));
+const drainMat = new THREE.ShaderMaterial({
+  uniforms: { uSrc: { value: null } },
+  blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+  depthTest: false, depthWrite: false,
+  vertexShader: `
+    uniform sampler2D uSrc;
+    attribute float aIdx;
+    varying vec2 vAmt;
+    ${FLOW_OUT}
+    void main() {
+      int i = int(aIdx + 0.5);
+      ivec2 t;
+      vec2 xz;
+      const float A = ${ARENA.toFixed(1)}, IN = 0.17; // the puddle's centre: this far out from the surface
+      if (i < ${4 * WALL_BLOOD_W}) {
+        int w = i / ${WALL_BLOOD_W}, u = i - w * ${WALL_BLOOD_W};
+        t = ivec2(u, w * ${WALL_BLOOD_ROWS});
+        float along = (float(u) + 0.5) / ${BLOOD_PX.toFixed(1)} - A;
+        xz = w == 0 ? vec2(A - IN, along) : w == 1 ? vec2(IN - A, along) : w == 2 ? vec2(along, A - IN) : vec2(along, IN - A);
+      } else if (i >= ${4 * WALL_BLOOD_W + COLUMNS.length * COLUMN_PX}) { // a platform side's foot
+        int j = i - ${4 * WALL_BLOOD_W + COLUMNS.length * COLUMN_PX}, f = j / ${PLAT_FACE_PX};
+        t = ivec2(j, ${5 * WALL_BLOOD_ROWS});
+        float a = float(f) * ${(Math.PI / 4).toFixed(6)}, s = (float(j - f * ${PLAT_FACE_PX}) + 0.5) / ${BLOOD_PX.toFixed(1)} - ${(PLATFORM_SIDE / 2).toFixed(2)};
+        xz = vec2(sin(a), cos(a)) * (${PLATFORM_APOTHEM.toFixed(4)} + IN) + vec2(cos(a), -sin(a)) * s;
+      } else {
+        int j = i - ${4 * WALL_BLOOD_W}, k = j / ${COLUMN_PX}, u = j - k * ${COLUMN_PX}, f = u / ${FACE_PX};
+        t = ivec2(j, ${4 * WALL_BLOOD_ROWS});
+        float a = float(f) * ${(Math.PI / 4).toFixed(6)}, s = (float(u - f * ${FACE_PX}) + 0.5) / ${BLOOD_PX.toFixed(1)} - ${(COLUMN_SIDE / 2).toFixed(2)};
+        vec2 c = ${COLUMNS.map((c, k) => (k < COLUMNS.length - 1 ? `k == ${k} ? ` : '') + `vec2(${c.x.toFixed(1)}, ${c.y.toFixed(1)})`).join(' : ')};
+        xz = c + vec2(sin(a), cos(a)) * (${COLUMN_APOTHEM.toFixed(4)} + IN) + vec2(cos(a), -sin(a)) * s;
+      }
+      vAmt = flowOut(uSrc, t);
+      gl_Position = vAmt.x > 0.0 ? vec4(xz / A, 0.0, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
+      gl_PointSize = ${BLOOD_DRAIN_PX.toFixed(1)};
+    }`,
+  fragmentShader: `
+    varying vec2 vAmt;
+    void main() {
+      float r = length(gl_PointCoord - 0.5) * 2.0;
+      if (r > 1.0) discard;
+      gl_FragColor = vec4(vAmt * ${BLOOD_DRAIN.toFixed(2)} * (1.0 - r * r), 0.0, 1.0);
+    }`,
+});
+const drainPoints = new THREE.Points(drainGeo, drainMat), drainScene = new THREE.Scene();
+drainPoints.frustumCulled = false;
+drainScene.add(drainPoints);
+const bloodCam = new THREE.Camera(); // (the shaders place everything themselves)
+let bloodMapsClear = false, bloodDryWait = 0, flowWait = 0;
+function flushBlood(dt) { // before the scene's drawn: this frame's stains into the maps, the drips, the drying
+  const target = renderer.getRenderTarget(), autoClear = renderer.autoClear;
+  renderer.autoClear = false;
+  if (!bloodMapsClear) { // their first use: empty
+    renderer.getClearColor(_clearColor);
+    const alpha = renderer.getClearAlpha();
+    renderer.setClearColor(0x000000, 0);
+    for (const rt of [bloodMap, topBloodMap, ...wallBloodRTs]) { renderer.setRenderTarget(rt); renderer.clear(); }
+    renderer.setClearColor(_clearColor, alpha);
+    bloodMapsClear = true;
+  }
+  // the walls: new stains, then the flow (each step: the bottom row's outflow drained onto the floor, then the move)
+  renderer.setRenderTarget(wallBloodRTs[wallBloodCur]);
+  wallStamps.draw();
+  wallIdle += dt;
+  flowWait = wallIdle < BLOOD_WALL_IDLE ? Math.min(flowWait + dt, 2 * BLOOD_FLOW_STEP) : 0;
+  for (; flowWait >= BLOOD_FLOW_STEP; flowWait -= BLOOD_FLOW_STEP) {
+    const src = wallBloodRTs[wallBloodCur].texture;
+    drainMat.uniforms.uSrc.value = flowMat.uniforms.uSrc.value = src;
+    flowMat.uniforms.uKeep.value = Math.exp(-BLOOD_FLOW_STEP / BLOOD_WALL_DRY_TAU);
+    renderer.setRenderTarget(bloodMap);
+    renderer.render(drainScene, bloodCam);
+    wallBloodCur ^= 1;
+    renderer.setRenderTarget(wallBloodRTs[wallBloodCur]);
+    renderer.render(flowScene, bloodCam);
+  }
+  wallBloodTex.value = wallBloodRTs[wallBloodCur].texture;
+  // the floor and the platform's top: drying, then new stains
+  const dry = (bloodDryWait += dt) >= BLOOD_DRY_STEP;
+  if (dry) { dryMat.uniforms.uKeep.value = Math.exp(-bloodDryWait / BLOOD_DRY_TAU); bloodDryWait = 0; }
+  renderer.setRenderTarget(topBloodMap);
+  if (dry) renderer.render(dryScene, bloodCam);
+  topStamps.draw();
+  renderer.setRenderTarget(bloodMap);
+  if (dry) renderer.render(dryScene, bloodCam);
+  floorStamps.draw();
+  renderer.setRenderTarget(target);
+  renderer.autoClear = autoClear;
+  probeFeet();
+}
+// Feet in the blood: the game needs to know where the blood is, which only the GPU does, so each frame it samples the
+// floor's map under every foot (you and each demon: BLOOD_PROBES at most), the most blood and wet blood within a texel
+// of it, into a strip of texels read back without waiting (it lands a frame or two later; feet move slowly).
+// Stepping in wet blood soaks the boots (or claws): each step after leaves a print, fainter each time
+// (BOOT_KEEP), till they're clean. In wet blood, a step squelches.
+const BLOOD_PROBES = 256, BOOT_KEEP = 0.8, BOOT_PRINT = 0.9; // probes, of the soaking kept a print, a print's blood (soaked)
+const PRINT_STRIDE = 0.8; // m: your feet come down this far apart (your step sound's every STEP_LENGTH: not every foot)
+const feetRT = new THREE.WebGLRenderTarget(BLOOD_PROBES, 1, { type: THREE.FloatType, depthBuffer: false });
+const feetGeo = new THREE.BufferGeometry();
+feetGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(BLOOD_PROBES * 3), 3));
+feetGeo.setAttribute('aXZ', new THREE.Float32BufferAttribute(new Float32Array(BLOOD_PROBES * 2), 2).setUsage(THREE.DynamicDrawUsage));
+feetGeo.setAttribute('aIdx', new THREE.Float32BufferAttribute(Float32Array.from({ length: BLOOD_PROBES }, (_, i) => i), 1));
+const feetMat = new THREE.ShaderMaterial({
+  uniforms: { uMap: floorBloodTex }, depthTest: false, depthWrite: false,
+  vertexShader: `
+    attribute vec2 aXZ;
+    attribute float aIdx;
+    flat out vec2 vXZ;
+    void main() { vXZ = aXZ; gl_Position = vec4((aIdx + 0.5) / ${BLOOD_PROBES}.0 * 2.0 - 1.0, 0.0, 0.0, 1.0); gl_PointSize = 1.0; }`,
+  fragmentShader: `
+    uniform sampler2D uMap;
+    flat in vec2 vXZ;
+    void main() {
+      ivec2 t = ivec2(floor((vXZ + ${ARENA.toFixed(1)}) * ${BLOOD_PX.toFixed(1)}));
+      vec2 b = vec2(0.0);
+      for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++)
+        b = max(b, texelFetch(uMap, clamp(t + ivec2(x, y), ivec2(0), ivec2(${BLOOD_RES - 1})), 0).rg);
+      gl_FragColor = vec4(b, 0.0, 1.0); // the most blood, the most wet blood
+    }`,
+});
+const feetPoints = new THREE.Points(feetGeo, feetMat), feetScene = new THREE.Scene();
+feetPoints.frustumCulled = false;
+feetScene.add(feetPoints);
+const feetBuf = new Float32Array(BLOOD_PROBES * 4);
+let probing = false;
+// what's under a foot (as last read): { depth, wet } (wet: how much of it, 0…1); you: player
+const player = { under: { depth: 0, wet: 0 }, boot: 0, foot: 1 };
+const offFloor = (x, z) => !onBloodFloor(x, 0, z) || platformDist(x, z) < PLATFORM_APOTHEM; // (the platform: not the floor's map)
+function probeFeet() { // after flushBlood: sample under every foot; read back (when the last read's back)
+  if (probing) return;
+  const who = [player, ...npcs.filter((n) => !n.dead).slice(0, BLOOD_PROBES - 1)], xz = feetGeo.attributes.aXZ.array;
+  who.forEach((w, i) => {
+    const p = w === player ? camera.position : w.imp.model.position;
+    xz[i * 2] = p.x; xz[i * 2 + 1] = p.z;
+  });
+  feetGeo.attributes.aXZ.needsUpdate = true;
+  feetGeo.setDrawRange(0, who.length);
+  const target = renderer.getRenderTarget();
+  renderer.setRenderTarget(feetRT);
+  renderer.render(feetScene, bloodCam);
+  renderer.setRenderTarget(target);
+  probing = true;
+  renderer.readRenderTargetPixelsAsync(feetRT, 0, 0, BLOOD_PROBES, 1, feetBuf).then(() => {
+    who.forEach((w, i) => {
+      const p = w === player ? camera.position : w.imp.model.position;
+      const depth = offFloor(p.x, p.z) ? 0 : feetBuf[i * 4];
+      w.under = { depth, wet: depth > 0.01 ? Math.min(feetBuf[i * 4 + 1] / depth, 1) : 0 };
+      if (w.under.wet > 0.3 && depth > 0.1) w.boot = 1; // stepped in wet blood: soaked
+    });
+  }).finally(() => { probing = false; });
+}
+// is w (player or a demon) standing in wet blood (so its step squelches)?
+const inWetBlood = (w) => (w.under?.wet ?? 0) > 0.3 && (w.under?.depth ?? 0) > 0.1;
+// a foot of w's coming down at p, facing (fx, fz): its print, if its boots are bloody
+function footPrint(w, p, fx, fz, claw) {
+  w.foot = -(w.foot ?? 1);
+  if ((w.boot ?? 0) > 0.05 && !offFloor(p.x, p.z)) {
+    const side = claw ? 0.22 : 0.12, x = p.x + fz * side * w.foot, z = p.z - fx * side * w.foot; // its foot: left or right of its middle
+    const [hx, hy] = claw ? [0.2, 0.16] : [0.15, 0.065];
+    floorStamps.add(x / ARENA, z / ARENA, fx, fz, hx, hy, claw ? -2 : -1, BOOT_PRINT * w.boot);
+    w.boot *= BOOT_KEEP;
+  }
+}
+// A squelch: no recording yet, so made here: a short burst of noise through a band that sweeps down, a wet slap
+let squelchNoise = null; // (made on first use: the audio context comes later in the file)
+function playSquelch(level, pitch = 1) {
+  if (!squelchNoise) {
+    squelchNoise = audio.createBuffer(1, audio.sampleRate * 0.25, audio.sampleRate);
+    const d = squelchNoise.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const t = audio.currentTime, src = audio.createBufferSource(), band = audio.createBiquadFilter(), gain = audio.createGain();
+  src.buffer = squelchNoise;
+  band.type = 'bandpass'; band.Q.value = 3;
+  band.frequency.setValueAtTime(1600 * pitch * (0.9 + Math.random() * 0.2), t);
+  band.frequency.exponentialRampToValueAtTime(350 * pitch, t + 0.14);
+  gain.gain.setValueAtTime(0, t);
+  gain.gain.linearRampToValueAtTime(level, t + 0.006);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+  src.connect(band).connect(gain).connect(shotOut);
+  src.start(t);
+  src.stop(t + 0.25);
+}
+
+// A surface's material reads a blood map: where there's blood, its colour, gloss and bulge replace the steel's.
+// Thin blood is a film the steel shows through, its reflection tinted (as the stickers' multiply did): BLOOD_FILM
+// wet and dry; thick blood hides it, an opaque coat (BLOOD_COAT wet and dry), glossy while wet
+const bloodSrgb = (r, g, b) => new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace);
+const BLOOD_FILM = [new THREE.Color(0.62, 0.04, 0.06), new THREE.Color(0.28, 0.035, 0.035)];
+const BLOOD_COAT = [bloodSrgb(0.66, 0.02, 0.035), bloodSrgb(0.3, 0.03, 0.025)]; // paint red; dried, darker
+const BLOOD_RELIEF = 4; // how steep its edges bulge
+// where this pixel is in the map: GLSL that sets bOn, bt (its texel), and the surface's world normal bN and the
+// directions its texels run along, bU (x) and bV (y); vBloodW: its world position
+const FLOOR_BLOOD_AT = `
+  if (vBloodW.y < 0.05 && max(abs(vBloodW.x), abs(vBloodW.z)) < ${ARENA.toFixed(1)}) { // (the ceiling shares materials)
+    bOn = true;
+    bt = ivec2(floor((vBloodW.xz + ${ARENA.toFixed(1)}) * ${BLOOD_PX.toFixed(1)}));
+  }`;
+const TOP_BLOOD_AT = `
+  if (abs(vBloodW.y - ${PLATFORM_H.toFixed(2)}) < 0.05 && max(abs(vBloodW.x), abs(vBloodW.z)) < ${TOP_BLOOD_HALF.toFixed(1)}) {
+    bOn = true;
+    bt = ivec2(floor((vBloodW.xz + ${TOP_BLOOD_HALF.toFixed(1)}) * ${BLOOD_PX.toFixed(1)}));
+  }`;
+const WALL_BLOOD_AT = `
+  if (vBloodW.y >= 0.0 && vBloodW.y < ${(WALL_ROWS * TILE).toFixed(1)}) {
+    vec3 p = vBloodW;
+    const float A = ${ARENA.toFixed(1)}, PX = ${BLOOD_PX.toFixed(1)};
+    int v = int(floor(p.y * PX));
+    bV = vec3(0.0, 1.0, 0.0);
+    if (abs(p.x) > A - 0.05 && abs(p.z) < A) {
+      bOn = true; bt = ivec2(floor((p.z + A) * PX), (p.x > 0.0 ? 0 : 1) * ${WALL_BLOOD_ROWS} + v);
+      bN = vec3(-sign(p.x), 0.0, 0.0); bU = vec3(0.0, 0.0, 1.0);
+    } else if (abs(p.z) > A - 0.05 && abs(p.x) < A) {
+      bOn = true; bt = ivec2(floor((p.x + A) * PX), (p.z > 0.0 ? 2 : 3) * ${WALL_BLOOD_ROWS} + v);
+      bN = vec3(0.0, 0.0, -sign(p.z)); bU = vec3(1.0, 0.0, 0.0);
+    } else if (p.y < ${PLATFORM_H.toFixed(2)} && length(p.xz) < ${(PLATFORM_APOTHEM / Math.cos(Math.PI / 8) + 0.1).toFixed(2)}) { // a platform side?
+      for (int f = 0; f < 8; f++) {
+        float a = float(f) * ${(Math.PI / 4).toFixed(6)};
+        vec2 n = vec2(sin(a), cos(a)), tg = vec2(cos(a), -sin(a));
+        float s = dot(p.xz, tg);
+        if (abs(dot(p.xz, n) - ${PLATFORM_APOTHEM.toFixed(4)}) < 0.05 && abs(s) <= ${(PLATFORM_SIDE / 2).toFixed(2)}) {
+          bOn = true;
+          bt = ivec2(f * ${PLAT_FACE_PX} + int(floor((s + ${(PLATFORM_SIDE / 2).toFixed(2)}) * PX)), ${5 * WALL_BLOOD_ROWS} + v);
+          bN = vec3(n.x, 0.0, n.y); bU = vec3(tg.x, 0.0, tg.y);
+        }
+      }
+    } else {
+      ${COLUMNS.map((c, k) => `{
+        vec2 d = p.xz - vec2(${c.x.toFixed(1)}, ${c.y.toFixed(1)});
+        float f = mod(floor(atan(d.x, d.y) / ${(Math.PI / 4).toFixed(6)} + 0.5) + 8.0, 8.0), a = f * ${(Math.PI / 4).toFixed(6)};
+        vec2 n = vec2(sin(a), cos(a)), tg = vec2(cos(a), -sin(a));
+        float s = dot(d, tg);
+        if (abs(dot(d, n) - ${COLUMN_APOTHEM.toFixed(4)}) < 0.05 && abs(s) <= ${(COLUMN_SIDE / 2).toFixed(2)}) {
+          bOn = true;
+          bt = ivec2(${k * COLUMN_PX} + int(f) * ${FACE_PX} + int(floor((s + ${(COLUMN_SIDE / 2).toFixed(2)}) * PX)), ${4 * WALL_BLOOD_ROWS} + v);
+          bN = vec3(n.x, 0.0, n.y); bU = vec3(tg.x, 0.0, tg.y);
+        }
+      }`).join('\n      ')}
+    }
+  }`;
+// (declared, not const: the floor and walls are built, and call these, before the maps exist; the maps are only
+// read once the shaders compile, at the first frame)
+function addBlood(mat, kind) { // kind: 'floor', 'top' (the platform's) or 'wall'
+  if (mat.userData.blood) return; // (materials are shared: once each)
+  mat.userData.blood = true;
+  const before = mat.onBeforeCompile, key = mat.customProgramCacheKey;
+  mat.customProgramCacheKey = () => `${key ? key.call(mat) : ''}:blood:${kind}`;
+  mat.onBeforeCompile = (shader, r) => {
+    before?.(shader, r);
+    const at = { wall: WALL_BLOOD_AT, top: TOP_BLOOD_AT, floor: FLOOR_BLOOD_AT }[kind];
+    shader.uniforms.uBloodTex = { wall: wallBloodTex, top: topBloodTex, floor: floorBloodTex }[kind];
+    const c = (v) => `vec3(${v.r.toFixed(4)}, ${v.g.toFixed(4)}, ${v.b.toFixed(4)})`;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vBloodW;')
+      .replace('#include <project_vertex>', `#include <project_vertex>
+  {
+    vec4 bw = vec4(transformed, 1.0);
+    #ifdef USE_INSTANCING
+      bw = instanceMatrix * bw;
+    #endif
+    vBloodW = (modelMatrix * bw).xyz;
+  }`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+uniform sampler2D uBloodTex;
+varying vec3 vBloodW;
+float bloodDepth(ivec2 t) { // how thick the blood stands at a texel: piles up, levelling off
+  return 1.0 - exp(-1.5 * texelFetch(uBloodTex, clamp(t, ivec2(0), textureSize(uBloodTex, 0) - 1), 0).r);
+}`)
+      .replace('#include <lights_physical_fragment>', `
+  float bloodOn = 0.0;
+  {
+    bool bOn = false;
+    ivec2 bt = ivec2(0);
+    vec3 bN = vec3(0.0, 1.0, 0.0), bU = vec3(1.0, 0.0, 0.0), bV = vec3(0.0, 0.0, 1.0);
+#ifdef USE_SPECULAR_INTENSITYMAP
+    vec2 bUvX = dFdx(vSpecularIntensityMapUv), bUvY = dFdy(vSpecularIntensityMapUv); // (here: before any branching)
+    vec3 bWX = dFdx(vBloodW), bWY = dFdy(vBloodW);
+#endif
+    ${at}
+    vec2 b = bOn ? texelFetch(uBloodTex, bt, 0).rg : vec2(0.0);
+    // Holes: the vents and slits are bottomless, so blood falls through: none over a hole (the tile's specular strength
+    // is 0 there: its ORM alpha, see tools/plate_textures.py), and round one the blood ends in the same border it has
+    // where it meets bare floor (the hole counts as no blood when its surface is worked out: see g below; it's the
+    // blood's own edge, not the tile's normal map). solid(o): is the surface o blood texels along (bU, bV) solid? Its uv
+    // there, from how the surface's uv and world position change across the screen (the tiles lie at random quarter
+    // turns, so the map's axes aren't the uv's)
+    vec2 bStepU = vec2(0.0), bStepV = vec2(0.0);
+#ifdef USE_SPECULAR_INTENSITYMAP
+    if (texture2D(specularIntensityMap, vSpecularIntensityMapUv).a < 0.5) b = vec2(0.0);
+    mat2 bW = mat2(dot(bWX, bU), dot(bWX, bV), dot(bWY, bU), dot(bWY, bV)); // world (along bU, bV) per screen x, y
+    if (abs(determinant(bW)) > 1e-12) {
+      mat2 bJ = mat2(bUvX, bUvY) * inverse(bW); // world (m) → uv
+      bStepU = bJ * vec2(${(1 / BLOOD_PX).toFixed(5)}, 0.0); bStepV = bJ * vec2(0.0, ${(1 / BLOOD_PX).toFixed(5)});
+    }
+    #define BLOOD_SOLID(o) step(0.5, textureLod(specularIntensityMap, vSpecularIntensityMapUv + bStepU * float(o.x) + bStepV * float(o.y), 0.0).a)
+#else
+    #define BLOOD_SOLID(o) 1.0
+#endif
+    if (b.r > 0.01) {
+      bloodOn = 1.0;
+      float thick = bloodDepth(bt);
+      // wet: how much of its blood is still wet; the thin edges dry first, the thick middle last (the coffee ring)
+      float wet = smoothstep(0.05, 0.5, clamp(b.g / b.r, 0.0, 1.0) * (0.5 + 1.5 * thick));
+      float deep = smoothstep(0.05, 0.35, thick); // 0: a film over the steel; 1: an opaque coat (most of it: paint)
+      vec3 film = diffuseColor.rgb * mix(${c(BLOOD_FILM[1])}, ${c(BLOOD_FILM[0])}, wet), coat = mix(${c(BLOOD_COAT[1])}, ${c(BLOOD_COAT[0])}, wet);
+      diffuseColor.rgb = mix(film, coat, deep);
+      metalnessFactor *= 1.0 - deep;
+      roughnessFactor = mix(mix(max(roughnessFactor, 0.6), 0.75, deep), mix(0.15, 0.06, deep), wet);
+      // its surface: from how its depth changes to the neighbouring texels (per texel: the surface's chunky pixels)
+      // (a hole next to it counts as no blood, as bare floor does: the border)
+      #define BLOOD_H(o) (bloodDepth(bt + o) * BLOOD_SOLID(o))
+      vec2 g = vec2(BLOOD_H(ivec2(1, 0)) - BLOOD_H(ivec2(-1, 0)), BLOOD_H(ivec2(0, 1)) - BLOOD_H(ivec2(0, -1))) * 0.5;
+      vec3 nBlood = normalize((viewMatrix * vec4(normalize(bN - (g.x * bU + g.y * bV) * ${BLOOD_RELIEF.toFixed(1)}), 0.0)).xyz);
+      // wet, it's its own surface (bulging at its edges); dried, a crust that follows the surface under it: its normal
+      // map's bumps and grooves (normal here is still the surface's)
+      normal = normalize(mix(normal, nBlood, wet));
+      totalEmissiveRadiance *= 0.1; // a lamp under it barely shows
+    }
+  }
+#include <lights_physical_fragment>
+  if (bloodOn > 0.0) { // the coat's a liquid's (or dried blood's) sheen, the film's the steel's tinted; no brush streaks
+    material.specularColor = mix(vec3(0.04), diffuseColor.rgb, metalnessFactor);
+    material.specularF90 = 1.0;
+#ifdef USE_ANISOTROPY
+    material.anisotropy = 0.0;
+    material.alphaT = pow2(material.roughness);
+#endif
+  }`);
+  };
+}
+function addFloorBlood(mat) { addBlood(mat, 'floor'); }
+function addWallBlood(mat) { addBlood(mat, 'wall'); }
+function addTopBlood(mat) { addBlood(mat, 'top'); }
+
 // Blood, thrown like paint: a hit bursts FL_GOBS gobs up and out of the demon, fanned all round the wound,
 // simulated as a fluid with Position Based Fluids (Macklin & Müller 2013). A gob is a packet of particles at rest spacing FL_SPACING, launched front faster than back, so it stretches
 // as it flies. Each step, every particle's density (from its neighbours within FL_H) is pushed towards the rest
@@ -1850,7 +2443,7 @@ const FL_ELEVATION = [0.5, 1.2]; // rad, how steeply each gob is thrown up (from
 const FL_MAX_MOVE = 0.1 * FL_SPACING; // m, most a particle's moved per solver pass
 const FL_VISCOSITY = 0.3, FL_COHESION = 0.4, FL_EPS = 50 * (0.065 / FL_H) ** 2; // XSPH share per step; most density deficit pulled
 // in; relaxation (the constraint gradients grow as 1/reach², so it does too: tuned at a 0.065 m reach)
-const FL_GOBS = 6, FL_GOB_R = 0.025, FL_GOB_LEN = 0.15, FL_SPREAD = 0.35, FL_DECAL_EVERY = 60; // per hit, m, m, back slower by, 1 in
+const FL_GOBS = 6, FL_GOB_R = 0.025, FL_GOB_LEN = 0.15, FL_SPREAD = 0.35, FL_DECAL_EVERY = 16; // per hit, m, m, back slower by, 1 in
 // Stains: where a gob's splat lands, one big stain about its size: the stain's body is a quarter of its size (its
 // fingers reach ~0.6), so STAIN_SHARE of the drawn splat's half-size makes the body as wide as the splat's solid
 // centre (SHEET_CORE) and the fingers reach its arms; every FL_DECAL_EVERY'th stray particle leaves a small satellite
@@ -2152,7 +2745,36 @@ const SHEET_GRID = 8; // quads per side the sheet is split into, so it can bend
 const SHEET_THIN = 0.06, SHEET_THICK = 0.35; // paint thickness (web cells) from translucent scarlet to near-black maroon
 const SHEET_TRANSLUCENT = 0.1, SHEET_GLOSS = 120, SHEET_GLINT = 0.9; // light through thin paint; glint tightness, strength
 const SHEET_RELIEF = 1.5; // how tall the paint stands (in blood pixels per unit height): more, the deeper its shading
-const SHEET_EDGE = 0.75; // how far in from every contour the paint rises (share of a shape's depth: 1 is its middle)
+// The paint's rim: a bevel rising from every contour over SHEET_BEVEL blood pixels, flat beyond it (the paint is 2D:
+// nothing bulges). Its width is the same all round every shape, whatever the balls under it: the balls set the
+// outline, not the surface. Its tilt is capped (SHEET_BEVEL_TILT, height per blood pixel) so the rim facing the light
+// catches a clean, continuous glint; and the outermost blood pixel on that side gets a highlight of its own
+// Each splat is a small pixel-art texture: its paint is baked each frame into its own SHEET_TEXELS-square tile of
+// sheetAtlas (one blood pixel a texel, each worked out once whatever the splat's size on screen), then its card is
+// drawn in the scene at full resolution, reading its tile without interpolation: crisp blood pixels that shrink with
+// distance like the splat does (down to screen pixels, past which its finest bits drop out)
+const SHEET_TEXELS = 128, SHEET_ATLAS_COLS = 16, SHEET_ATLAS_ROWS = Math.ceil(SHEET_MAX / SHEET_ATLAS_COLS);
+const SHEET_BEVEL = 1.5, SHEET_BEVEL_TILT = 0.6, SHEET_EDGE_LIGHT = 0.3; // blood px; most slope; the lit edge's strength
+// The splat's shape is a Worley web (as below); the paint itself is 2D metaballs packed into it, so the shape is
+// drawn in liquid at a resolution: a jittered grid of SHEET_BALLS balls per web cell side, each as big as how deep in
+// the shape its centre is (full inside, shrinking to nothing at the edge, none outside). Each ball's influence fades
+// out to SHEET_REACH times its radius; the paint is wherever their sum passes 0.5. Inside the shape the balls overlap
+// into solid paint; where the shape is thin (a strand barely a ball wide) they bead up into chains with stretched
+// necks, which part as the strand thins: not threads, but flung liquid. More balls: the shape held closer, finer
+// beads; fewer: chunkier, breaking sooner
+const SHEET_BALLS = 8, SHEET_BALL_JITTER = 0.3, SHEET_BALL_EDGE = 4; // per web cell side; how far off its grid point
+// (share of a step); how fast a ball reaches full size going into the shape (1 / share of the shape's depth)
+const SHEET_REACH = 2.2; // a ball's influence's reach (radii)
+// The hybrid (SHEET_MODE 0; M in debug mode cycles it, the dense metaballs (1), and the web alone (2)): cheaper. A few big metaballs for the splotches, shrinking as
+// the sheet ages, the web's strands (one Worley lookup a pixel, not one per ball) joining them, thick near them and
+// thinning away, and both merged as distances with a smooth minimum, so strands flow into the splotches in a fillet.
+// How many balls; how far out from the middle (of the sheet's half-size); their radii; how much they shrink by the
+// end; how softly they merge with each other, and with the strands (sheet units); how far from them the web reaches
+const HYB_BALLS = 5, HYB_SPREAD = 0.45, HYB_R_MIN = 0.07, HYB_R_MAX = 0.2, HYB_SHRINK = 0.7;
+const HYB_BALL_K = 0.12, HYB_BLEND = 0.06, HYB_WEB_REACH = 0.25;
+const HYB_ROUND = [0, 1]; // how much the balls are shaded as domes: new (flat), and late in life (balled up; see nDome)
+let sheetMode = 0; // see SHEET_MODES
+const SHEET_MODES = ['hybrid', 'metaballs', 'worley'];
 const SHEET_CELLS = 2.4, SHEET_WEB = 0.17; // web cells across the sheet's half-size; filament half-width (in cells), new
 const SHEET_WARP = 0.6, SHEET_LUMPS = 0.6; // how far (in cells) smooth noise bends the web; how much strands swell and pinch
 const SHEET_FLOW = 3, SHEET_SPREAD = 0.5; // how fast (noise units/s) the warp flows, so the arms writhe; how far (in
@@ -2208,8 +2830,14 @@ const sheetAttr = (name, n) => {
 const shAttrA = sheetAttr('aA', 3), shAttrB = sheetAttr('aB', 3), shAttrLight = sheetAttr('aLight', 3), shAttrLightDir = sheetAttr('aLightDir', 3);
 const shAttrSeed = sheetAttr('aSeed', 1), shAttrAge = sheetAttr('aAge', 1);
 sheetGeo.instanceCount = 0;
+// random texels, for the splats' noise: a fetch is cheaper than hashing with sin (the shader needs hundreds a pixel)
+const NOISE_SIZE = 256;
+const noiseTex = Object.assign(new THREE.DataTexture(
+  Uint8Array.from({ length: NOISE_SIZE * NOISE_SIZE * 4 }, () => Math.random() * 256), NOISE_SIZE, NOISE_SIZE), {
+  wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping, magFilter: THREE.LinearFilter, minFilter: THREE.LinearFilter, needsUpdate: true });
 const sheetMat = new THREE.ShaderMaterial({
   uniforms: {
+    uNoise: { value: noiseTex },
     uThin: { value: srgb(0.7, 0.03, 0.05) }, uThick: { value: srgb(0.25, 0.0, 0.02) }, // albedo: thin film, thick paint
     uFogColor: gooMat.uniforms.uFogColor, uFogDensity: gooMat.uniforms.uFogDensity,
   },
@@ -2217,7 +2845,7 @@ const sheetMat = new THREE.ShaderMaterial({
     attribute vec2 corner;
     attribute vec3 aA, aB, aLight, aLightDir;
     attribute float aSeed, aAge;
-    varying vec2 vUv, vS;
+    varying vec2 vUv, vS, vDir, vFit; // vDir: the card's x axis on screen (its y: vDir turned left); vFit: see fit
     varying vec3 vLight, vLightDir;
     varying float vSeed, vAge, vZ;
     void main() {
@@ -2237,19 +2865,24 @@ const sheetMat = new THREE.ShaderMaterial({
       c.z += ${SHEET_CURL.toFixed(2)} * size * (up * up + 0.6 * vS.x * vS.x * up);
       vUv = corner; vSeed = aSeed; vAge = aAge; vZ = -c.z;
       vLight = min(aLight, vec3(${SHEET_LIGHT_MAX.toFixed(1)})); // capped, as for the casings (see CASE_LIGHT_MAX)
-      gl_Position = projectionMatrix * c; // facing you, along the rope as you see it
+      // baked flat into its tile of the atlas (see SHEET_TEXELS), not drawn on screen: it's sheetCards that are
+      vec2 tile = vec2(mod(float(gl_InstanceID), ${SHEET_ATLAS_COLS}.0), floor(float(gl_InstanceID) / ${SHEET_ATLAS_COLS}.0));
+      // by its proportions, so its blood pixels are square: its long side the tile's width, the other side less
+      vec2 fit = half_ / max(half_.x, half_.y);
+      vDir = dir; vFit = fit;
+      gl_Position = vec4((tile + (corner * fit) * 0.5 + 0.5) / vec2(${SHEET_ATLAS_COLS}.0, ${SHEET_ATLAS_ROWS}.0) * 2.0 - 1.0, 0.0, 1.0);
     }`,
   fragmentShader: `
     uniform vec3 uThin, uThick, uFogColor;
     uniform float uFogDensity;
-    varying vec2 vUv, vS;
+    varying vec2 vUv, vS, vDir, vFit; // vDir: the card's x axis on screen (its y: vDir turned left); vFit: see fit
     varying vec3 vLight, vLightDir;
     varying float vSeed, vAge, vZ;
-    vec2 hash2(vec2 p) { return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
-    float vnoise(vec2 p) { // smooth value noise, about -1..1
+    uniform sampler2D uNoise;
+    vec2 hash2(vec2 p) { return texelFetch(uNoise, ivec2(mod(floor(p), ${NOISE_SIZE}.0)), 0).xy; } // 0..1, per whole p
+    float vnoise(vec2 p) { // smooth value noise, about -1..1: the texture's own blend, between texels eased (smoothstep)
       vec2 i = floor(p), f = fract(p), u = f * f * (3.0 - 2.0 * f);
-      float a = hash2(i).x, b = hash2(i + vec2(1.0, 0.0)).x, c = hash2(i + vec2(0.0, 1.0)).x, d = hash2(i + vec2(1.0)).x;
-      return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 2.0 - 1.0;
+      return textureLod(uNoise, (i + u + 0.5) / ${NOISE_SIZE}.0, 0.0).z * 2.0 - 1.0;
     }
     float fbm(vec2 p) { return vnoise(p) * 0.65 + vnoise(p * 2.3 + 7.1) * 0.35; }
     vec3 worley(vec2 p) { // distances to the nearest three feature points: F1, F2, F3
@@ -2262,14 +2895,17 @@ const sheetMat = new THREE.ShaderMaterial({
       }
       return sqrt(vec3(d1, d2, d3));
     }
-    // how far inside the paint a point of the sheet is: > 0 is paint, about 1 deep in a shape's middle
-    float paint(vec2 uv, out float thick) {
+    // the shape (the metaballs' blueprint): how far inside it a point of the sheet is, > 0 inside, about 1 deep in a
+    // shape's middle; and its paint thickness there
+    // a direction in the baked tile (the card's axes: x along its rope) as it is on screen, view space's x, y
+    vec2 toView(vec2 v) { return vDir * v.x + vec2(-vDir.y, vDir.x) * v.y; }
+    float shapeAt(vec2 uv, out float thick) {
       float r2 = dot(uv, uv);
       thick = 0.0;
       if (r2 > 1.0) return -1.0;
-      // paint (> 0) on three kinds of shape, all thinning towards the rim and as the sheet ages: filaments on the
-      // cell borders (F2 − F1 small), fat knots where three cells meet (F3 − F1 small), and a solid patch at the
-      // centre whose edge wobbles with the cells
+      // three kinds of shape, all thinning towards the rim and as the sheet ages: filaments on the cell borders
+      // (F2 − F1 small), fat knots where three cells meet (F3 − F1 small), and a solid patch at the centre whose edge
+      // wobbles with the cells
       float thin = max((1.0 - vAge / ${SHEET_LIFE.toFixed(2)}) * (1.0 - r2), 1e-4);
       // Worley's cell borders are straight lines; bending its coordinates with smooth noise first (a domain warp)
       // curves them into wandering strands, and more noise swells and pinches each strand along its length
@@ -2293,25 +2929,109 @@ const sheetMat = new THREE.ShaderMaterial({
       thick = max(max(strand * wStrand, knot * wKnot), core * wCore);
       return max(strand, max(knot, core));
     }
-    // the paint's height there: flat at the core, rising gradually towards the edges (paint pooled into a raised
-    // rim), then dropping off at the contour itself (thin strands are all rim)
-    float height(float inside) {
-      float e = clamp(inside / ${SHEET_EDGE.toFixed(2)}, 0.0, 1.0); // 0 on the contour, 1 in the flat core
-      return (0.35 + 0.65 * (1.0 - smoothstep(0.1, 1.0, e))) * smoothstep(0.0, 0.12, e);
+    // the paint: the metaballs packed into the shape (see SHEET_BALLS). How far inside it a point is (0 on its
+    // contour, about 1 deep in a ball's middle), its thickness (the shape's, where the balls came from), and how that
+    // depth changes across the sheet (its slope, for the shading: worked out with the sum, so it's one pass)
+    float paint(vec2 uv, out float thick, out vec2 grad) {
+      thick = 0.0; grad = vec2(0.0);
+      if (dot(uv, uv) > 1.0) return -1.0;
+      const float STEP = ${(1 / (SHEET_CELLS * SHEET_BALLS)).toFixed(4)}; // the balls' grid step (sheet units)
+      // a full ball: overlapping its neighbours (solid), but reaching no further than the 3 × 3 grid cells round here
+      const float R_FULL = ${((1.5 - SHEET_BALL_JITTER / 2) * 0.98).toFixed(3)} * STEP;
+      vec2 g0 = floor(uv / STEP);
+      float f = 0.0, tw = 0.0, tSum = 0.0;
+      for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+        vec2 cell = g0 + vec2(x, y);
+        vec2 c = (cell + 0.5 + ${SHEET_BALL_JITTER.toFixed(2)} * (hash2(cell + vSeed) - 0.5)) * STEP; // its centre
+        float sThick, sIn = shapeAt(c, sThick);
+        float R = R_FULL * clamp(sIn * ${SHEET_BALL_EDGE.toFixed(1)}, 0.0, 1.0); // its reach: by its depth in the shape
+        if (R <= 0.0) continue;
+        vec2 dp = uv - c;
+        float d2 = dot(dp, dp) / (R * R);
+        if (d2 >= 1.0) continue;
+        float w = 1.0 - d2;
+        f += w * w * w;
+        grad -= 6.0 * w * w * dp / (R * R);
+        tw += w * w * w; tSum += w * w * w * sThick;
+      }
+      thick = tw > 0.0 ? tSum / tw : 0.0;
+      grad *= 2.0; // of (f − 0.5) / 0.5
+      return (f - 0.5) / 0.5;
     }
+    #if SHEET_MODE == 0
+    float smin(float a, float b, float k) { float h = max(k - abs(a - b), 0.0) / k; return min(a, b) - h * h * k * 0.25; }
+    // the hybrid's paint (see HYB_BALLS): how far inside (sheet units, a distance: < 0 outside) and the thickness
+    vec3 hybBall; float hybBallW; // the nearest ball (centre, radius), and how much it, not the web, shapes this spot
+    float paintHybrid(vec2 uv, out float thick) {
+      thick = 0.0;
+      float r2 = dot(uv, uv), t = vAge / ${SHEET_LIFE.toFixed(2)};
+      if (r2 > 1.0) return -1.0;
+      // the splotches: balls round the middle, drifting out and shrinking as it ages, merged softly
+      float dB = 1e3, nearest = 1e3;
+      for (int k = 0; k < ${HYB_BALLS}; k++) {
+        vec2 h = hash2(vec2(vSeed, float(k) + 0.5)), g = hash2(vec2(float(k) + 3.7, vSeed));
+        float ang = h.x * 6.283, out_ = sqrt(h.y);
+        vec2 c = vec2(cos(ang), sin(ang)) * out_ * ${HYB_SPREAD.toFixed(2)} * (1.0 + ${SHEET_SPREAD.toFixed(2)} * t);
+        float R = mix(${HYB_R_MIN.toFixed(2)}, ${HYB_R_MAX.toFixed(2)}, g.x) * (1.0 - 0.5 * out_) * (1.0 - ${HYB_SHRINK.toFixed(2)} * t);
+        float db = length(uv - c) - R;
+        if (db < nearest) { nearest = db; hybBall = vec3(c, R); }
+        dB = smin(dB, db, ${HYB_BALL_K.toFixed(2)});
+      }
+      // the web (as shapeAt's: bent cell borders, swelling and pinching), thick near the splotches, gone away from them
+      vec2 q = uv * ${SHEET_CELLS.toFixed(1)} + vSeed;
+      float flow = vAge * ${SHEET_FLOW.toFixed(1)};
+      q -= uv * ${SHEET_SPREAD.toFixed(2)} * ${SHEET_CELLS.toFixed(1)} * t;
+      q += ${SHEET_WARP.toFixed(2)} * vec2(fbm(q * 0.6 + vec2(flow, 0.0)), fbm(q * 0.6 + 31.7 - vec2(0.0, flow)));
+      vec3 F = worley(q);
+      float near = exp(-max(dB, 0.0) / ${HYB_WEB_REACH.toFixed(2)}) * max((1.0 - t) * (1.0 - r2), 0.0);
+      float wS = ${SHEET_WEB.toFixed(2)} * near * (1.0 + ${SHEET_LUMPS.toFixed(2)} * vnoise(q * 2.7 + 13.3)), wK = ${SHEET_KNOT.toFixed(2)} * near;
+      float dW = min(F.y - F.x - wS, F.z - F.x - wK) * 0.5 / ${SHEET_CELLS.toFixed(1)}; // (cells to sheet units)
+      float d = smin(dB, dW, ${HYB_BLEND.toFixed(2)});
+      hybBallW = clamp(0.5 + 0.5 * (dW - dB) / ${HYB_BLEND.toFixed(2)}, 0.0, 1.0);
+      thick = max(-d, 0.0) * ${SHEET_CELLS.toFixed(1)}; // in web cells, as shapeAt's
+      return -d;
+    }
+    #endif
     void main() {
-      // the uv at the centre of this fragment's ${GOO_PIXEL} px block: the blood's chunky pixels
-      vec2 dp = (floor(gl_FragCoord.xy / ${GOO_PIXEL.toFixed(1)}) + 0.5) * ${GOO_PIXEL.toFixed(1)} - gl_FragCoord.xy;
-      vec2 uv = vUv + dFdx(vUv) * dp.x + dFdy(vUv) * dp.y;
-      vec2 ex = dFdx(vUv) * ${GOO_PIXEL.toFixed(1)}, ey = dFdy(vUv) * ${GOO_PIXEL.toFixed(1)}; // one blood pixel (before any discard)
-      float thick, unused;
-      float inside = paint(uv, thick);
-      if (inside <= 0.0) discard;
-      // lit from the main light's direction: the slope comes from the height one blood pixel to the right and up
-      // (screen x, y, which are view space's), so the rim facing the light is bright and the far side shadowed
-      float h = height(inside);
-      float gx = height(paint(uv + ex, unused)) - h, gy = height(paint(uv + ey, unused)) - h;
-      vec3 nPaint = normalize(vec3(-gx, -gy, 1.0 / ${SHEET_RELIEF.toFixed(1)}));
+      // baked into the atlas, one fragment per blood pixel (see SHEET_TEXELS)
+      vec2 uv = vUv, ex = dFdx(vUv), ey = dFdy(vUv); // here; one blood pixel right, and up (before any discard)
+      float thick;
+      #if SHEET_MODE == 1
+      vec2 grad;
+      float inside = paint(uv, thick, grad); // the dense metaballs
+      vec2 gs = vec2(dot(grad, ex), dot(grad, ey)); // the depth's change over one blood pixel right, and up
+      #else
+      #if SHEET_MODE == 0
+      float inside = paintHybrid(uv, thick);
+      #else
+      float inside = shapeAt(uv, thick); // the web alone
+      #endif
+      vec2 gs = vec2(dFdx(inside), dFdy(inside)); // its change over one blood pixel right, and up
+      #endif
+      // The rim (see SHEET_BEVEL): how many blood pixels in from the edge this is, from the field's depth over its
+      // slope (screen x, y: view space's), and which way is inward. A bevel over the first SHEET_BEVEL of them, its
+      // slope pointing straight in from the edge (so it turns smoothly along the contour), flat beyond
+      float gl = max(length(gs), 1e-4);
+      vec2 inward = toView(gs / gl); // (the tile's axes are the card's: see toView)
+      float edgePx = inside / gl;
+      if (edgePx <= 0.0) discard;
+      float x = clamp(edgePx / ${SHEET_BEVEL.toFixed(1)}, 0.0, 1.0);
+      float h = x * x * (3.0 - 2.0 * x); // 0 on the edge, 1 on the flat
+      vec2 g = min(6.0 * x * (1.0 - x) / ${SHEET_BEVEL.toFixed(1)}, ${SHEET_BEVEL_TILT.toFixed(2)}) * inward; // its slope
+      vec3 nPaint = normalize(vec3(-g, 1.0 / ${SHEET_RELIEF.toFixed(1)}));
+      #if SHEET_MODE == 0
+      // Where a ball shapes the paint, it's shaded as a dome (its normal a sphere's), so the light, its shadow side
+      // and the glint fall as on a bead: more so as it ages, surface tension balling it up (see HYB_ROUND)
+      {
+        vec2 dv = (uv - hybBall.xy) / max(hybBall.z, 1e-4);
+        float r = min(length(dv), 0.97);
+        vec2 dTile = r > 1e-4 ? normalize(dv * vFit) * r : vec2(0.0);
+        vec3 nDome = vec3(toView(dTile), sqrt(1.0 - r * r));
+        float round_ = hybBallW * mix(${HYB_ROUND[0].toFixed(2)}, ${HYB_ROUND[1].toFixed(2)}, smoothstep(0.0, 0.7, vAge / ${SHEET_LIFE.toFixed(2)}));
+        nPaint = normalize(mix(nPaint, nDome, round_));
+        thick = mix(thick, max(thick, sqrt(1.0 - r * r) * ${SHEET_THICK.toFixed(2)}), round_); // deep in its middle
+      }
+      #endif
       // the flower's cup: flat where it hangs at the bottom, curving towards you higher up (and a little at the
       // sides up there), so it faces further down and out the higher it goes; the paint's own relief rides on it
       float up = clamp(vS.y * 0.5 + 0.5, 0.0, 1.0);
@@ -2326,17 +3046,75 @@ const sheetMat = new THREE.ShaderMaterial({
       float diffuse = max(dot(n, vLightDir) * 0.6 + 0.4, 0.0); // wrapped, so the unlit side isn't black
       float fresnel = pow(1.0 - clamp(n.z, 0.0, 1.0), 4.0);
       float spec = pow(max(dot(n, normalize(vLightDir + vec3(0.0, 0.0, 1.0))), 0.0), ${SHEET_GLOSS.toFixed(1)});
-      float glint = smoothstep(0.3, 0.6, spec) * (0.4 + 0.6 * h); // on or off per blood pixel, mostly on the rims
+      float glint = smoothstep(0.3, 0.6, spec); // on or off per blood pixel, mostly on the bevel facing the light
+      // the lit edge: the outermost blood pixel of every shape, on its side facing the light (threads: one bright edge)
+      float litEdge = step(edgePx, 1.0) * smoothstep(0.35, 0.75, dot(-inward, normalize(vLightDir.xy + vec2(1e-5))));
       vec3 lit = min(vLight, vec3(2.0)); // what a highlight reflects (capped, so a glint doesn't blow out the bloom)
       vec3 col = albedo * vLight * (0.25 + 0.75 * diffuse) * (1.0 - 0.5 * fresnel)
         + uThin * vLight * ${SHEET_TRANSLUCENT.toFixed(2)} * (1.0 - t) // light through the thin parts
-        + lit * (${SHEET_GLINT.toFixed(2)} * glint + 0.04 * fresnel);
-      gl_FragColor = vec4(mix(col, uFogColor, 1.0 - exp(-uFogDensity * uFogDensity * vZ * vZ)), 1.0);
+        + lit * (${SHEET_GLINT.toFixed(2)} * glint + 0.04 * fresnel)
+        + mix(uThin * 2.5 * vLight, lit, 0.3) * ${SHEET_EDGE_LIGHT.toFixed(2)} * litEdge; // the lit edge: wet scarlet, not white
+      gl_FragColor = vec4(col, 1.0); // (fog's added on the card: see sheetCards)
     }`,
 });
-const sheets = new THREE.Mesh(sheetGeo, sheetMat);
+sheetMat.defines = { SHEET_MODE: sheetMode };
+const sheets = new THREE.Mesh(sheetGeo, sheetMat); // the bake: every live splat into its tile of sheetAtlas
 sheets.frustumCulled = false;
-scene.add(sheets);
+const sheetScene = new THREE.Scene(), _clearColor = new THREE.Color();
+sheetScene.add(sheets);
+const sheetAtlas = new THREE.WebGLRenderTarget(SHEET_ATLAS_COLS * SHEET_TEXELS, SHEET_ATLAS_ROWS * SHEET_TEXELS,
+  { type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter, depthBuffer: false });
+// The cards, in the scene at full resolution: bent and turned to you as the bake had them, each reading its tile
+const sheetCards = new THREE.Mesh(sheetGeo, new THREE.ShaderMaterial({
+  uniforms: { uAtlas: { value: sheetAtlas.texture }, uFogColor: gooMat.uniforms.uFogColor, uFogDensity: gooMat.uniforms.uFogDensity },
+  vertexShader: `
+    attribute vec2 corner;
+    attribute vec3 aA, aB;
+    varying vec2 vUv;
+    varying float vTile, vZ;
+    void main() {
+      vec4 a = viewMatrix * vec4(aA, 1.0), b = viewMatrix * vec4(aB, 1.0), c = (a + b) * 0.5;
+      vec2 ax = b.xy - a.xy;
+      float len = length(ax);
+      vec2 dir = len > 1e-4 ? ax / len : vec2(1.0, 0.0), nrm = vec2(-dir.y, dir.x);
+      vec2 half_ = vec2(0.5 * len + ${SHEET_PAD.toFixed(3)}, 0.5 * len * ${SHEET_WIDTH.toFixed(2)} + ${SHEET_PAD.toFixed(3)}) * ${SHEET_SCALE.toFixed(1)};
+      vec2 off = dir * corner.x * half_.x + nrm * corner.y * half_.y;
+      float size = length(half_);
+      vec2 s = off / size;
+      c.xy += off;
+      float up = clamp(s.y * 0.5 + 0.5, 0.0, 1.0); // the bend (as the bake's)
+      c.z += ${SHEET_CURL.toFixed(2)} * size * (up * up + 0.6 * s.x * s.x * up);
+      vUv = corner * half_ / max(half_.x, half_.y) * 0.5 + 0.5; vTile = float(gl_InstanceID); vZ = -c.z; // (as the bake fit it)
+      gl_Position = projectionMatrix * c;
+    }`,
+  fragmentShader: `
+    uniform sampler2D uAtlas;
+    uniform vec3 uFogColor;
+    uniform float uFogDensity;
+    varying vec2 vUv;
+    varying float vTile, vZ;
+    void main() {
+      float t = floor(vTile + 0.5);
+      ivec2 tile = ivec2(mod(t, ${SHEET_ATLAS_COLS}.0), floor(t / ${SHEET_ATLAS_COLS}.0));
+      ivec2 texel = tile * ${SHEET_TEXELS} + clamp(ivec2(vUv * ${SHEET_TEXELS}.0), ivec2(0), ivec2(${SHEET_TEXELS - 1}));
+      vec4 b = texelFetch(uAtlas, texel, 0); // no interpolation: its blood pixels, crisp
+      if (b.a < 0.5) discard; // no paint here
+      gl_FragColor = vec4(mix(b.rgb, uFogColor, 1.0 - exp(-uFogDensity * uFogDensity * vZ * vZ)), 1.0);
+    }`,
+}));
+sheetCards.frustumCulled = false;
+scene.add(sheetCards);
+function bakeSheets() { // before the scene's drawn: the live splats' paint, into their tiles of sheetAtlas
+  if (!sheetGeo.instanceCount) return;
+  renderer.getClearColor(_clearColor);
+  const alpha = renderer.getClearAlpha();
+  renderer.setRenderTarget(sheetAtlas);
+  renderer.setClearColor(0x000000, 0); // a = 0: no paint
+  renderer.clear();
+  renderer.render(sheetScene, camera); // (camera: the bake lights and bends them as you see them)
+  renderer.setRenderTarget(null);
+  renderer.setClearColor(_clearColor, alpha);
+}
 // Each frame: drop sheets whose gob's ends have landed (or whose slots were reused), and place the rest
 function updateSheets() {
   let m = 0;
@@ -2834,7 +3612,7 @@ const probeMat = new THREE.ShaderMaterial({
 });
 const probeRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter });
 const probeCam = new THREE.OrthographicCamera(-0.005, 0.005, 0.005, -0.005, 0.01, 200);
-const _probe = new Float32Array(4), _clearColor = new THREE.Color();
+const _probe = new Float32Array(4);
 // Renders a demon with its mesh's material swapped (its pose current) into target, cleared to transparent black
 // first or drawn over what's there; the renderer's state is put back after
 function renderDemon(npc, mat, target, cam, clear) {
@@ -2964,6 +3742,20 @@ function playStep(level) {
   if (k >= lastStep) k++;
   playSound(`footstep_${(lastStep = k % FOOTSTEPS)}`, level * (0.85 + Math.random() * 0.15), 0.05);
 }
+// your step's sound: squelching in wet blood (the step under it)
+function playerStep(level) {
+  const wet = jumpY <= 0 && inWetBlood(player);
+  playStep(wet ? level * 0.6 : level);
+  if (wet) playSquelch(level * 1.4);
+}
+// your feet, every PRINT_STRIDE m walked on the floor: a print each (if your boots are bloody), facing the way you're
+// walking (move: this frame's, normalized)
+let printDist = 0;
+function playerFeet(dist) {
+  if ((printDist += dist) < PRINT_STRIDE) return;
+  printDist -= PRINT_STRIDE;
+  footPrint(player, camera.position, move.x, move.z, false);
+}
 
 function tryFire(now) {
   if (!gun || gun.busy || gun.cooldown > 0) return;
@@ -2988,7 +3780,7 @@ function tryFire(now) {
   shakeKick += KICK_PER_SHOT;
   shakeTrauma = Math.min(shakeTrauma + TRAUMA_PER_SHOT, 1);
   const hit = shotHit();
-  if (hit) { burstBlood(hit); paintWound(hit.npc, hit.entry); damageNpc(hit.npc, hit.dir); }
+  if (hit) { burstBlood(hit); splashLens(hit.entry); paintWound(hit.npc, hit.entry); damageNpc(hit.npc, hit.dir); }
   else { // missed them: it hits the arena
     const dir = camera.getWorldDirection(_ray), w = rayWorld(camera.position, dir);
     if (w) spawnHole(_v.copy(camera.position).addScaledVector(dir, w.t), w.normal);
@@ -3105,82 +3897,215 @@ function demonShot(npc) {
 // The view's own effects, drawn over everything (after the gun): blood specks that landed on your view, and arcs
 // pointing at what hit you. One full-screen pass, a few uniforms: HUD_SPECKS splats and HUD_ARCS arcs at most.
 const HUD_SPECKS = 12, HUD_ARCS = 4, SPECK_LIFE = 1.6, ARC_LIFE = 1.1; // s
+// The vignette: darkening from VIGNETTE[0] out from the middle to full at VIGNETTE[1] (1: the middle of an edge; ~1.41:
+// a corner), up to VIGNETTE_STRENGTH dark
+const VIGNETTE = [0.45, 1.45], VIGNETTE_STRENGTH = 0.6;
+// A speck: a scatter of SPECK_DROPS droplets, SPECK_DROP_MIN..MAX in radius (screen heights; the big ones fewer and
+// nearer the middle). They're on the lens, too near to focus on, so they're drawn as a camera would see them: sharp
+// first (lensDrops: little domes, lit, what's behind showing through them, and a tiny, very bright glint where each
+// catches the light), into an HDR image SPECK_PIXEL screen px per texel (pixel art), then that whole image blurred
+// (lensBlur: a plain gaussian, SPECK_BLUR its sigma in screen heights). The blur spreads every drop out alike, but a
+// glint is so much brighter than the rest that more of its spread stays bright: it swells into a wide soft disc, the
+// brighter the wider, like the sun's glints off water when you're focused past them.
+const SPECK_DROPS = 10, SPECK_DROP_MIN = 0.006, SPECK_DROP_MAX = 0.018, SPECK_PIXEL = 3, SPECK_BLUR = 0.012;
+// how much a drop's dome tilts at its rim (0 flat, 1 a half sphere), how far it bends what's behind it (of the
+// screen), and how bright its glint (HDR, for the biggest drop under the ceiling lights; × what it reflects)
+const SPECK_TILT = 0.8, SPECK_REFRACT = 0.03, SPECK_GLINT = 300, SPECK_GLINTING = 0.35; // share of drops that catch it
 const hudFx = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
   uniforms: {
-    uRes: { value: new THREE.Vector2(1, 1) }, uTime: { value: 0 },
+    uRes: { value: new THREE.Vector2(1, 1) }, uTime: { value: 0 }, uFlash: { value: 0 }, uScene: { value: null },
     uSpecks: { value: Array.from({ length: HUD_SPECKS }, () => new THREE.Vector4(0, 0, 0, -1e3)) }, // x, y (0..1), size, birth
     uArcs: { value: Array.from({ length: HUD_ARCS }, () => new THREE.Vector2(0, -1e3)) },             // angle, birth
+    uLens: { value: null }, // the blurred drops (lensBlur), or null: none
   },
   vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
   fragmentShader: `
     uniform vec2 uRes;
     uniform float uTime;
-    uniform vec4 uSpecks[${HUD_SPECKS}];
     uniform vec2 uArcs[${HUD_ARCS}];
-    float hash(float n) { return fract(sin(n) * 43758.5453); }
+    uniform sampler2D uLens;
+    uniform bool uLensOn;
     void main() {
-      vec2 px = floor(gl_FragCoord.xy / 3.0) * 3.0 + 1.5; // 3 px blocks: the specks are pixel art
-      vec2 q = px / uRes.y; // in screen heights
+      // the drops, blurred: HDR light (premultiplied) and how much they hide; tone mapped as the world is, the light
+      // added (so a glint's spread brightens past the drop itself)
       vec4 col = vec4(0.0);
-      // specks: a blob and a couple of droplets, a drip running down slowly, fading out
-      for (int i = 0; i < ${HUD_SPECKS}; i++) {
-        vec4 s = uSpecks[i];
-        float age = uTime - s.w;
-        if (age < 0.0 || age > ${SPECK_LIFE.toFixed(2)}) continue;
-        vec2 c = vec2(s.x * uRes.x / uRes.y, s.y);
-        float r = s.z, d = length(q - c) - r;
-        for (int k = 0; k < 3; k++) {
-          float a = hash(s.w * 7.0 + float(i) * 3.1 + float(k)) * 6.283;
-          d = min(d, length(q - c - vec2(cos(a), sin(a)) * r * 1.8) - r * 0.35);
-        }
-        float run = min(age, 0.8) * r * 2.5; // the drip
-        vec2 dq = q - c; dq.y += r * 0.2;
-        if (dq.y < 0.0 && dq.y > -run && abs(dq.x) < r * 0.3) d = min(d, 0.0);
-        if (d < 0.0) {
-          float a = 0.85 * (1.0 - smoothstep(${(SPECK_LIFE * 0.6).toFixed(2)}, ${SPECK_LIFE.toFixed(2)}, age));
-          col = vec4(mix(vec3(0.45, 0.02, 0.03), vec3(0.25, 0.01, 0.015), smoothstep(0.0, ${SPECK_LIFE.toFixed(2)}, age)), max(col.a, a));
-        }
+      if (uLensOn) {
+        vec4 b = texelFetch(uLens, ivec2(gl_FragCoord.xy / uRes * vec2(textureSize(uLens, 0))), 0);
+        col = vec4(linearToOutputTexel(vec4(toneMapping(b.rgb), 1.0)).rgb, b.a);
       }
-      // arcs: a band round the centre, the way the shot came from (up the screen: ahead), red in its middle and
-      // fading out to its ends and as it ages
+      // arcs: a thin curve round the centre, the way the shot came from (up the screen: ahead), tapering to its ends,
+      // and from its middle a soft point, pointing out; one red, one soft edge, fading as it ages
       vec2 o = (gl_FragCoord.xy - uRes * 0.5) / uRes.y;
       float rad = length(o), ang = atan(o.x, o.y); // 0 straight up the screen, clockwise
-      float band = 1.0 - smoothstep(0.0, 0.035, abs(rad - 0.2));
       for (int i = 0; i < ${HUD_ARCS}; i++) {
         float age = uTime - uArcs[i].y;
         if (age < 0.0 || age > ${ARC_LIFE.toFixed(2)}) continue;
-        float da = abs(atan(sin(ang - uArcs[i].x), cos(ang - uArcs[i].x)));
-        float a = band * (1.0 - smoothstep(0.0, 0.6, da)) * (1.0 - smoothstep(0.0, ${ARC_LIFE.toFixed(2)}, age)) * 0.85;
-        if (a > col.a) col = vec4(0.85, 0.05, 0.04, a);
+        float t = abs(atan(sin(ang - uArcs[i].x), cos(ang - uArcs[i].x))) / 0.9; // along it, 0 middle .. 1 ends
+        float w = mix(0.02, 0.006, min(t * t, 1.0)); // its width, tapering; a gaussian across: blurred
+        float dr = (rad - 0.2) / w;
+        float arc = exp(-dr * dr) * (1.0 - smoothstep(0.7, 1.0, t));
+        vec2 dir = vec2(sin(uArcs[i].x), cos(uArcs[i].x));
+        float out_ = dot(o, dir), across = abs(dot(o, vec2(dir.y, -dir.x)));
+        const float BASE = 0.195, TIP = 0.235, HALF = 0.024, K = (TIP - BASE) / HALF;
+        float d = min(out_ - BASE, (TIP - out_ - across * K) / sqrt(1.0 + K * K)); // about how far inside the point
+        float a = max(arc, smoothstep(-0.022, 0.012, d)) * (1.0 - smoothstep(0.0, ${ARC_LIFE.toFixed(2)}, age)) * 0.85;
+        if (a > col.a) col = vec4(vec3(0.85, 0.05, 0.04) * a, a);
       }
-      if (col.a <= 0.0) discard;
-      gl_FragColor = col;
+      // the vignette: the lens darker toward the edges and corners, under the rest (black, premultiplied)
+      vec2 vo = (gl_FragCoord.xy / uRes - 0.5) * 2.0; // −1…1 across and up
+      float vig = smoothstep(${VIGNETTE[0].toFixed(2)}, ${VIGNETTE[1].toFixed(2)}, length(vo)) * ${VIGNETTE_STRENGTH.toFixed(2)};
+      col.a += vig * (1.0 - col.a);
+      if (col.a <= 0.0 && dot(col.rgb, vec3(1.0)) <= 0.0) discard;
+      gl_FragColor = col; // premultiplied
     }`,
-  transparent: true, depthTest: false, depthWrite: false,
+  transparent: true, premultipliedAlpha: true, depthTest: false, depthWrite: false,
 }));
+hudFx.material.uniforms.uLensOn = { value: false };
 hudFx.frustumCulled = false;
 hudFx.renderOrder = 1; // over the gun
 hudScene.add(hudFx);
-let speckNext = 0, arcNext = 0;
+// the drops, sharp, into lensRT[0]; blurred across into lensRT[1], then up, back into lensRT[0]
+const lensRT = [0, 1].map(() => new THREE.WebGLRenderTarget(1, 1, {
+  type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter, depthBuffer: false }));
+const lensDrops = new THREE.ShaderMaterial({
+  uniforms: { // shared with hudFx: hudHit writes the specks there
+    uSpecks: hudFx.material.uniforms.uSpecks, uTime: hudFx.material.uniforms.uTime, uFlash: hudFx.material.uniforms.uFlash,
+    uScene: hudFx.material.uniforms.uScene,
+  },
+  vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `
+    uniform float uTime, uFlash; // uFlash: your muzzle flash, now (0..1)
+    uniform vec4 uSpecks[${HUD_SPECKS}];
+    uniform sampler2D uScene; // the world behind, HDR (see sceneTex)
+    vec2 hash2(vec2 p) { return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
+    float lum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+    void main() {
+      vec2 size = vec2(textureSize(uScene, 0)) / ${SPECK_PIXEL.toFixed(1)}; // this image's (about)
+      vec2 uv = gl_FragCoord.xy / size, q = gl_FragCoord.xy / size.y; // 0..1; screen heights
+      float texel = 1.0 / size.y;
+      vec3 L = normalize(vec3(-0.25, 0.75, 0.6)), H = normalize(L + vec3(0.0, 0.0, 1.0)); // the ceiling lights: above
+      // the frontmost drop here (the tallest dome), and every drop's glint
+      float best = 0.0, bestR = 1.0, bestFade = 0.0;
+      vec2 bestD = vec2(0.0);
+      vec3 glints = vec3(0.0);
+      for (int i = 0; i < ${HUD_SPECKS}; i++) {
+        vec4 s = uSpecks[i]; // its middle (0..1 across and up the screen), its spread, its birth
+        float age = uTime - s.w;
+        if (age < 0.0 || age > ${SPECK_LIFE.toFixed(2)}) continue;
+        vec2 c = vec2(s.x * size.x / size.y, s.y);
+        if (length(q - c) > s.z + ${SPECK_DROP_MAX.toFixed(3)} + 2.0 * texel) continue; // nowhere near
+        float fade = 1.0 - smoothstep(${(SPECK_LIFE * 0.6).toFixed(2)}, ${SPECK_LIFE.toFixed(2)}, age);
+        for (int k = 0; k < ${SPECK_DROPS}; k++) {
+          vec2 h = hash2(vec2(s.w * 13.1 + float(i), float(k))), g = hash2(vec2(float(k) + 0.5, s.w * 7.3 + float(i)));
+          float out_ = sqrt(h.y), ang = h.x * 6.283; // where, round its middle
+          float r = mix(${SPECK_DROP_MIN.toFixed(3)}, ${SPECK_DROP_MAX.toFixed(3)}, g.x * g.x * (1.0 - 0.6 * out_));
+          vec2 dc = c + vec2(cos(ang), sin(ang)) * out_ * s.z;
+          dc.y -= min(age, 0.8) * g.y * r; // the bigger ones creep down a little
+          vec2 d = (q - dc) / r;
+          float h2 = 1.0 - dot(d, d); // its dome's height here, squared (of r)
+          if (h2 > best) { best = h2; bestR = r; bestD = d; bestFade = fade; }
+          // its glint, if it catches the light (SPECK_GLINTING of them do): where its dome faces halfway between you
+          // and the light, one texel or so across (a point, too small to draw sharper), as bright as the drop is big
+          // and what it reflects (the lights, your flash)
+          if (fract(g.x * 31.7 + h.y * 17.3) > ${SPECK_GLINTING.toFixed(2)}) continue;
+          vec2 gp = dc + H.xy / ${SPECK_TILT.toFixed(2)} * r * 0.9;
+          vec2 gd = (q - gp) / texel;
+          float shine = 0.04 + lum(textureLod(uScene, gp * size.y / size + H.xy * 0.15, 0.0).rgb) * 0.5 + uFlash * 2.0;
+          glints += vec3(1.0, 0.92, 0.85) * exp(-dot(gd, gd) * 1.5) * shine * fade
+            * ${SPECK_GLINT.toFixed(1)} * pow(r / ${SPECK_DROP_MAX.toFixed(3)}, 2.0);
+        }
+      }
+      if (best <= 0.0) { gl_FragColor = vec4(glints, 0.0); return; } // a glint's edge past its drop: light, no cover
+      // the drop: a dome, lit from above; what's behind shows through it, bent, the thicker the redder
+      float th = sqrt(best);
+      vec3 n = normalize(vec3(bestD * ${SPECK_TILT.toFixed(2)}, th));
+      vec3 behind = textureLod(uScene, uv - n.xy * ${SPECK_REFRACT.toFixed(3)}, 0.0).rgb;
+      vec3 through = behind * exp(-(0.3 + th) * vec3(0.4, 5.0, 6.0)) * 0.8; // blood lets red through
+      vec3 body = vec3(0.5, 0.02, 0.02) * (0.25 + 0.5 * max(dot(n, L), 0.0)) * (1.0 + uFlash * 4.0);
+      float a = bestFade * 0.95;
+      gl_FragColor = vec4((body + through) * a + glints, a); // premultiplied
+    }`,
+  depthTest: false, depthWrite: false,
+});
+const lensBlur = new THREE.ShaderMaterial({
+  uniforms: { uTex: { value: null }, uDir: { value: new THREE.Vector2() }, uSigma: { value: 1 } },
+  vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D uTex;
+    uniform vec2 uDir; // across (1, 0) or up (0, 1)
+    uniform float uSigma; // texels
+    void main() { // a plain gaussian, one way
+      ivec2 p = ivec2(gl_FragCoord.xy), last = textureSize(uTex, 0) - 1;
+      vec4 sum = vec4(0.0);
+      float wsum = 0.0;
+      for (int i = -32; i <= 32; i++) {
+        float x = float(i);
+        if (abs(x) > 3.0 * uSigma) continue;
+        float w = exp(-x * x / (2.0 * uSigma * uSigma));
+        sum += texelFetch(uTex, clamp(p + ivec2(uDir * x), ivec2(0), last), 0) * w;
+        wsum += w;
+      }
+      gl_FragColor = sum / wsum;
+    }`,
+  depthTest: false, depthWrite: false,
+});
+const lensQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), lensDrops), lensScene = new THREE.Scene();
+lensQuad.frustumCulled = false;
+lensScene.add(lensQuad);
+function drawLens(now) { // before the HUD: the drops, sharp, then blurred (see SPECK_BLUR); none, nothing
+  const u = hudFx.material.uniforms;
+  u.uLensOn.value = u.uSpecks.value.some((s) => now - s.w >= 0 && now - s.w <= SPECK_LIFE) && !!sceneTex;
+  if (!u.uLensOn.value) return;
+  const w = Math.ceil(u.uRes.value.x / SPECK_PIXEL), h = Math.ceil(u.uRes.value.y / SPECK_PIXEL);
+  for (const rt of lensRT) if (rt.width !== w || rt.height !== h) rt.setSize(w, h);
+  lensBlur.uniforms.uSigma.value = Math.min(SPECK_BLUR * h, 10);
+  const pass = (mat, target) => { lensQuad.material = mat; renderer.setRenderTarget(target); renderer.render(lensScene, hudCam); };
+  pass(lensDrops, lensRT[0]);
+  lensBlur.uniforms.uTex.value = lensRT[0].texture; lensBlur.uniforms.uDir.value.set(1, 0); pass(lensBlur, lensRT[1]);
+  lensBlur.uniforms.uTex.value = lensRT[1].texture; lensBlur.uniforms.uDir.value.set(0, 1); pass(lensBlur, lensRT[0]);
+  renderer.setRenderTarget(null);
+  u.uLens.value = lensRT[0].texture;
+}
+let speckNext = 0, arcNext = 0, hudFlash = 0;
 const _hudV = new THREE.Vector3();
 // You, hit: a grunt, one of GRUNTS at random (never the same twice running), at most one per GRUNT_GAP s so a volley
 // doesn't stack them
 const GRUNT_GAP = 0.45;
 let lastGrunt = -Infinity, lastGruntK = -1;
+// n specks of blood onto the lens, landing at t: towards its left and right edges (the right with chance `right`),
+// clear of the crosshair
+function flickSpecks(n, t, right = 0.5) {
+  for (let k = 0; k < n; k++) {
+    const side = Math.random() < right ? 1 : -1;
+    hudFx.material.uniforms.uSpecks.value[speckNext++ % HUD_SPECKS]
+      .set(0.5 + side * (0.2 + Math.random() * 0.28), 0.15 + Math.random() * 0.7, 0.03 + Math.random() * 0.04, t);
+  }
+}
 function hudHit(from) {
   const u = hudFx.material.uniforms, t = u.uTime.value;
+  hurt = Math.min(hurt + HURT_PER_HIT, 1); // knocked out of focus (see HURT_BLUR)
   if (audio.currentTime - lastGrunt >= GRUNT_GAP) {
     let k = (Math.random() * (GRUNTS - 1)) | 0;
     if (k >= lastGruntK) k++;
     lastGrunt = audio.currentTime;
     playSound(`hurt_grunt_${(lastGruntK = k % GRUNTS)}`, 0.7, 0.05);
   }
-  for (let k = 0, n = 2 + ((Math.random() * 3) | 0); k < n; k++) { // a few specks, mostly towards the edges
-    const side = Math.random() < 0.5 ? -1 : 1;
-    u.uSpecks.value[speckNext++ % HUD_SPECKS].set(0.5 + side * (0.2 + Math.random() * 0.28), 0.15 + Math.random() * 0.7, 0.006 + Math.random() * 0.012, t);
-  }
+  flickSpecks(2 + ((Math.random() * 3) | 0), t);
   _hudV.copy(from).applyMatrix4(camera.matrixWorldInverse); // where it came from, in view space
   u.uArcs.value[arcNext++ % HUD_ARCS].set(Math.atan2(_hudV.x, -_hudV.z), t);
+}
+// Blood flung your way: a burst within LENS_SPLASH_RANGE m of you, and in view, splashes the lens too, where you see
+// it, as when you're hit (flickSpecks), mostly on its side of the screen, once it's flown that far (at
+// LENS_SPLASH_SPEED); the nearer, the more
+const LENS_SPLASH_RANGE = 4, LENS_SPLASH_SPEED = 5; // m; m/s
+const _lensP = new THREE.Vector3();
+function splashLens(at) {
+  const d = at.distanceTo(camera.position), near = 1 - d / LENS_SPLASH_RANGE;
+  if (near <= 0) return;
+  _lensP.copy(at).project(camera);
+  if (_lensP.z > 1 || Math.abs(_lensP.x) > 1.2 || Math.abs(_lensP.y) > 1.2) return; // behind you, or out of view
+  flickSpecks(Math.round(near * 3 + Math.random()), hudFx.material.uniforms.uTime.value + d / LENS_SPLASH_SPEED,
+    0.5 + 0.35 * THREE.MathUtils.clamp(_lensP.x * 3, -1, 1));
 }
 
 function updateAmmo() {
@@ -3214,14 +4139,21 @@ function findFootfalls(gltf) {
   }
   return out;
 }
+const _stepE = new THREE.Euler();
 function demonSteps(npc, pace) { // after its walk has moved on this frame: did a foot come down?
   const t = npc.walk.time, was = npc.walkWas ?? t;
   npc.walkWas = t;
   if (pace < 0.05 || npc.walk.getEffectiveWeight() < 0.5) return;
   const crossed = (f) => (t >= was ? was < f && f <= t : f > was || f <= t); // (t wraps round at the loop)
   for (const f of demonFootfalls) if (crossed(f)) {
-    const d = npc.imp.model.position.distanceTo(camera.position);
-    if (d < DEMON_STEP_RANGE) demonVoice(npc, `footstep_${(Math.random() * FOOTSTEPS) | 0}`, 0.5 / (1 + d * 0.15), DEMON_STEP_PITCH);
+    const m = npc.imp.model, d = m.position.distanceTo(camera.position);
+    const yaw = _stepE.setFromQuaternion(m.quaternion, 'YXZ').y - DEMON_FACING; // its heading (see steer)
+    footPrint(npc, m.position, Math.sin(yaw), Math.cos(yaw), true); // its claw print, if bloody
+    const wet = inWetBlood(npc);
+    if (d < DEMON_STEP_RANGE) {
+      demonVoice(npc, `footstep_${(Math.random() * FOOTSTEPS) | 0}`, (wet ? 0.3 : 0.5) / (1 + d * 0.15), DEMON_STEP_PITCH);
+      if (wet) playSquelch(0.6 / (1 + d * 0.15), 0.7);
+    }
   }
 }
 const npcs = []; // { imp, walk, fire, death, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer, stagger, knock, shakeDir, health, dead }
@@ -3291,6 +4223,8 @@ addEventListener('keydown', (e) => {
   keys[e.code] = true;
   if (!gun) return;
   if (e.code === 'KeyR') reload();
+  if (e.code === 'Backquote') document.body.classList.toggle('debug');
+  if (!document.body.classList.contains('debug')) return; // the rest are debug toggles
   if (e.code === 'KeyB') opts.bounds = !opts.bounds;
   if (e.code === 'KeyH') opts.spriteShadows = !opts.spriteShadows;
   if (e.code === 'KeyO') opts.lod = !opts.lod;
@@ -3298,7 +4232,13 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyN') opts.stepped = !opts.stepped;
   if (e.code === 'KeyL') opts.lockDist = !opts.lockDist;
   if (e.code === 'KeyK') opts.snap = !opts.snap;
-  if (e.code === 'KeyF') dof.enabled = !dof.enabled;
+  if (e.code === 'KeyF') dofOn = !dofOn;
+  if (e.code === 'KeyI') spriteDebug = !spriteDebug; // see updateSpriteDebug
+  if (e.code === 'KeyM') { // the airborne blood: the next of SHEET_MODES
+    sheetMode = (sheetMode + 1) % SHEET_MODES.length;
+    sheetMat.defines = { SHEET_MODE: sheetMode };
+    sheetMat.needsUpdate = true;
+  }
   if (e.code === 'KeyP') {
     rtSizeIdx = (rtSizeIdx + 1) % RT_SIZES.length;
     opts.resolution = RT_SIZES[rtSizeIdx];
@@ -3306,7 +4246,7 @@ addEventListener('keydown', (e) => {
   }
   if (e.code === 'Equal') addNpcs(10);
   if (e.code === 'Minus') removeNpcs(10);
-  hud.textContent = HUD + `  |  bounds ${opts.bounds ? 'ON' : 'off'} · showing ${opts.real ? 'REAL 3D' : 'sprites'} · anim ${opts.stepped ? opts.animFps + 'fps' : 'smooth'} · RT dolly ${opts.lockDist ? 'LOCKED' : 'follows'} · angles ${opts.snap ? opts.snaps + '×' + opts.pitchSnaps + ' snaps' : 'free'} · sprite ${opts.resolution}px${opts.lod ? ' (LOD)' : ''} · shadows ${opts.spriteShadows ? 'SPRITE' : 'blob'} · DoF ${dof.enabled ? 'ON' : 'off'}`;
+  hud.textContent = HUD + `  |  bounds ${opts.bounds ? 'ON' : 'off'} · showing ${opts.real ? 'REAL 3D' : 'sprites'} · anim ${opts.stepped ? opts.animFps + 'fps' : 'smooth'} · RT dolly ${opts.lockDist ? 'LOCKED' : 'follows'} · angles ${opts.snap ? opts.snaps + '×' + opts.pitchSnaps + ' snaps' : 'free'} · sprite ${opts.resolution}px${opts.lod ? ' (LOD)' : ''} · shadows ${opts.spriteShadows ? 'SPRITE' : 'blob'} · DoF ${dofOn ? 'ON' : 'off'} · blood ${SHEET_MODES[sheetMode]}`;
 });
 addEventListener('keyup', (e) => (keys[e.code] = false));
 addEventListener('resize', () => {
@@ -3319,17 +4259,68 @@ addEventListener('resize', () => {
 sizeGun();
 
 // --- Benchmark stats: averaged over half-second windows ---
-const statsEl = document.getElementById('stats');
+const statsEl = document.getElementById('stats'), fpsEl = document.getElementById('fps'); // fps: always shown (the game's in the works)
 let statFrames = 0, statCpu = 0, statSprites = 0, statStart = performance.now();
 function reportStats(cpuMs, sprites) {
   statFrames++; statCpu += cpuMs; statSprites += sprites;
   const now = performance.now();
   if (now - statStart < 500) return;
   const { calls, triangles } = renderer.info.render;
+  fpsEl.textContent = `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps`;
   statsEl.textContent = `${npcs.length} demons (${opts.real ? 'REAL 3D' : 'sprites'}) · ` +
     `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps · CPU ${(statCpu / statFrames).toFixed(2)} ms/frame · ` +
     `${calls} draw calls · ${(triangles / 1000).toFixed(0)}k tris · ${(statSprites / statFrames).toFixed(1)} sprite renders/frame`;
   statFrames = statCpu = statSprites = 0; statStart = now;
+}
+
+// Sprite debug (I, in debug mode): to catch a demon that's vanished. Every demon on screen gets a marker with its
+// number (green: nothing between you and it; grey: something is, so not seeing it is right), and the top right shows
+// every demon's sprite image as it is now (its number, distance, texture size and how long since it was last drawn under
+// it), each on a dark square: an empty square is an empty sprite. Up to SPRITE_DEBUG_MAX of them.
+const SPRITE_DEBUG_MAX = 24, SPRITE_DEBUG_COLS = 6, SPRITE_DEBUG_SIZE = 0.11; // demons; columns; of the screen height
+let spriteDebug = false;
+const spriteDebugLayer = Object.assign(document.createElement('div'), { style: 'position:fixed;inset:0;pointer-events:none;z-index:40;display:none;font:bold 11px monospace' });
+document.body.appendChild(spriteDebugLayer);
+const spriteDebugMarks = [], spriteDebugLabels = [], spriteDebugThumbs = [];
+const _sdc = new THREE.Vector3(), _sdp = new THREE.Vector3(), _sdd = new THREE.Vector3();
+function updateSpriteDebug() {
+  spriteDebugLayer.style.display = spriteDebug ? 'block' : 'none';
+  spriteDebugThumbs.forEach((t) => (t.visible = false));
+  if (!spriteDebug) return;
+  const aspect = innerWidth / innerHeight, h = 2 * SPRITE_DEBUG_SIZE, w = h / aspect; // a thumbnail, in clip units
+  npcs.slice(0, SPRITE_DEBUG_MAX).forEach((n, i) => {
+    if (!spriteDebugMarks[i]) { // made on first use
+      spriteDebugMarks[i] = spriteDebugLayer.appendChild(Object.assign(document.createElement('div'), { style: 'position:absolute;width:14px;height:14px;border:2px solid' }));
+      spriteDebugLabels[i] = spriteDebugLayer.appendChild(Object.assign(document.createElement('div'), { style: 'position:absolute;color:#fff;text-shadow:0 0 2px #000;font-size:10px' }));
+      const back = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: 0x202020, depthTest: false, depthWrite: false }));
+      const pic = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ transparent: true, premultipliedAlpha: true, depthTest: false, depthWrite: false }));
+      back.renderOrder = 10; pic.renderOrder = 11; back.frustumCulled = pic.frustumCulled = false;
+      spriteDebugThumbs.push(back, pic);
+      hudScene.add(back, pic);
+    }
+    // its marker, where its middle is on screen
+    const im = n.imp, mark = spriteDebugMarks[i], c = _sdc.copy(im.model.position).add(im.fit), p = _sdp.copy(c).project(camera);
+    const dist = c.distanceTo(camera.position), hit = rayWorld(camera.position, _sdd.copy(c).sub(camera.position).normalize());
+    const onScreen = p.z < 1 && Math.abs(p.x) < 1 && Math.abs(p.y) < 1;
+    mark.style.display = onScreen ? 'block' : 'none';
+    mark.style.left = `${(p.x * 0.5 + 0.5) * innerWidth - 9}px`;
+    mark.style.top = `${(-p.y * 0.5 + 0.5) * innerHeight - 9}px`;
+    mark.style.borderColor = mark.style.color = hit && hit.t < dist - 0.5 ? '#888' : '#3f3';
+    mark.textContent = i;
+    // its sprite image, in the grid
+    const col = i % SPRITE_DEBUG_COLS, row = Math.floor(i / SPRITE_DEBUG_COLS);
+    const x = 1 - (col + 0.5) * w * 1.08 - 0.01, y = 1 - (row + 0.5) * h * 1.25 - 0.06;
+    const [back, pic] = spriteDebugThumbs.slice(i * 2, i * 2 + 2);
+    back.position.set(x, y, 0); back.scale.set(w, h, 1);
+    pic.position.set(x, y, 0); pic.scale.set(w, h, 1);
+    if (pic.material.map !== im.rt.texture) { pic.material.map = im.rt.texture; pic.material.needsUpdate = true; }
+    back.visible = pic.visible = true;
+    const label = spriteDebugLabels[i];
+    label.style.left = `${(x - w / 2 + 1) * 0.5 * innerWidth}px`;
+    label.style.top = `${(1 - (y - h / 2)) * 0.5 * innerHeight}px`;
+    const age = im.renderedAt ? (performance.now() - im.renderedAt) / 1000 : Infinity; // s since its sprite was last drawn
+    label.textContent = `${i}${n.dead ? '†' : ''} ${dist.toFixed(0)}m ${im.rt.width}px ${age < 10 ? age.toFixed(1) + 's' : '—'}`;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3534,9 +4525,10 @@ renderer.setAnimationLoop(() => {
   const landing = jumpY === floorY && jumpV < -4; // came down from more than ~0.4 m
   if (jumpY === floorY && jumpV < 0) jumpV = 0;
   // Footsteps: one every STEP_LENGTH m walked on the ground (so quicker when sprinting), a heavier one on landing
-  if (landing) { playStep(0.55); stepDist = 0; }
+  if (landing) { playerStep(0.55); stepDist = 0; }
   else if (moving && grounded) {
-    if ((stepDist += (sprinting ? SPRINT : MOVE) * dt) >= STEP_LENGTH) { stepDist -= STEP_LENGTH; playStep(sprinting ? 0.42 : 0.32); }
+    if ((stepDist += (sprinting ? SPRINT : MOVE) * dt) >= STEP_LENGTH) { stepDist -= STEP_LENGTH; playerStep(sprinting ? 0.42 : 0.32); }
+    if (jumpY <= 0) playerFeet((sprinting ? SPRINT : MOVE) * dt);
   } else stepDist = STEP_LENGTH * 0.7; // standing (or in the air): setting off, the first step comes soon
   camera.position.y = EYE_HEIGHT + jumpY;
   const reach = ARENA - 0.5; // the wall is solid: stop half a metre short of it
@@ -3624,10 +4616,22 @@ renderer.setAnimationLoop(() => {
 
   const shaken = shakeCamera(dt, now);
   drawBloodField();
+  hurt = Math.max(hurt - dt / HURT_RECOVER, 0); // back into focus
+  dof.uniforms.uHurt.value = hurt * hurt; // eased: clears fast at first, the last of it lingers less
+  dof.uniforms.uDof.value = dofOn ? 1 : 0;
+  dof.enabled = dofOn || hurt > 0;
+  bakeSheets();
+  flushBlood(dt);
   composer.render(dt);
   hudFx.material.uniforms.uTime.value = now;
+  // your muzzle flash, for the blood on the lens: full while it's lit, dying off fast after
+  hudFlash = gun && now < gun.flashUntil ? 1 : Math.max(hudFlash - dt * 14, 0);
+  hudFx.material.uniforms.uFlash.value = hudFlash;
+  hudFx.material.uniforms.uScene.value = sceneTex;
   renderer.getDrawingBufferSize(hudFx.material.uniforms.uRes.value);
+  drawLens(now);
   renderer.autoClear = false; // weapon goes flat on top of the world (no bloom on it)
+  updateSpriteDebug();
   renderer.render(hudScene, hudCam);
   renderer.autoClear = true;
   if (shaken) camera.quaternion.copy(_camQ); // undo: the look controls own the real orientation
