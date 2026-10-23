@@ -1933,6 +1933,12 @@ function holdShotgun(root, draw, mainJoint, shotgun) {
   arm.side = along.clone().cross(palm); // (the fingers curl round it, towards the palm)
   arm.fingers = [];
   arm.hand.traverse((b) => { if (/^LeftHand(Index|Middle|Ring|Pinky)[123]_/.test(b.name)) arm.fingers.push(b); });
+  arm.thumb = [1, 2, 3].map((j) => { let f = null; arm.hand.traverse((b) => { if (!f && new RegExp(`^LeftHandThumb${j}_`).test(b.name)) f = b; }); return f; });
+  arm.gripRest = [...arm.fingers, ...arm.thumb].map((b) => b.quaternion.clone()); // (their grip on the forend, at the ready)
+  // every bone shotgunReload changes, with the clip's pose for it and what shotgunReload last left it at (see clipPose)
+  arm.kept = [arm.upper, arm.fore, arm.hand, ...arm.fingers, ...arm.thumb].map((bone) => ({
+    bone, q: bone.quaternion.clone(), p: bone.position.clone(), outQ: new THREE.Quaternion(0, 0, 0, 0), outP: new THREE.Vector3(NaN, 0, 0),
+  }));
   // the two shells in the chambers (seen only while it's open: see shotgunReload), rims at the group's origin
   const shells = new THREE.Group(), shell = shellModel();
   for (const x of [-SHOTGUN_BARREL_X, SHOTGUN_BARREL_X]) {
@@ -2046,10 +2052,32 @@ function shotgunReload(t) {
   const atWrist = twistOf(arm.fore.getWorldQuaternion(_tw1), q, arm.wristRest, along);
   turnAbout(arm.fore, along, w * ((1 - WRIST_TWIST) * atWrist - WRIST_TWIST * atElbow));
   hand.quaternion.slerp(hand.parent.getWorldQuaternion(_rp).invert().multiply(q), w);
-  // the fingers curled into a fist (each joint turned round the hand's side axis, which the turns leave where it is)
+  // The fingers and thumb, which the clip moves about (its hand is busy with a magazine): on the forend (till it leaves
+  // for the shells, and back on it at the end) held in their grip at the ready (the clip lifted the index finger, to a
+  // magazine release); in the fist, held as they were when it first closed (the thumb swung out of it as it rested on the
+  // breech, the fingers twitched under the curl), easing back to the clip's as it opens; the fingers curled into a fist
+  // on top (each joint turned round the hand's side axis, which the turns leave where it is)
+  const digits = [...arm.fingers, ...arm.thumb], onForend = Math.max(1 - smooth(t, 0.22, 0.3), smooth(t, 0.8, 0.88)); // (forming as it comes back)
+  digits.forEach((b, i) => b.quaternion.slerp(arm.gripRest[i], onForend * w));
+  if (closed <= 0) arm.held = null;
+  else if (closed >= 0.999 && !arm.held) arm.held = digits.map((b) => b.quaternion.clone());
+  if (arm.held) digits.forEach((b, i) => b.quaternion.slerp(arm.held[i], closed * w));
   const side = _rl[0].copy(arm.side).applyQuaternion(hand.getWorldQuaternion(_rg));
   for (const bone of arm.fingers) turnAbout(bone, side, FIST_CURL * closed * w);
+  for (const bone of arm.thumb) bone.updateMatrixWorld(true);
 }
+// The bones shotgunReload changes, put back to the clip's pose before it changes them again. three's mixer writes a
+// bone only when the clip's value for it changes: where the clip holds one still, the bone kept the last pose's changes
+// and the next ones went on top. The fingers' curl went on again every pose (at full frame rate they spun round while
+// the fist held, then snapped back when the clip moved them). A bone still exactly as shotgunReload left it wasn't
+// written: back to the clip's value it had; otherwise the mixer's fresh value is the clip's.
+function clipPose(kept) {
+  for (const k of kept) {
+    if (k.bone.quaternion.equals(k.outQ)) k.bone.quaternion.copy(k.q); else k.q.copy(k.bone.quaternion);
+    if (k.bone.position.equals(k.outP)) k.bone.position.copy(k.p); else k.p.copy(k.bone.position);
+  }
+}
+function keepPose(kept) { for (const k of kept) { k.outQ.copy(k.bone.quaternion); k.outP.copy(k.bone.position); } }
 // Turns bone by angle (rad) round axis (world, through the bone's origin)
 const _ta = new THREE.Quaternion(), _tp = new THREE.Quaternion();
 function turnAbout(bone, axis, angle) {
@@ -4522,7 +4550,11 @@ function updateGun(dt, now) {
     gun.offArm?.scale.setScalar(1e-4); // one-handed (see PISTOL_VIEW), or the left fist mirrored (see holdFists)
     if (gun.fists) gun.posedAt = now; // (the fists are posed as they're drawn: see below)
     const r = gun.actions.Reload;
-    if (gun.hinge) shotgunReload(r.isRunning() ? r.time / r.getClip().duration : 0);
+    if (gun.hinge) {
+      clipPose(gun.arm.kept);
+      shotgunReload(r.isRunning() ? r.time / r.getClip().duration : 0);
+      keepPose(gun.arm.kept);
+    }
   }
 
   let lights = 0; // which flash lights reach your eye; a change means a re-render
