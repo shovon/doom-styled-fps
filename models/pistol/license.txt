@@ -1,0 +1,11 @@
+Model Information:
+* title:	CANIK RIVAL S
+* source:	https://sketchfab.com/3d-models/canik-rival-s-a7349a89226043adb9720a90ede7c5b5
+* author:	Cam Diep Minh (https://sketchfab.com/diepminh1997)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "CANIK RIVAL S" (https://sketchfab.com/3d-models/canik-rival-s-a7349a89226043adb9720a90ede7c5b5) by Cam Diep Minh (https://sketchfab.com/diepminh1997) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
