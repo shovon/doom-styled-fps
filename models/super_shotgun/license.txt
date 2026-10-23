@@ -1,0 +1,11 @@
+Model Information:
+* title:	Sci-fi Super Shotgun
+* source:	https://sketchfab.com/3d-models/sci-fi-super-shotgun-5929e6949d1e421e927116e117248f07
+* author:	tnnv (https://sketchfab.com/tnnv)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Sci-fi Super Shotgun" (https://sketchfab.com/3d-models/sci-fi-super-shotgun-5929e6949d1e421e927116e117248f07) by tnnv (https://sketchfab.com/tnnv) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
