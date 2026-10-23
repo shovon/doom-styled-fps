@@ -26,11 +26,11 @@ body.debug #fps{display:none} /* (the debug stats show it, there) */
 <body>
 <div id="ui"><div id="hud">Debug (` to hide) · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · F depth of field · M cycle blood · I sprite debug · = / - add/remove 10 demons</div>
 <div id="stats"></div></div>
-<div id="start"><div>Click to play</div><small>WASD move · Shift sprint · Space jump · mouse look · click fire · R reload</small><small>Esc: this menu</small></div>
+<div id="start"><div>Click to play</div><small>WASD move · Shift sprint · Space jump · mouse look · click fire · R reload · 1-4 weapons</small><small>Esc: this menu</small></div>
 <div id="crosshair"></div>
 <div id="fps"></div>
 <div id="ammo"></div><div id="health"></div>
-<div id="credit">Weapon: "M4 - FPS Weapon Animations Pack (v.1)" by BarcodeGames (sketchfab.com/barcodegames), CC-BY-4.0<br>Shotgun: "Sci-fi Super Shotgun" by tnnv (sketchfab.com/tnnv), CC-BY-4.0<br>Casing: "Bullet Case" by oscarherry3d (sketchfab.com/oscarherry3d), CC-BY-4.0</div>
+<div id="credit">Weapon: "M4 - FPS Weapon Animations Pack (v.1)" by BarcodeGames (sketchfab.com/barcodegames), CC-BY-4.0<br>Shotgun: "Sci-fi Super Shotgun" by tnnv (sketchfab.com/tnnv), CC-BY-4.0<br>Pistol: "CANIK RIVAL S" by Cam Diep Minh (sketchfab.com/diepminh1997), CC-BY-4.0<br>Casing: "Bullet Case" by oscarherry3d (sketchfab.com/oscarherry3d), CC-BY-4.0</div>
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -1622,17 +1622,28 @@ const opts = {
 // ---------------------------------------------------------------------------
 const GUN_RES = 240;          // weapon render height in pixels (width follows the screen's aspect)
 const GUN_FOV = 60;
-// The weapon: 'shotgun' (models/super_shotgun/super_shotgun.glb, tnnv's sawn-off side-by-side, held in the M4
-// pack's arms and moved by its clips: see holdShotgun) or 'm4' (the pack's own rifle)
-const WEAPON = 'shotgun', SHOTGUN = WEAPON === 'shotgun';
-// M4: 30 rounds, full auto at 800 rpm (mid M4A1 range), one bullet a shot. Shotgun: 2 shells, both barrels fire at
-// once (8 pellets each), then it reloads FIRE_INTERVAL s later. A pellet goes up to SPREAD rad off the aim.
-const MAG = SHOTGUN ? 2 : 30, FIRE_INTERVAL = SHOTGUN ? 0.25 : 0.075, PELLETS = SHOTGUN ? 16 : 1, SPREAD = SHOTGUN ? 0.05 : 0;
-// How hard a shot hits (shotgun 1): it sets the camera's kick and shake, the gun's recoil, and how long a demon it
-// hits goes on bleeding (see KICK_PER_SHOT, RECOIL_BACK, BLEED_TIME)
-const POWER = SHOTGUN ? 1 : 0.15;
-const SPLAT_SCALE = SHOTGUN ? 1.5 : 1; // how much bigger a shot's airborne splash is drawn (not more of it: see burstBlood)
-const RELOAD_SPEED = SHOTGUN ? 2.3 : 2.5; // reload clips play this much faster (3.6 s → 1.45 s, the shotgun's 1.6 s): the demons don't wait
+// The weapons, all in the M4 pack's arms and moved by its clips, switched with keys 1-4 (see useWeapon), the pistol to
+// start: fists (the arms bare: see holdFists), the pistol (models/pistol/pistol.glb, Cam Diep Minh's Canik Rival S:
+// see holdPistol), the M4 (the pack's own rifle) and the shotgun (models/super_shotgun/super_shotgun.glb, tnnv's
+// sawn-off side-by-side: see holdShotgun). Each one's:
+//   mag: rounds (M4 30, full auto at 800 rpm, mid M4A1 range; the shotgun 2 shells, both barrels at once, 8 pellets
+//     each, then it reloads; the pistol 20, the extended magazine, one shot a click; fists: a punch every interval s
+//     while it's held, left and right in turn: see punch)
+//   interval: s between shots; pellets a shot, up to spread rad off the aim
+//   power: how hard a shot hits (shotgun 1): the camera's kick and shake, the gun's recoil, and how long a demon it
+//     hits goes on bleeding (see KICK_PER_SHOT, RECOIL_BACK, BLEED_TIME)
+//   splat: how much bigger a shot's airborne splash is drawn (not more of it: see burstBlood)
+//   reload: how much faster the reload clips play (3.6 s → 1.45 s at 2.5; the shotgun's 1.6 s): the demons don't wait
+//   flash: the muzzle flash's size (the shotgun: both barrels' in one; the pistol: a 9 mm through a compensator)
+const WEAPONS = {
+  fists: { key: 'Digit1', mag: 1, interval: 0.3, pellets: 1, spread: 0, power: 0.3, splat: 1, reload: 2.5, flash: 1 },
+  pistol: { key: 'Digit2', mag: 20, interval: 0.12, pellets: 1, spread: 0, power: 0.3, splat: 1, reload: 2.8, flash: 0.7 },
+  m4: { key: 'Digit3', mag: 30, interval: 0.075, pellets: 1, spread: 0, power: 0.15, splat: 1, reload: 2.5, flash: 1 },
+  shotgun: { key: 'Digit4', mag: 2, interval: 0.25, pellets: 16, spread: 0.05, power: 1, splat: 1.5, reload: 2.3, flash: 1.4 },
+};
+// The one in hand (set by useWeapon; read all over, so kept as these names)
+let WEAPON = 'pistol', SHOTGUN = false, PISTOL = true, FISTS = false;
+let MAG = 20, FIRE_INTERVAL = 0.12, PELLETS = 1, SPREAD = 0, POWER = 0.3, SPLAT_SCALE = 1, RELOAD_SPEED = 2.8;
 const BOB = 0.04;             // weapon bob size, in screen units (2 = full screen height)
 
 const gunScene = new THREE.Scene();
@@ -1659,9 +1670,18 @@ const gunQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasi
   blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
 }));
 hudScene.add(gunQuad);
+// Fists: the left fist is the right one's image, mirrored (see holdFists): drawn into its own target, laid over the
+// screen flipped left to right (it follows the gun's bob), under the right
+const gunMirrorRT = gunRT.clone(), gunMirrorQuad = new THREE.Mesh(gunQuad.geometry, gunQuad.material.clone());
+gunMirrorQuad.material.map = gunMirrorRT.texture;
+gunMirrorQuad.scale.x = -1;
+gunMirrorQuad.renderOrder = -1;
+gunMirrorQuad.visible = false; // (fists only: see useWeapon)
+hudScene.add(gunMirrorQuad);
 function sizeGun() {
   const w = Math.round((GUN_RES * innerWidth) / innerHeight);
   gunRT.setSize(w, GUN_RES);
+  gunMirrorRT.setSize(w, GUN_RES);
   gunCam.aspect = w / GUN_RES;
   gunCam.updateProjectionMatrix();
   if (gun) gun.dirty = true;
@@ -1705,7 +1725,6 @@ const muzzleSprite = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.3), new THREE
 muzzleSprite.material.uniforms.uRepeat = { value: flashSheet.repeat };
 muzzleSprite.material.uniforms.uOffset = { value: flashSheet.offset };
 muzzleSprite.visible = false;
-if (SHOTGUN) muzzleSprite.scale.setScalar(1.4); // both barrels' flashes in one
 gunScene.add(muzzleSprite);
 
 let gun = null;      // { root, mixer, actions, joint, muzzle, hinge, shells, arm, shellsOut, handOver, eyeBack, flick, lower, firedAt, ammo, busy, cooldown, animAcc, lastLights, dirty, flashUntil, flashVariant, flashMirror, flashFrame }
@@ -1714,6 +1733,161 @@ const _toGun = new THREE.Matrix4(), _gs = new THREE.Vector3(), _mw = new THREE.V
 const _tgp = new THREE.Vector3(), _tgq = new THREE.Quaternion();
 const _flickAt = new THREE.Vector3(), _flickAxis = new THREE.Vector3(), _flickQ = new THREE.Quaternion();
 
+// The pistol in the M4's place, as the shotgun (see holdShotgun): the rifle's meshes hidden, the pistol on the rifle's
+// joint at the ready pose, its trigger (its origin) on the rifle's trigger, facing where the eye looks (metres, barrel
+// along −Z, up +Y: see tools/pistol.py). Returns its muzzle (the compensator's front, on the bore: PISTOL_MUZZLE, in
+// its own space) and its "Slide", which runs back SLIDE_BACK m and home over SLIDE_TIME s a shot, and stays back
+// on an empty magazine.
+const PISTOL_MUZZLE = [0, 0.0392, -0.1665], SLIDE_BACK = 0.025, SLIDE_TIME = 0.08; // m; m; s
+// One-handed: the left arm (from the shoulder) shrunk to nothing after every pose (the clips still move it, for the
+// rifle), and the whole view shifted so the pistol sits higher, still out to the right in the right hand: the gun's
+// eye moved PISTOL_VIEW m right and down (so the hand and pistol show up left and up)
+const PISTOL_VIEW = [0, -0.085];
+function holdPistol(root, draw, mainJoint, pistol) {
+  root.traverse((o) => { if (o.isMesh && !o.isSkinnedMesh) o.visible = false; });
+  draw.play();
+  draw.time = draw.getClip().duration;
+  draw.getMixer().update(0);
+  root.updateMatrixWorld(true);
+  root.getObjectByName('FPS_Camera_j_01').matrixWorld.decompose(_sgP, _sgQ, _sgS);
+  new THREE.Box3().setFromObject(root.getObjectByName('Trigger_M4_D_0')).getCenter(_sgP);
+  pistol.matrix.compose(_sgP, _sgQ, _sgS.set(1, 1, 1)).premultiply(mainJoint.matrixWorld.clone().invert());
+  pistol.matrix.decompose(pistol.position, pistol.quaternion, pistol.scale);
+  mainJoint.add(pistol);
+  draw.stop();
+  const muzzle = new THREE.Object3D();
+  muzzle.position.fromArray(PISTOL_MUZZLE);
+  pistol.add(muzzle);
+  return { muzzle, slide: pistol.getObjectByName('Slide') };
+}
+// Fists: the rifle's meshes hidden; only the right arm is ever drawn, posed by us (reachArm, every pose); the left fist is
+// its image, mirrored left to right (drawn twice: the right arm posed as the left fist would be, into the mirror's image,
+// then as itself: see updateGun). The rig's two arms are only near mirror copies (the left hand ~5% smaller, the thumbs
+// built differently, the light falling differently on each side), so posing the left as its own arm, even as the right's
+// mirror image bone by bone, never quite looked like the same fist.
+// The guard: fists up, the forearms standing up from elbows down and out to the fists (a boxer's triangle), the wrists
+// straight, the curled fingers facing the other fist (thumb sides towards you); a punch drives a fist out to the middle
+// of the view and back over PUNCH_TIME s (fast out, slower back), left and right in turn, the fist turning palm down
+// (a corkscrew). Positions are the right arm's, in the eye's space (cm: its bone's units). The rig's shoulders sit where
+// a rifle wants them (the right one 39 cm behind the eye, out of reach of anything in front), so the fist's is set
+// (FIST_SHOULDER): low and forward; a punch drives it forward (FIST_SHOULDER_OUT) with the arm (~51 cm) to full stretch
+// at FIST_OUT.
+const FIST_SHOULDER = [32, -47, -11], FIST_SHOULDER_OUT = [16, -38, -14], FIST_GUARD = [16, -17, -36], FIST_OUT = [4, -8, -50];
+const FIST_ELBOW = [65, -100, -40]; // the way the elbow bends: down and out from under the fist
+// A tight fist: each finger from straight (the rig's bind pose) bent this far at its three knuckles (rad); the thumb
+// from straight bent the way the rig's own pose bends it (round the rifle's grip), times FIST_THUMB_CLOSE at its base,
+// knuckle and last joint (so it closes along the joints' own axes: aimed at points instead, it twisted and tore), then
+// turned FIST_THUMB_LOWER rad down the fist at its base (it sat high); the guard breathing FIST_SWAY cm up and down
+const FIST_BEND = [1.45, 1.75, 1.1], FIST_THUMB_CLOSE = [1.7, 1.9, 1.85], FIST_THUMB_LOWER = 0.7;
+const FIST_SWAY = 0.5, FIST_SWAY_HZ = 0.8, PUNCH_TIME = 0.28; // cm; Hz; s
+// A punch lands on the nearest demon in front, its body within PUNCH_REACH m of your eye and within PUNCH_CONE (rad)
+// of your aim, PUNCH_HIT of the way into the punch, for PUNCH_DAMAGE (a shot does 1; each point knocks it back too)
+const PUNCH_REACH = 1.4, PUNCH_CONE = 0.45, PUNCH_HIT = 0.35, PUNCH_DAMAGE = 3;
+// The fists, [left, right]: the right arm with all it needs to pose; the left only its punch (it's the right, mirrored)
+function holdFists(root, draw) {
+  let skeleton = null;
+  root.traverse((o) => { if (o.isSkinnedMesh) skeleton = o.skeleton; });
+  const bindWorld = (b) => new THREE.Matrix4().copy(skeleton.boneInverses[skeleton.bones.indexOf(b)]).invert();
+  const bindTurn = (b) => { // a bone's turn on its parent in the bind pose
+    const local = bindWorld(b.parent).invert().multiply(bindWorld(b));
+    return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().extractRotation(local));
+  };
+  root.traverse((o) => { if (o.isMesh && !o.isSkinnedMesh) o.visible = false; });
+  draw.play();
+  draw.time = draw.getClip().duration;
+  draw.getMixer().update(0);
+  root.updateMatrixWorld(true);
+  const at = (b) => b.getWorldPosition(new THREE.Vector3());
+  const bone = (re) => { let f = null; root.traverse((o) => { if (!f && re.test(o.name)) f = o; }); return f; };
+  const L = { punchAt: -Infinity };
+  const R = { upper: bone(/^RightArm_\d+$/), fore: bone(/^RightForeArm_\d+$/), hand: bone(/^RightHand_\d+$/), punchAt: -Infinity };
+  // the right hand's own directions (its bone's space): along it (wrist to knuckles), and the way the fingers curl
+  const wrist = at(R.hand), along = at(bone(/^RightHandMiddle1_/)).sub(wrist).normalize();
+  const curl = at(bone(/^RightHandMiddle4_/)).sub(wrist);
+  curl.addScaledVector(along, -curl.dot(along)).normalize();
+  const inv = R.hand.getWorldQuaternion(new THREE.Quaternion()).invert();
+  R.along = along.applyQuaternion(inv); R.curl = curl.applyQuaternion(inv);
+  R.side = R.along.clone().cross(R.curl); // (the fingers curl round it)
+  const S0 = at(R.upper), E0 = at(R.fore);
+  R.elbowAxis = E0.clone().sub(S0).cross(wrist.clone().sub(E0)).normalize().applyQuaternion(R.upper.getWorldQuaternion(new THREE.Quaternion()).invert());
+  R.fingers = [];
+  R.hand.traverse((b) => { if (/^RightHand(Index|Middle|Ring|Pinky)[123]_/.test(b.name)) R.fingers.push(b); });
+  R.joint = R.fingers.map((b) => +/([123])_\d+$/.exec(b.name)[1] - 1); // (0: the knuckle)
+  R.thumb = [1, 2, 3].map((j) => bone(new RegExp(`^RightHandThumb${j}_`)));
+  R.thumbRest = R.thumb.map((b) => b.quaternion.clone()); // (the rig's pose: the clips don't move the thumbs)
+  // ...straight (their turns in the bind pose), bent from there each pose: the clips don't move the fingers, so
+  // nothing else puts them back between poses (bent from wherever they were, they wound round and round)
+  R.fingerBind = R.fingers.map(bindTurn);
+  R.thumbBind = R.thumb.map(bindTurn);
+  // ...and the arm as the clip leaves it (Draw's end): each pose starts from there. Once Draw has ended nothing else puts
+  // the arm back (three only writes a bone when the clip's value changes), and reachArm turns the forearm the least it
+  // can from wherever it was, so its roll about its length crept ~6° a punch, for good
+  R.armRest = [R.upper.quaternion.clone(), R.fore.quaternion.clone()];
+  draw.stop();
+  return [L, R];
+}
+const _fa = new THREE.Vector3(), _fb = new THREE.Vector3(), _fc = new THREE.Vector3(), _fd = new THREE.Vector3();
+const _fm = new THREE.Matrix4(), _fn = new THREE.Matrix4(), _fq = new THREE.Quaternion(), _fp = new THREE.Quaternion();
+// The right arm posed, as at now (the latest pose's time), its punch thrown at punchAt
+function poseFist(arm, punchAt, now) {
+  const eye = gun.joint;
+  arm.upper.quaternion.copy(arm.armRest[0]);
+  arm.fore.quaternion.copy(arm.armRest[1]); // (reachArm updates the chain's matrices)
+  const t = (now - punchAt) / PUNCH_TIME;
+  const out = t < 0 || t >= 1 ? 0 : t < PUNCH_HIT ? smooth(t, 0, PUNCH_HIT) : 1 - smooth(t, PUNCH_HIT, 1);
+  const sway = FIST_SWAY * Math.sin(now * FIST_SWAY_HZ * 2 * Math.PI) * (1 - out);
+  const wrist = eye.localToWorld(_fa.fromArray(FIST_GUARD).lerp(_fb.fromArray(FIST_OUT), out).setY(_fa.y + sway));
+  const shoulder = eye.localToWorld(_fb.fromArray(FIST_SHOULDER).lerp(_fc.fromArray(FIST_SHOULDER_OUT), out));
+  const elbowAt = eye.localToWorld(_fc.fromArray(FIST_ELBOW));
+  reachArm(arm, wrist, shoulder, 1, elbowAt);
+  // the fist: knuckles along the forearm (elbow to wrist), the curled fingers facing the other fist in the guard,
+  // turning to face down as it punches out
+  const A = arm.hand.getWorldPosition(_fa).sub(arm.fore.getWorldPosition(_fb)).normalize();
+  const D = eye.localToWorld(_fc.set(-(1 - out), -out, 0)).sub(eye.getWorldPosition(_fd)).normalize();
+  D.addScaledVector(A, -D.dot(A)).normalize();
+  _fm.makeBasis(A, D, _fb.crossVectors(A, D)); // world: along, curl, side
+  _fn.makeBasis(arm.along, arm.curl, _fd.crossVectors(arm.along, arm.curl)).transpose(); // (local, inverted)
+  _fq.setFromRotationMatrix(_fm.multiply(_fn));
+  arm.hand.quaternion.copy(arm.fore.getWorldQuaternion(_fp).invert().multiply(_fq));
+  arm.hand.updateMatrixWorld(true);
+  const side = _fa.copy(arm.side).applyQuaternion(arm.hand.getWorldQuaternion(_fp));
+  arm.fingers.forEach((b, i) => { b.quaternion.copy(arm.fingerBind[i]); b.updateMatrixWorld(true); turnAbout(b, side, FIST_BEND[arm.joint[i]]); });
+  arm.thumb.forEach((b, i) => { b.quaternion.slerpQuaternions(arm.thumbBind[i], arm.thumbRest[i], FIST_THUMB_CLOSE[i]); b.updateMatrixWorld(true); });
+  turnAbout(arm.thumb[0], _fa.copy(arm.curl).applyQuaternion(arm.hand.getWorldQuaternion(_fp)), FIST_THUMB_LOWER);
+}
+// A punch (from tryFire): the next fist goes out; it lands PUNCH_HIT of the way in (see landPunch, from updateGun)
+function punch(now) {
+  const arm = gun.fists[gun.nextFist ^= 1];
+  arm.punchAt = now;
+  gun.punchLands = now + PUNCH_TIME * PUNCH_HIT;
+  gun.dirty = true;
+  shakeKick += KICK_PER_SHOT * 0.5;
+}
+const _pa = new THREE.Vector3(), _pt = new THREE.Vector3();
+function landPunch() {
+  gun.punchLands = Infinity;
+  const o = camera.position, aim = camera.getWorldDirection(_pa);
+  let best = null, bestT = Infinity;
+  for (const npc of npcs) {
+    if (npc.dead) continue;
+    const c = _pt.copy(npc.imp.model.position).add(npc.imp.fit).sub(o), r = npc.imp.r * 0.5;
+    const t = c.dot(aim), d = c.length();
+    if (t <= 0 || d - r > PUNCH_REACH || Math.acos(Math.min(t / d, 1)) > PUNCH_CONE + Math.atan2(r, d)) continue;
+    if (d < bestT) { bestT = d; best = npc; }
+  }
+  if (!best) return;
+  // where it lands: on the near side of its body, along the line from you to it
+  const c = _pt.copy(best.imp.model.position).add(best.imp.fit), dir = c.clone().sub(o).normalize();
+  const entry = c.clone().addScaledVector(dir, -best.imp.r * 0.35);
+  const hit = { entry, exit: entry.clone().addScaledVector(dir, 0.1), dir, npc: best };
+  paintWound(best, entry);
+  for (let k = 0; k < PUNCH_DAMAGE; k++) damageNpc(best, dir);
+  burstBlood(hit, FL_GOBS, 0.7);
+  splashLens(entry);
+  playSound('punch', 1, 0.08);
+  playSquelch(0.6, 0.8);
+  shakeKick += KICK_PER_SHOT;
+}
 // The shotgun in the M4's place: the rifle's own meshes hidden (the arms stay), the shotgun on the rifle's joint so
 // every clip carries it. Placed at the ready pose (the end of Draw): its trigger (its origin) on the rifle's trigger,
 // facing where the eye looks (it's in metres, barrels along −Z, up +Y: see tools/super_shotgun.py). Returns its
@@ -1781,7 +1955,8 @@ const breakOpen = (t) => BREAK_ANGLE * Math.min(smooth(t, 0.08, 0.22), 1 - THREE
 const SWING_UP = 0.35;
 // The gun's kick on firing: thrown back this far (m) and its muzzle up this far (rad, round its grip) at POWER 1, at
 // once, easing back with this time constant (s)
-const RECOIL_BACK = 0.07 * POWER, RECOIL_PITCH = 0.3 * POWER, RECOIL_TIME = 0.1;
+let RECOIL_BACK = 0.07 * POWER, RECOIL_PITCH = 0.3 * POWER; // (see useWeapon)
+const RECOIL_TIME = 0.1;
 // The gun and both arms are lowered this far (m) while it's open and being loaded, and brought back up by the flick
 const RELOAD_LOWER = 0.05;
 const SHELLS_SEATED = [0, SHOTGUN_BREECH[1] - 0.0271, SHOTGUN_BREECH[2] + 0.1049]; // rims on the breech face
@@ -1820,14 +1995,15 @@ const _rf = new THREE.Quaternion(), _rg = new THREE.Quaternion();
 function shotgunReload(t) {
   gun.hinge.rotation.x = -breakOpen(t); // −: muzzles down
   gun.hinge.updateWorldMatrix(true, false);
-  if (t > 0.2 && !gun.shellsOut) { gun.shellsOut = true; dropShells(); }
+  const spent = gun.modes.shotgun; // (spent: fired since its shells last dropped; a reload begun again after a switch drops none)
+  if (t > 0.2 && !gun.shellsOut) { gun.shellsOut = true; if (spent.spent) { spent.spent = false; dropShells(); } }
   const w = smooth(t, 0, 0.05) * (1 - smooth(t, 0.96, 0.998)); // how much the left arm is ours, not the clip's
   gun.eyeBack = RELOAD_EYE_BACK * smooth(t, 0.34, 0.42) * (1 - smooth(t, 0.7, 0.8)); // (eased while it's out of view)
   gun.handOver = t > 0.42 && t < 0.72; // drawn over the gun while it punches and rests there (see splitLeftArm)
   gun.flick = SWING_UP * smooth(t, 0.78, 0.83) * (1 - smooth(t, 0.85, 0.95));
   gun.lower = RELOAD_LOWER * smooth(t, 0.04, 0.2) * (1 - smooth(t, 0.78, 0.85));
   const sh = gun.shells;
-  sh.visible = t > 0 && (t < 0.2 || t > 0.36); // the spent shells until they drop, then the new ones
+  sh.visible = t > 0 && ((t < 0.2 && spent.spent) || t > 0.36); // the spent shells until they drop, then the new ones
   sh.position.fromArray(SHELLS_SEATED);
   if (w <= 0) return;
   const arm = gun.arm, hand = arm.hand, H = gun.hinge;
@@ -1955,10 +2131,10 @@ function dropShells() {
     _brP.set(x, SHOTGUN_BREECH[1], SHOTGUN_BREECH[2]).sub(gun.hinge.position); // (in the hinge's space)
     gun.hinge.localToWorld(_brP).applyMatrix4(gunCam.matrixWorldInverse).applyMatrix4(camera.matrixWorld); // gun → view → world
     _brV.copy(_cf).multiplyScalar(-0.2).add(camera.up).addScaledVector(_cf.clone().cross(camera.up), x * 30 * Math.random());
-    dropCasing(_brP, _brV);
+    dropCasing(_brP, _brV, 'shell');
   }
 }
-function setupGun(g, shotgun) {
+function setupGun(g, models) { // models: the pistol's and the shotgun's scenes
   // The pack's clips are slices of one long timeline (Fire's keys sit at 7.5–8.3 s); move each to start at 0
   for (const clip of g.animations) {
     const start = Math.min(...clip.tracks.map((t) => t.times[0]));
@@ -1991,23 +2167,63 @@ function setupGun(g, shotgun) {
     a.clampWhenFinished = true; // every clip ends in the ready pose, so holding the last frame = idle
     return [c.name, a];
   }));
-  actions.Reload.timeScale = actions.Reload_Empty.timeScale = RELOAD_SPEED;
-  let hinge = null, shells = null, arm = null;
-  if (shotgun) ({ muzzle, hinge, shells, arm } = holdShotgun(root, actions.Draw, mainJoint, shotgun.scene));
+  // Every weapon set up on the one rig, each one's parts kept apart (modes: what useWeapon swaps in), each from the rig
+  // as it comes (pristine: every bone's place, turn and size), which a weapon is put back to when it's taken up
+  const pristine = [];
+  root.traverse((o) => { if (o.isBone) pristine.push([o, o.position.clone(), o.quaternion.clone(), o.scale.clone()]); });
+  const restore = () => { for (const [b, p, q, sc] of pristine) { b.position.copy(p); b.quaternion.copy(q); b.scale.copy(sc); } };
+  const meshesOf = (o) => { const m = []; o.traverse((c) => { if (c.isMesh && !c.isSkinnedMesh) m.push(c); }); return m; };
+  const leftArm = root.getObjectByName('LeftArm_026'); // (hidden, for the pistol: see PISTOL_VIEW; and fists: see holdFists)
+  const modes = { m4: { muzzle, meshes: meshesOf(root) } };
+  modes.shotgun = { ...holdShotgun(root, actions.Draw, mainJoint, models.shotgun), meshes: meshesOf(models.shotgun) };
+  restore();
+  modes.pistol = { ...holdPistol(root, actions.Draw, mainJoint, models.pistol), meshes: meshesOf(models.pistol), offArm: leftArm };
+  restore();
+  modes.fists = { fists: holdFists(root, actions.Draw), meshes: [], offArm: leftArm };
+  restore();
   gun = {
-    root, mixer, actions, muzzle, hinge, shells, arm, joint: root.getObjectByName('FPS_Camera_j_01'),
-    ammo: MAG, busy: true, cooldown: 0, firedAt: -Infinity, animAcc: 1 / opts.animFps, lastLights: -1, dirty: true, flashUntil: 0,
-    flashVariant: 0, flashMirror: false, flashFrame: -1,
+    root, mixer, actions, modes, pristine, ammoOf: {}, joint: root.getObjectByName('FPS_Camera_j_01'), nextFist: 1, posedAt: 0,
+    animAcc: 1 / opts.animFps, lastLights: -1, flashVariant: 0, flashMirror: false, flashFrame: -1,
   };
   mixer.addEventListener('finished', (e) => {
     if (e.action === actions.Reload || e.action === actions.Reload_Empty) gun.ammo = MAG;
     if (e.action !== actions.Fire) gun.busy = false;
     updateAmmo();
   });
+  for (const m of Object.values(modes)) for (const o of m.meshes) o.visible = true; // (blood masks are made for what's shown)
   gun.blood = addGunBlood(root);
   gun.splashes = []; // demon blood to paint on it (see splashGun)
-  playGun('Draw');
   sizeGun();
+  useWeapon(WEAPON);
+}
+// Takes up a weapon (see WEAPONS): its numbers in place; the rig put back as it came (nothing of the last one's pose
+// carries over: fists' curled fingers, the pistol's hidden arm, the shotgun's reloading arm), only its parts shown,
+// at rest; its own ammo (as it was left); then drawn
+function useWeapon(name) {
+  const w = WEAPONS[name], m = gun.modes[name];
+  gun.ammoOf[WEAPON] = gun.ammo;
+  WEAPON = name; SHOTGUN = name === 'shotgun'; PISTOL = name === 'pistol'; FISTS = name === 'fists';
+  ({ mag: MAG, interval: FIRE_INTERVAL, pellets: PELLETS, spread: SPREAD, power: POWER, splat: SPLAT_SCALE, reload: RELOAD_SPEED } = w);
+  RECOIL_BACK = 0.07 * POWER; RECOIL_PITCH = 0.3 * POWER; KICK_PER_SHOT = 0.04 * POWER; TRAUMA_PER_SHOT = POWER;
+  BLEED_SPURTS = Math.floor(BLEED_TIME * POWER / BLEED_EVERY + 1e-6);
+  muzzleSprite.scale.setScalar(w.flash);
+  gunMirrorQuad.visible = FISTS;
+  trigger = false;
+  for (const [b, p, q, sc] of gun.pristine) { b.position.copy(p); b.quaternion.copy(q); b.scale.copy(sc); }
+  for (const [k, mode] of Object.entries(gun.modes)) for (const o of mode.meshes) o.visible = k === name;
+  Object.assign(gun, {
+    muzzle: m.muzzle ?? gun.modes.m4.muzzle, hinge: m.hinge ?? null, shells: m.shells ?? null, arm: m.arm ?? null,
+    slide: m.slide ?? null, offArm: m.offArm ?? null, fists: m.fists ?? null, ammo: gun.ammoOf[name] ?? MAG, busy: true,
+    cooldown: 0, firedAt: -Infinity, flashUntil: 0, punchLands: Infinity, handOver: false, eyeBack: 0, lower: 0, flick: 0,
+    shellsOut: false, dirty: true, animAcc: 1 / opts.animFps, // (posed at once: else the rig's rest pose showed a moment)
+  });
+  gun.reloadSound?.stop(); // (the last one's reload, if it was mid-way)
+  if (gun.hinge) gun.hinge.rotation.x = 0; // (shut)
+  if (gun.shells) gun.shells.visible = false;
+  if (gun.slide) gun.slide.position.z = 0;
+  for (const f of gun.fists ?? []) f.punchAt = -Infinity;
+  gun.actions.Reload.timeScale = gun.actions.Reload_Empty.timeScale = RELOAD_SPEED;
+  playGun('Draw');
   updateAmmo();
 }
 
@@ -2022,8 +2238,9 @@ function playGun(name) {
 // way to full, so it rattles hard from the first shot and a sustained burst only tops it up a little), on smooth
 // noise so it rattles rather than jitters. Applied to the
 // camera only for the render and undone straight after, so the mouse look never inherits it.
-const KICK_PER_SHOT = 0.04 * POWER, KICK_RETURN = 14, HIT_KICK = 0.05, HIT_KICK_RETURN = 9; // rad; 1/s: being shot                       // rad, 1/s spring back
-const TRAUMA_PER_SHOT = POWER, TRAUMA_DECAY = 2.2, SHAKE_ANGLE = 0.018; // 0..1, per s, rad at full trauma
+let KICK_PER_SHOT = 0.04 * POWER, TRAUMA_PER_SHOT = POWER; // (see useWeapon)
+const KICK_RETURN = 14, HIT_KICK = 0.05, HIT_KICK_RETURN = 9; // rad; 1/s: being shot                       // rad, 1/s spring back
+const TRAUMA_DECAY = 2.2, SHAKE_ANGLE = 0.018; // (trauma 0..1) per s, rad at full trauma
 let shakeKick = 0, shakeTrauma = 0, hitKickYaw = 0, hitKickPitch = 0; // hitKick: a jolt from being shot (see demonShot)
 const _shakeE = new THREE.Euler(0, 0, 0, 'YXZ'), _shakeQ = new THREE.Quaternion(), _camQ = new THREE.Quaternion();
 const wobble = (t, seed) => 0.6 * Math.sin(t * 37 + seed) + 0.4 * Math.sin(t * 61 + seed * 2.3); // smooth, ~-1..1
@@ -2944,12 +3161,12 @@ function burstBlood({ entry, dir }, gobs = FL_GOBS, strength = 1, scale = 1) { /
 // s, for BLEED_TIME × the shot's POWER (the shotgun's: about half a second; the M4's: none, its hits come too fast
 // to need it). The wound moves with the demon.
 const BLEED_TIME = 0.5, BLEED_EVERY = 0.08, BLEED_GOBS = 2, BLEED_MAX = 12; // s at POWER 1, s, gobs a spurt, wounds at once
-const BLEED_SPURTS = Math.floor(BLEED_TIME * POWER / BLEED_EVERY + 1e-6);
+let BLEED_SPURTS = Math.floor(BLEED_TIME * POWER / BLEED_EVERY + 1e-6); // (see useWeapon)
 const bleeds = []; // { npc, at (from the demon's origin, m), dir, next (s), left }
-function startBleed(hit, now) {
-  if (!BLEED_SPURTS) return;
+function startBleed(hit, now, spurts) { // (spurts: the BLEED_SPURTS of the weapon that fired: it may be put away since)
+  if (!spurts) return;
   if (bleeds.length >= BLEED_MAX) bleeds.shift();
-  bleeds.push({ npc: hit.npc, at: hit.entry.clone().sub(hit.npc.imp.model.position), dir: hit.dir.clone(), next: now + BLEED_EVERY, left: BLEED_SPURTS });
+  bleeds.push({ npc: hit.npc, at: hit.entry.clone().sub(hit.npc.imp.model.position), dir: hit.dir.clone(), next: now + BLEED_EVERY, left: spurts, spurts });
 }
 const _bleedAt = new THREE.Vector3();
 function updateBleeds(now) {
@@ -2957,7 +3174,7 @@ function updateBleeds(now) {
     const b = bleeds[k];
     if (now < b.next) continue;
     b.next += BLEED_EVERY;
-    burstBlood({ entry: _bleedAt.copy(b.npc.imp.model.position).add(b.at), dir: b.dir }, BLEED_GOBS, 0.4 + 0.5 * b.left / BLEED_SPURTS);
+    burstBlood({ entry: _bleedAt.copy(b.npc.imp.model.position).add(b.at), dir: b.dir }, BLEED_GOBS, 0.4 + 0.5 * b.left / b.spurts);
     if (--b.left <= 0) bleeds.splice(k, 1);
   }
   for (let k = unflown.length - 1; k >= 0; k--) { // (see throwUnflown) the stains of gobs that weren't flown, as they land
@@ -3707,15 +3924,18 @@ function rayWorld(o, dir) {
 // end (seen a little from above, so its mouth and base show as it turns), lit by a plain key light and the room's
 // environment. In the world each casing is a quad facing you showing the frame for its tumble angle, multiplied by
 // the light where it is (bloodLight, as the demons get it). It arcs out, falls, bounces a couple of times and lies
-// on its side, for CASE_LIFE s. The shotgun's spent shells are baked the same way, from shellModel.
+// on its side, for CASE_LIFE s. The shotgun's spent shells are baked the same way, from shellModel. Each kind
+// (CASE_KINDS: its length, m) has its row in the one sheet, at the same pixels per cm: a frame CASE_PX px, showing
+// CASE_SPAN m (the longest kind fills 90% of it), so casings of every weapon can lie about at once.
 const CASE_MAX = 200, CASE_FRAMES = 16, CASE_LIFE = 30; // casings, frames, s
-const CASE_LEN = SHOTGUN ? 0.07 : 0.045, CASE_PX = SHOTGUN ? 36 : 24; // m, px a frame (the same pixels per cm for both)
+const CASE_KINDS = { rifle: 0.045, pistol: 0.03, shell: 0.07 }, CASE_ROW = Object.fromEntries(Object.keys(CASE_KINDS).map((k, i) => [k, i]));
+const CASE_SPAN = 0.07, CASE_PX = 36;
 const CASE_GRAVITY = 9.8, CASE_BOUNCE = 0.35; // m/s²; share of its speed a bounce keeps (upwards)
 // bloodLight's inverse-square sum has no ceiling: right by the muzzle flash or a floor light a casing would get dozens
 // of times the light all over (a real one shows a small highlight, not that), so it's capped, and so is the colour,
 // below BLOOM_THRESHOLD: casings brighten near lights but never glow
 const CASE_LIGHT_MAX = 1.5, CASE_COLOR_MAX = 2.0;
-const caseRT = new THREE.WebGLRenderTarget(CASE_FRAMES * CASE_PX, CASE_PX, {
+const caseRT = new THREE.WebGLRenderTarget(CASE_FRAMES * CASE_PX, Object.keys(CASE_KINDS).length * CASE_PX, {
   type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
 });
 // A spent 12-gauge shell, along +Y: the red plastic hull (open at the mouth, where the crimp unfolded on firing) on a
@@ -3734,14 +3954,14 @@ function shellModel() {
   part(R, 0.054, 0.016, red, true);           // the hull
   return shell;
 }
-function bakeCasings(model) {
+function bakeCasings(model, kind) { // into its kind's row (see CASE_KINDS)
   const inner = new THREE.Group(), pivot = new THREE.Group();
   inner.add(model.clone(true));
   pivot.add(inner);
   inner.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(inner), size = box.getSize(new THREE.Vector3());
   inner.position.copy(box.getCenter(new THREE.Vector3())).negate();
-  pivot.scale.setScalar(1.8 / size.y); // its length (model Y) fills 90% of a frame
+  pivot.scale.setScalar((1.8 / size.y) * (CASE_KINDS[kind] / CASE_SPAN)); // its length (model Y): 90% of a frame at CASE_SPAN
   const bake = new THREE.Scene(), key = new THREE.DirectionalLight(0xfff0d8, 2.5);
   bake.environment = scene.environment;
   key.position.set(-1, 2, 3);
@@ -3754,7 +3974,7 @@ function bakeCasings(model) {
   caseRT.scissorTest = true;
   for (let k = 0; k < CASE_FRAMES; k++) {
     pivot.rotation.set(0.5, 0, (k / CASE_FRAMES) * 2 * Math.PI); // turned in your view's plane, tipped towards you
-    caseRT.viewport.set(k * CASE_PX, 0, CASE_PX, CASE_PX);
+    caseRT.viewport.set(k * CASE_PX, CASE_ROW[kind] * CASE_PX, CASE_PX, CASE_PX);
     caseRT.scissor.copy(caseRT.viewport);
     renderer.setRenderTarget(caseRT);
     renderer.render(bake, cam);
@@ -3765,6 +3985,7 @@ function bakeCasings(model) {
 const casePos = new Float32Array(CASE_MAX * 3), caseVel = new Float32Array(CASE_MAX * 3);
 const caseAngle = new Float32Array(CASE_MAX), caseSpin = new Float32Array(CASE_MAX), caseLife = new Float32Array(CASE_MAX);
 const caseLanded = new Uint8Array(CASE_MAX); // its drop sound played
+const caseKind = new Float32Array(CASE_MAX); // its row (see CASE_KINDS)
 let caseNext = 0;
 const caseGeo = new THREE.InstancedBufferGeometry();
 {
@@ -3777,20 +3998,20 @@ const caseAttr = (name, n) => {
   caseGeo.setAttribute(name, a);
   return a;
 };
-const caseAttrPos = caseAttr('aPos', 3), caseAttrLight = caseAttr('aLight', 3), caseAttrFrame = caseAttr('aFrame', 1);
+const caseAttrPos = caseAttr('aPos', 3), caseAttrLight = caseAttr('aLight', 3), caseAttrFrame = caseAttr('aFrame', 1), caseAttrKind = caseAttr('aKind', 1);
 caseGeo.instanceCount = 0;
 const casings = new THREE.Mesh(caseGeo, new THREE.ShaderMaterial({
   uniforms: { uSheet: { value: caseRT.texture }, uFogColor: { value: new THREE.Color() }, uFogDensity: { value: 0 } },
   vertexShader: `
     attribute vec3 aPos, aLight;
-    attribute float aFrame;
+    attribute float aFrame, aKind;
     varying vec2 vUv;
     varying vec3 vLight;
     varying float vZ;
     void main() {
       vec4 c = viewMatrix * vec4(aPos, 1.0);
-      c.xy += position.xy * ${(CASE_LEN / 0.9).toFixed(4)}; // facing you; the casing fills 90% of its frame
-      vUv = vec2((position.x + 0.5 + aFrame) / ${CASE_FRAMES}.0, position.y + 0.5);
+      c.xy += position.xy * ${(CASE_SPAN / 0.9).toFixed(4)}; // facing you; a frame shows CASE_SPAN in 90% of it
+      vUv = vec2((position.x + 0.5 + aFrame) / ${CASE_FRAMES}.0, (position.y + 0.5 + aKind) / ${Object.keys(CASE_KINDS).length}.0);
       vLight = min(aLight, vec3(${CASE_LIGHT_MAX.toFixed(1)})); vZ = -c.z;
       gl_Position = projectionMatrix * c;
     }`,
@@ -3815,10 +4036,11 @@ function ejectCasing() { // out of the port: right of and a little below your ey
   _cr.crossVectors(_cf, camera.up).normalize();
   _cu.crossVectors(_cr, _cf);
   const p = _v.copy(camera.position).addScaledVector(_cr, 0.14).addScaledVector(_cu, -0.12).addScaledVector(_cf, 0.45);
-  dropCasing(p, _cr.clone().multiplyScalar(2.2 + Math.random()).addScaledVector(_cu, 1.2 + Math.random() * 0.8).addScaledVector(_cf, (Math.random() - 0.7) * 0.6));
+  dropCasing(p, _cr.clone().multiplyScalar(2.2 + Math.random()).addScaledVector(_cu, 1.2 + Math.random() * 0.8).addScaledVector(_cf, (Math.random() - 0.7) * 0.6), PISTOL ? 'pistol' : 'rifle');
 }
-function dropCasing(p, v) { // a casing at p (world), flying at v (m/s)
+function dropCasing(p, v, kind) { // a casing (of a kind: see CASE_KINDS) at p (world), flying at v (m/s)
   const i = caseNext++ % CASE_MAX, k = i * 3;
+  caseKind[i] = CASE_ROW[kind];
   casePos.set([p.x, p.y, p.z], k);
   caseVel.set([v.x, v.y, v.z], k);
   caseAngle[i] = Math.random() * 2 * Math.PI;
@@ -3828,7 +4050,7 @@ function dropCasing(p, v) { // a casing at p (world), flying at v (m/s)
 }
 function updateCasings(dt) {
   let n = 0;
-  const P = caseAttrPos.array, F = caseAttrFrame.array;
+  const P = caseAttrPos.array, F = caseAttrFrame.array, K = caseAttrKind.array;
   for (let i = 0; i < CASE_MAX; i++) {
     if (caseLife[i] <= 0) continue;
     if ((caseLife[i] -= dt) <= 0) continue;
@@ -3856,10 +4078,11 @@ function updateCasings(dt) {
     P.set(casePos.subarray(k, k + 3), n * 3);
     bloodLight(casePos[k], casePos[k + 1], casePos[k + 2], caseAttrLight.array, n * 3);
     const turn = ((caseAngle[i] / (2 * Math.PI)) % 1 + 1) % 1;
+    K[n] = caseKind[i];
     F[n++] = Math.round(turn * CASE_FRAMES) % CASE_FRAMES;
   }
   caseGeo.instanceCount = n;
-  caseAttrPos.needsUpdate = caseAttrLight.needsUpdate = caseAttrFrame.needsUpdate = true;
+  caseAttrPos.needsUpdate = caseAttrLight.needsUpdate = caseAttrFrame.needsUpdate = caseAttrKind.needsUpdate = true;
   casings.material.uniforms.uFogColor.value.copy(scene.fog.color);
   casings.material.uniforms.uFogDensity.value = scene.fog.density;
 }
@@ -4016,6 +4239,7 @@ function firePellets() {
     const r = SPREAD * Math.sqrt(Math.random()), a = Math.random() * 2 * Math.PI; // evenly over a disc
     shots.push(fireShot(_pel.clone().addScaledVector(_pelR, r * Math.cos(a)).addScaledVector(_pelU, r * Math.sin(a)).normalize()));
   }
+  const splat = SPLAT_SCALE, spurts = BLEED_SPURTS; // (this weapon's: the hits land a frame or two later, maybe after a switch)
   Promise.all(shots).then((hits) => {
     const byDemon = new Map(); // the demon → its first hit, and how many pellets hit it
     for (const hit of hits) {
@@ -4026,9 +4250,9 @@ function firePellets() {
     }
     for (const { hit, n } of byDemon.values()) {
       const gobs = Math.min(FL_GOBS + n - 1, BURST_GOBS_MAX);
-      burstBlood(hit, gobs, 1, SPLAT_SCALE);
+      burstBlood(hit, gobs, 1, splat);
       throwUnflown(hit, n * FL_GOBS - gobs, clock.elapsedTime); // the rest, a gob burst a pellet, only on the floor
-      startBleed(hit, clock.elapsedTime);
+      startBleed(hit, clock.elapsedTime, spurts);
       splashLens(hit.entry);
     }
   });
@@ -4187,6 +4411,8 @@ function bloodOnBeforeCompile(shader) {
 // Sound: the rifle's report on every shot (sounds/rifle_shot.wav: freesound "assaultrifle2", trimmed to its crack and
 // 1.5 s of tail). At full auto the copies overlap into the burst; each a touch different in pitch and level, so it
 // doesn't machine-gun one identical sample. Web Audio: decoded once, started on the click that locks the pointer.
+// The shotgun's blast instead: sounds/shotgun_blast.wav (Pixabay, universfield "shotgun blast"). A punch landing:
+// sounds/punch.wav (Pixabay, universfield "punch", 140236), its leading silence cut.
 const audio = new AudioContext();
 // Music: sounds/dream_cheater.mp3 ("Dream Cheater"), looped at half volume; streamed by an <audio> element (8 minutes:
 // decoded whole into Web Audio it'd be ~170 MB), started with the rest of the sound on the first click
@@ -4199,7 +4425,7 @@ const FOOTSTEPS = 11; // sounds/footstep_0..10.wav: single steps from "walking u
 const GRUNTS = 5; // sounds/hurt_grunt_0..4.wav: from heckingfeck's royalty-free "male pain grunts" (its 0:00, 0:02, 0:03, 0:07, 0:13)
 const DEMON_GRUNTS = 4; // sounds/demon_grunt_0..3.wav: freesound "monster chase grunts" (its four)
 const DEMON_DEATHS = 4; // sounds/demon_death_0..3.wav: the four calls in dragon-studio "monster call"
-for (const name of ['rifle_shot', 'shell_drop', 'reload', 'demon_shot', ...Array.from({ length: DEMON_GRUNTS }, (_, k) => `demon_grunt_${k}`),
+for (const name of ['rifle_shot', 'shotgun_blast', 'punch', 'shell_drop', 'reload', 'demon_shot', ...Array.from({ length: DEMON_GRUNTS }, (_, k) => `demon_grunt_${k}`),
   ...Array.from({ length: DEMON_DEATHS }, (_, k) => `demon_death_${k}`),
   ...Array.from({ length: GRUNTS }, (_, k) => `hurt_grunt_${k}`),
   ...Array.from({ length: FOOTSTEPS }, (_, k) => `footstep_${k}`)])
@@ -4212,8 +4438,9 @@ function playSound(name, level, pitch) { // pitch: ± this fraction, at random
   gain.gain.value = level;
   src.connect(gain).connect(shotOut);
   src.start();
+  return src;
 }
-const playShot = () => playSound('rifle_shot', 0.85 + Math.random() * 0.15, 0.04);
+const playShot = () => playSound(SHOTGUN ? 'shotgun_blast' : 'rifle_shot', 0.85 + Math.random() * 0.15, 0.04);
 // A casing hitting the floor (sounds/shell_drop.wav: the first drop of freesound "bullet shells", its clink and its
 // little bounces after): once, on its first landing; quieter the further it fell from you
 const playShellDrop = (d) => playSound('shell_drop', (0.5 + Math.random() * 0.3) / (1 + d * 0.6), 0.08);
@@ -4241,9 +4468,11 @@ function playerFeet(dist) {
 
 function tryFire(now) {
   if (!gun || gun.busy || gun.cooldown > 0) return;
+  if (FISTS) { gun.cooldown = Math.max(gun.cooldown, -0.05) + FIRE_INTERVAL; return punch(now); }
   if (gun.ammo === 0) return reload();
   gun.ammo--;
-  if (SHOTGUN) { trigger = false; gun.ammo = 0; } // one shot a click: both barrels
+  if (SHOTGUN) { trigger = false; gun.ammo = 0; gun.modes.shotgun.spent = true; } // one shot a click: both barrels
+  if (PISTOL) trigger = false; // one shot a click
   // Carry leftover time into the next shot so the rate isn't rounded up to whole frames (capped, so a
   // long pause doesn't bank a burst)
   gun.cooldown = Math.max(gun.cooldown, -0.05) + FIRE_INTERVAL;
@@ -4274,7 +4503,8 @@ function reload() {
   playGun(gun.ammo === 0 && !SHOTGUN ? 'Reload_Empty' : 'Reload'); // (Reload_Empty works the M4's bolt)
   // sounds/reload.wav (dragon-studio "gun reload"): 1.5 s, magazine out at 0.56 s and in at 0.81 s, about the length
   // of the sped-up reload clip, so it plays from the start, unvaried
-  playSound('reload', 0.6, 0);
+  gun.reloadSound = playSound('reload', 0.6, 0);
+  updateAmmo();
 }
 
 // Returns 1 if it re-rendered the weapon texture this frame (for stats)
@@ -4282,10 +4512,15 @@ function updateGun(dt, now) {
   if (!gun) return 0;
   gun.cooldown -= dt;
   if (SHOTGUN && gun.ammo === 0 && gun.cooldown <= 0) reload(); // a reload every shot
+  if (now >= gun.punchLands) landPunch();
   gun.animAcc += dt;
-  const posed = !opts.stepped || gun.animAcc >= 1 / opts.animFps; // same stepped animation as the demons
+  // same stepped animation as the demons; a punch at twice that (three poses was too few)
+  const punching = gun.fists?.some((a) => now - a.punchAt < PUNCH_TIME + 0.1);
+  const posed = !opts.stepped || gun.animAcc >= 1 / (punching ? 2 * opts.animFps : opts.animFps);
   if (posed) {
     gun.mixer.update(gun.animAcc); gun.animAcc = 0;
+    gun.offArm?.scale.setScalar(1e-4); // one-handed (see PISTOL_VIEW), or the left fist mirrored (see holdFists)
+    if (gun.fists) gun.posedAt = now; // (the fists are posed as they're drawn: see below)
     const r = gun.actions.Reload;
     if (gun.hinge) shotgunReload(r.isRunning() ? r.time / r.getClip().duration : 0);
   }
@@ -4295,6 +4530,11 @@ function updateGun(dt, now) {
   // the flash's frame: 0 the bang, 1 the next instant, -1 none; a change means a re-render
   const flashFrame = now < gun.flashUntil ? (now < gun.flashUntil - (GUN_FLASH_TIME - GUN_BANG_TIME) ? 0 : 1) : -1;
   if (flashFrame !== gun.flashFrame) { gun.flashFrame = flashFrame; gun.dirty = true; }
+  if (gun.slide) { // back and home after a shot (a quick out, a slower return), held back once it's empty
+    const t = (now - gun.firedAt) / SLIDE_TIME, z = gun.ammo === 0 && !gun.busy ? SLIDE_BACK
+      : t < 1 ? SLIDE_BACK * (t < 0.3 ? t / 0.3 : 1 - (t - 0.3) / 0.7) : 0;
+    if (z !== gun.slide.position.z) { gun.slide.position.z = z; gun.dirty = true; }
+  }
   dryGunBlood(dt);
   if (!posed && lights === gun.lastLights && !gun.dirty) return 0;
   gun.lastLights = lights;
@@ -4302,6 +4542,7 @@ function updateGun(dt, now) {
 
   gun.root.updateMatrixWorld(true);
   gun.joint.matrixWorld.decompose(gunCam.position, gunCam.quaternion, _gs); // the animated camera joint is the eye
+  if (PISTOL) gunCam.translateX(PISTOL_VIEW[0]).translateY(PISTOL_VIEW[1]); // the pistol higher (see PISTOL_VIEW)
   if (gun.eyeBack) gunCam.translateZ(gun.eyeBack); // (see RELOAD_EYE_BACK)
   if (gun.lower) gunCam.translateY(gun.lower); // (see RELOAD_LOWER: the eye up, so everything it sees is lower)
   // the kick (see RECOIL_BACK): back at you, at once, easing off
@@ -4350,9 +4591,15 @@ function updateGun(dt, now) {
     flashSheet.offset.set((v + (m ? 1 : 0)) / FLASH_VARIANTS, gun.flashFrame === 0 ? 0.5 : 0);
   }
 
+  if (gun.fists) poseFist(gun.fists[1], gun.fists[1].punchAt, gun.posedAt); // (posed before the blood's painted on it)
   if (gun.splashes.length) paintGunBlood();
   renderer.setRenderTarget(gunRT);
   renderer.render(gunScene, gunCam);
+  if (gun.fists) { // then as the left fist would be, into the mirror's image (see holdFists)
+    poseFist(gun.fists[1], gun.fists[0].punchAt, gun.posedAt);
+    renderer.setRenderTarget(gunMirrorRT);
+    renderer.render(gunScene, gunCam);
+  }
   renderer.setRenderTarget(null);
   return 1;
 }
@@ -4588,7 +4835,7 @@ function hudHit(from) {
     let k = (Math.random() * (GRUNTS - 1)) | 0;
     if (k >= lastGruntK) k++;
     lastGrunt = audio.currentTime;
-    playSound(`hurt_grunt_${(lastGruntK = k % GRUNTS)}`, 0.7, 0.05);
+    playSound(`hurt_grunt_${(lastGruntK = k % GRUNTS)}`, 1, 0.05);
   }
   flickSpecks(2 + ((Math.random() * 3) | 0), t);
   _hudV.copy(from).applyMatrix4(camera.matrixWorldInverse); // where it came from, in view space
@@ -4718,7 +4965,9 @@ let gunBloodAt = -Infinity, gunDryWait = 0; // when it was last painted; s since
 function splashGun(at, near) {
   if (!gun?.blood) return;
   _gunTo.copy(at).applyMatrix4(camera.matrixWorldInverse).normalize(); // the burst, from your eye (view space: the gun's too)
-  gun.splashes.push({ x: _gunTo.x, near });
+  // (fists: both fists show the right arm's blood, mirrored, so it takes every burst as if on its own side: a burst on
+  // the left otherwise gave both a thin coat)
+  gun.splashes.push({ x: FISTS ? Math.abs(_gunTo.x) : _gunTo.x, near });
   gun.dirty = true;
 }
 function paintGunBlood() { // in updateGun, posed and its eye placed, before it's drawn
@@ -4758,7 +5007,8 @@ function dryGunBlood(dt) { // every GUN_BLOOD_STEP s while there's blood on it (
 }
 
 function updateAmmo() {
-  ammoEl.textContent = gun ? `${gun.ammo} / ${MAG}${gun.busy && gun.ammo < MAG ? '  reloading' : ''}` : '';
+  const reloading = gun && (gun.actions.Reload.isRunning() || gun.actions.Reload_Empty.isRunning()); // (not busy: that's drawing, too)
+  ammoEl.textContent = gun && !FISTS ? `${gun.ammo} / ${MAG}${reloading ? '  reloading' : ''}` : '';
 }
 
 // ---------------------------------------------------------------------------
@@ -4846,16 +5096,19 @@ const loader = new GLTFLoader();
 Promise.all([
   loader.loadAsync('models/demon.glb'), loader.loadAsync('models/demon_walk.glb'), loader.loadAsync('models/m4/scene.gltf'),
   loader.loadAsync('models/bullet_case/scene.gltf'), loader.loadAsync('models/demon_death.glb'),
-  WEAPON === 'shotgun' ? loader.loadAsync('models/super_shotgun/super_shotgun.glb') : null,
-]).then(([demon, demonWalk, m4, bulletCase, demonDeath, shotgun]) => {
-  bakeCasings(SHOTGUN ? shellModel() : bulletCase.scene.getObjectByName('pCylinder3'));
+  loader.loadAsync('models/pistol/pistol.glb'), loader.loadAsync('models/super_shotgun/super_shotgun.glb'),
+]).then(([demon, demonWalk, m4, bulletCase, demonDeath, pistol, shotgun]) => {
+  const brass = bulletCase.scene.getObjectByName('pCylinder3');
+  bakeCasings(brass, 'rifle');
+  bakeCasings(brass, 'pistol');
+  bakeCasings(shellModel(), 'shell');
   // demon_walk.glb: Mixamo "Orc Walk" retargeted onto the demon rig in Blender; replaces the built-in Walk
   demon.animations = demon.animations.filter((c) => c.name !== 'Walk').concat(demonWalk.animations);
   // demon_death.glb: Mixamo "Death From Back Headshot" retargeted the same way, grounded by the mesh
   demon.animations.push(...demonDeath.animations);
   demonGltf = demon;
   demonFootfalls = findFootfalls(demon);
-  setupGun(m4, shotgun);
+  setupGun(m4, { pistol: pistol.scene, shotgun: shotgun.scene });
   // ?n=100 spawns 100 demons (default 8), ?real starts in real-3D mode
   const params = new URLSearchParams(location.search);
   addNpcs(params.has('n') ? Number(params.get('n')) : 8);
@@ -4873,6 +5126,8 @@ addEventListener('keydown', (e) => {
   keys[e.code] = true;
   if (!gun) return;
   if (e.code === 'KeyR') reload();
+  const pick = Object.keys(WEAPONS).find((w) => WEAPONS[w].key === e.code); // 1-4: a weapon
+  if (pick && pick !== WEAPON) useWeapon(pick);
   if (e.code === 'Backquote') document.body.classList.toggle('debug');
   if (!document.body.classList.contains('debug')) return; // the rest are debug toggles
   if (e.code === 'KeyB') opts.bounds = !opts.bounds;
@@ -5205,6 +5460,7 @@ renderer.setAnimationLoop((time) => {
   const tx = 2 / gunRT.width, ty = 2 / gunRT.height;
   gunQuad.position.x = Math.round((Math.cos(bobPhase) * BOB * bobAmp) / tx) * tx;
   gunQuad.position.y = -Math.round((Math.abs(Math.sin(bobPhase)) * BOB * bobAmp) / ty) * ty;
+  gunMirrorQuad.position.copy(gunQuad.position);
 
   if (trigger) tryFire(now);
   updateBleeds(now);
