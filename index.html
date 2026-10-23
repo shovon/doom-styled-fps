@@ -1767,22 +1767,37 @@ function holdPistol(root, draw, mainJoint, pistol) {
 // mirror image bone by bone, never quite looked like the same fist.
 // The guard: fists up, the forearms standing up from elbows down and out to the fists (a boxer's triangle), the wrists
 // straight, the curled fingers facing the other fist (thumb sides towards you); a punch drives a fist out to the middle
-// of the view and back over PUNCH_TIME s (fast out, slower back), left and right in turn, the fist turning palm down
+// of the view and back over PUNCH_TIME s (fast out, slower back), left and right in turn, the fist turning over
 // (a corkscrew). Positions are the right arm's, in the eye's space (cm: its bone's units). The rig's shoulders sit where
 // a rifle wants them (the right one 39 cm behind the eye, out of reach of anything in front), so the fist's is set
 // (FIST_SHOULDER): low and forward; a punch drives it forward (FIST_SHOULDER_OUT) with the arm (~51 cm) to full stretch
-// at FIST_OUT.
-const FIST_SHOULDER = [32, -47, -11], FIST_SHOULDER_OUT = [16, -38, -14], FIST_GUARD = [16, -17, -36], FIST_OUT = [4, -8, -50];
+// at FIST_OUT, level, into the view (the shoulder kept low: any further up or forward, the arm's cut-off end shows).
+const FIST_SHOULDER = [32, -47, -11], FIST_SHOULDER_OUT = [16, -30, -20], FIST_GUARD = [16, -17, -36], FIST_OUT = [2, -13, -82];
+// ...the arm stretched PUNCH_STRETCH longer at full stretch (a smear: the shoulder can't come further forward, so the
+// reach comes from the arm)
+const PUNCH_STRETCH = 0.3;
+// ...while the other fist pulls back to the chin (the body turning into the punch): to FIST_BACK (nearer you: bigger,
+// still in view), its shoulder to FIST_SHOULDER_BACK
+const FIST_SHOULDER_BACK = [33, -47, -8], FIST_BACK = [13, -15, -28];
 const FIST_ELBOW = [65, -100, -40]; // the way the elbow bends: down and out from under the fist
 // A tight fist: each finger from straight (the rig's bind pose) bent this far at its three knuckles (rad); the thumb
 // from straight bent the way the rig's own pose bends it (round the rifle's grip), times FIST_THUMB_CLOSE at its base,
 // knuckle and last joint (so it closes along the joints' own axes: aimed at points instead, it twisted and tore), then
 // turned FIST_THUMB_LOWER rad down the fist at its base (it sat high); the guard breathing FIST_SWAY cm up and down
 const FIST_BEND = [1.45, 1.75, 1.1], FIST_THUMB_CLOSE = [1.7, 1.9, 1.85], FIST_THUMB_LOWER = 0.7;
-const FIST_SWAY = 0.5, FIST_SWAY_HZ = 0.8, PUNCH_TIME = 0.28; // cm; Hz; s
+const FIST_SWAY = 0.5, FIST_SWAY_HZ = 0.8, PUNCH_TIME = 0.17; // cm; Hz; s
+// ...and a punch turns the fist over PUNCH_TWIST rad about the forearm on its way out (a corkscrew: the thumb side
+// rolling in and down, the pinky up), the turn running ahead of the reach (and staying till the fist's nearly back)
+const PUNCH_TWIST = 2.9, PUNCH_TWIST_FORE = 0.65; // rad; the forearm's share (the rest's the wrist's)
 // A punch lands on the nearest demon in front, its body within PUNCH_REACH m of your eye and within PUNCH_CONE (rad)
-// of your aim, PUNCH_HIT of the way into the punch, for PUNCH_DAMAGE (a shot does 1; each point knocks it back too)
-const PUNCH_REACH = 1.4, PUNCH_CONE = 0.45, PUNCH_HIT = 0.35, PUNCH_DAMAGE = 3;
+// of your aim, PUNCH_HIT of the way into the punch, for PUNCH_DAMAGE (a shot does 1; each point knocks it back too),
+// shaking the view with PUNCH_SHAKE trauma (see shakeCamera: a shotgun blast is 1, the most a gun can add) and
+// snapping it PUNCH_JOLT rad (up, and to a side), springing back as from being shot
+const PUNCH_REACH = 1.4, PUNCH_CONE = 0.45, PUNCH_HIT = 0.12, PUNCH_DAMAGE = 3, PUNCH_SHAKE = 2, PUNCH_JOLT = 0.07;
+// A punch is timed from PUNCH_LEAD s before the click (a fifth of its way out, in time: half way, as it's fastest at
+// the start), and posed every frame till it's out (see updateGun): the click's frame shows the fist half way out, the
+// next all the way out, as it lands; no frame of it still in the guard (s)
+const PUNCH_LEAD = PUNCH_TIME * PUNCH_HIT * 0.2;
 // The fists, [left, right]: the right arm with all it needs to pose; the left only its punch (it's the right, mirrored)
 function holdFists(root, draw) {
   let skeleton = null;
@@ -1823,28 +1838,40 @@ function holdFists(root, draw) {
   // the arm back (three only writes a bone when the clip's value changes), and reachArm turns the forearm the least it
   // can from wherever it was, so its roll about its length crept ~6° a punch, for good
   R.armRest = [R.upper.quaternion.clone(), R.fore.quaternion.clone()];
+  R.boneLength = [R.fore.position.clone(), R.hand.position.clone()]; // (the elbow and wrist on their parents: stretched)
   draw.stop();
   return [L, R];
 }
 const _fa = new THREE.Vector3(), _fb = new THREE.Vector3(), _fc = new THREE.Vector3(), _fd = new THREE.Vector3();
 const _fm = new THREE.Matrix4(), _fn = new THREE.Matrix4(), _fq = new THREE.Quaternion(), _fp = new THREE.Quaternion();
-// The right arm posed, as at now (the latest pose's time), its punch thrown at punchAt
-function poseFist(arm, punchAt, now) {
+// How far out a punch thrown at punchAt is at now (0: in the guard, 1: all the way out): out at full speed from the
+// first frame, easing into the hit (cubic ease-out), then eased slower back to the guard
+function punchOut(punchAt, now) {
+  const t = (now - punchAt) / PUNCH_TIME;
+  return t < 0 || t >= 1 ? 0 : t < PUNCH_HIT ? 1 - (1 - t / PUNCH_HIT) ** 3 : 1 - smooth(t, PUNCH_HIT, 1);
+}
+// The right arm posed, as at now (the latest pose's time), its punch thrown at punchAt, the other fist's at otherAt
+function poseFist(arm, punchAt, otherAt, now) {
   const eye = gun.joint;
   arm.upper.quaternion.copy(arm.armRest[0]);
   arm.fore.quaternion.copy(arm.armRest[1]); // (reachArm updates the chain's matrices)
-  const t = (now - punchAt) / PUNCH_TIME;
-  const out = t < 0 || t >= 1 ? 0 : t < PUNCH_HIT ? smooth(t, 0, PUNCH_HIT) : 1 - smooth(t, PUNCH_HIT, 1);
+  const out = punchOut(punchAt, now), back = punchOut(otherAt, now);
+  arm.fore.position.copy(arm.boneLength[0]).multiplyScalar(1 + PUNCH_STRETCH * out);
+  arm.hand.position.copy(arm.boneLength[1]).multiplyScalar(1 + PUNCH_STRETCH * out);
   const sway = FIST_SWAY * Math.sin(now * FIST_SWAY_HZ * 2 * Math.PI) * (1 - out);
-  const wrist = eye.localToWorld(_fa.fromArray(FIST_GUARD).lerp(_fb.fromArray(FIST_OUT), out).setY(_fa.y + sway));
-  const shoulder = eye.localToWorld(_fb.fromArray(FIST_SHOULDER).lerp(_fc.fromArray(FIST_SHOULDER_OUT), out));
+  _fa.fromArray(FIST_GUARD).lerp(_fb.fromArray(FIST_BACK), back).lerp(_fb.fromArray(FIST_OUT), out);
+  const wrist = eye.localToWorld(_fa.setY(_fa.y + sway));
+  _fb.fromArray(FIST_SHOULDER).lerp(_fc.fromArray(FIST_SHOULDER_BACK), back);
+  const shoulder = eye.localToWorld(_fb.lerp(_fc.fromArray(FIST_SHOULDER_OUT), out));
   const elbowAt = eye.localToWorld(_fc.fromArray(FIST_ELBOW));
   reachArm(arm, wrist, shoulder, 1, elbowAt);
   // the fist: knuckles along the forearm (elbow to wrist), the curled fingers facing the other fist in the guard,
-  // turning to face down as it punches out
+  // turned over (PUNCH_TWIST) as it punches out
   const A = arm.hand.getWorldPosition(_fa).sub(arm.fore.getWorldPosition(_fb)).normalize();
-  const D = eye.localToWorld(_fc.set(-(1 - out), -out, 0)).sub(eye.getWorldPosition(_fd)).normalize();
-  D.addScaledVector(A, -D.dot(A)).normalize();
+  const twist = -PUNCH_TWIST * (1 - (1 - out) ** 2);
+  turnAbout(arm.fore, A, twist * PUNCH_TWIST_FORE); // (the rig has no twist bones: all of it at the wrist pinched it)
+  const D = eye.localToWorld(_fc.set(-1, 0, 0)).sub(eye.getWorldPosition(_fd)).normalize();
+  D.addScaledVector(A, -D.dot(A)).normalize().applyAxisAngle(A, twist);
   _fm.makeBasis(A, D, _fb.crossVectors(A, D)); // world: along, curl, side
   _fn.makeBasis(arm.along, arm.curl, _fd.crossVectors(arm.along, arm.curl)).transpose(); // (local, inverted)
   _fq.setFromRotationMatrix(_fm.multiply(_fn));
@@ -1858,8 +1885,8 @@ function poseFist(arm, punchAt, now) {
 // A punch (from tryFire): the next fist goes out; it lands PUNCH_HIT of the way in (see landPunch, from updateGun)
 function punch(now) {
   const arm = gun.fists[gun.nextFist ^= 1];
-  arm.punchAt = now;
-  gun.punchLands = now + PUNCH_TIME * PUNCH_HIT;
+  arm.punchAt = now - PUNCH_LEAD;
+  gun.punchLands = arm.punchAt + PUNCH_TIME * PUNCH_HIT;
   gun.dirty = true;
   shakeKick += KICK_PER_SHOT * 0.5;
 }
@@ -1887,6 +1914,8 @@ function landPunch() {
   playSound('punch', 1, 0.08);
   playSquelch(0.6, 0.8);
   shakeKick += KICK_PER_SHOT;
+  shakeTrauma = Math.max(shakeTrauma, PUNCH_SHAKE);
+  hitKickPitch += PUNCH_JOLT; hitKickYaw += PUNCH_JOLT * (Math.random() < 0.5 ? -0.6 : 0.6);
 }
 // The shotgun in the M4's place: the rifle's own meshes hidden (the arms stay), the shotgun on the rifle's joint so
 // every clip carries it. Placed at the ready pose (the end of Draw): its trigger (its origin) on the rifle's trigger,
@@ -4542,9 +4571,11 @@ function updateGun(dt, now) {
   if (SHOTGUN && gun.ammo === 0 && gun.cooldown <= 0) reload(); // a reload every shot
   if (now >= gun.punchLands) landPunch();
   gun.animAcc += dt;
-  // same stepped animation as the demons; a punch at twice that (three poses was too few)
+  // same stepped animation as the demons; a punch at twice that (three poses was too few), and every frame on its way
+  // out, till a pose shows it all the way out
   const punching = gun.fists?.some((a) => now - a.punchAt < PUNCH_TIME + 0.1);
-  const posed = !opts.stepped || gun.animAcc >= 1 / (punching ? 2 * opts.animFps : opts.animFps);
+  const striking = gun.fists?.some((a) => gun.posedAt - a.punchAt < PUNCH_TIME * PUNCH_HIT);
+  const posed = striking || !opts.stepped || gun.animAcc >= 1 / (punching ? 2 * opts.animFps : opts.animFps);
   if (posed) {
     gun.mixer.update(gun.animAcc); gun.animAcc = 0;
     gun.offArm?.scale.setScalar(1e-4); // one-handed (see PISTOL_VIEW), or the left fist mirrored (see holdFists)
@@ -4623,12 +4654,12 @@ function updateGun(dt, now) {
     flashSheet.offset.set((v + (m ? 1 : 0)) / FLASH_VARIANTS, gun.flashFrame === 0 ? 0.5 : 0);
   }
 
-  if (gun.fists) poseFist(gun.fists[1], gun.fists[1].punchAt, gun.posedAt); // (posed before the blood's painted on it)
+  if (gun.fists) poseFist(gun.fists[1], gun.fists[1].punchAt, gun.fists[0].punchAt, gun.posedAt); // (posed before the blood's painted on it)
   if (gun.splashes.length) paintGunBlood();
   renderer.setRenderTarget(gunRT);
   renderer.render(gunScene, gunCam);
   if (gun.fists) { // then as the left fist would be, into the mirror's image (see holdFists)
-    poseFist(gun.fists[1], gun.fists[0].punchAt, gun.posedAt);
+    poseFist(gun.fists[1], gun.fists[0].punchAt, gun.fists[1].punchAt, gun.posedAt);
     renderer.setRenderTarget(gunMirrorRT);
     renderer.render(gunScene, gunCam);
   }
