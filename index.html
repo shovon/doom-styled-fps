@@ -4823,7 +4823,8 @@ function hurtPlayer(from, damage) {
 // Zombies (see ENEMY): one within ZOMBIE_REACH of you (its middle to your eye, across the floor) stops and swings, and
 // keeps swinging till you're past ZOMBIE_LET_GO; a blow lands ZOMBIE_HITS s into Punch (its fist at full stretch, ~0.9 m
 // out: an overhead, then a jab) for ZOMBIE_DAMAGE, unless you've jumped ZOMBIE_CLEAR clear of it. While you're up
-// where they can't follow (the platform, the top of the stairs), those within ZOMBIE_WAIT stand (Idle) and wait.
+// where they can't follow (the platform, above the stairs' bottom step), those within ZOMBIE_WAIT of you, or at the
+// platform's edge, stand (Idle) and wait.
 const ZOMBIE_REACH = 1.2, ZOMBIE_LET_GO = 1.4, ZOMBIE_HITS = [1.27, 1.87], ZOMBIE_DAMAGE = 10, ZOMBIE_CLEAR = 0.6; // m; m; s; ; m
 const ZOMBIE_WAIT = 6, ZOMBIE_SPACING = 1.5; // m; m: how far apart they like to keep (closer than demons: they crowd you)
 function demonShot(npc) {
@@ -5527,7 +5528,16 @@ const TOWER_BODY = TOWER_HALF * Math.SQRT2 + 0.5; // a tower's corner post, plus
 const ZOMBIE_AROUND = [[new THREE.Vector2(), Math.hypot(PLATFORM_APOTHEM + 3 * STAIR_RUN, STAIR_HALF) + 0.5, null],
   ...COLUMNS.map((c) => [c, COLUMN_BODY, COLUMN_APOTHEM / Math.cos(Math.PI / 8)]),
   ...TOWERS.map((c) => [c, TOWER_BODY, TOWER_HALF * Math.SQRT2])];
-let youUp = false; // you're up on the platform or the stairs (see the floor, in the main loop)
+let youUp = false; // you're up on the platform or the stairs, above their bottom step (see the floor, in the main loop)
+// How far (x, z) is from the platform or its stairs, across the floor (0: on them)
+function platformGap(x, z) {
+  let g = Math.max(platformDist(x, z) - PLATFORM_APOTHEM, 0);
+  for (const k of STAIR_SIDES) {
+    const b = STAIR_BOXES.find((s) => s.n === PLATFORM_FACES[k] && s.e0 === 0), [e, a] = stairLocal(b, x, z);
+    g = Math.min(g, Math.hypot(e - THREE.MathUtils.clamp(e, 0, 3 * STAIR_RUN), a - THREE.MathUtils.clamp(a, -STAIR_HALF, STAIR_HALF)));
+  }
+  return g;
+}
 const _zo = new THREE.Vector3(), _zd = new THREE.Vector3();
 // Is your aim on this demon? (its body within AI_AIM_MARGIN of your line of fire); if so, which side of it it's on
 function aimedAt(p, centreY) {
@@ -5680,7 +5690,7 @@ renderer.setAnimationLoop((time) => {
     if (jumpY >= b.h - PLATFORM_STEP) floorY = Math.max(floorY, b.h);
     else pushOutOfStairBox(camera.position, b, 0.4);
   }
-  youUp = floorY > 0.5;
+  youUp = floorY > STAIR_RISE; // (from the middle step: on it, they couldn't reach you, the stair's in the way)
   const grounded = jumpY <= floorY;
   if (grounded && keys.Space) jumpV = Math.sqrt(2 * GRAVITY * JUMP_HEIGHT);
   jumpV -= GRAVITY * dt;
@@ -5740,7 +5750,8 @@ renderer.setAnimationLoop((time) => {
     if (npc.stagger > 0) updateStagger(npc, dt); // knocked back, but still free to turn (and a demon to shoot)
     if (ZOMBIE) { // waiting below you (you're up where it can't follow), swinging at you, or running at you
       const m = npc.imp.model, p = m.position, dist = Math.hypot(camera.position.x - p.x, camera.position.z - p.z);
-      const act = floorY > 0.5 && dist < ZOMBIE_WAIT ? npc.idle
+      // (up there, the ones near you, or at its edge, as near as they can get: else they ran on the spot there)
+      const act = youUp && (dist < ZOMBIE_WAIT || platformGap(p.x, p.z) < 0.5 + AI_AVOID + 0.2) ? npc.idle
         : dist < (npc.act === npc.fire ? ZOMBIE_LET_GO : ZOMBIE_REACH) ? npc.fire : npc.walk;
       if (act !== (npc.act ??= npc.walk)) { npc.act.fadeOut(0.2); act.reset().fadeIn(0.2).play(); npc.act = act; npc.fireWas = undefined; }
       npc.fire.timeScale = npc.stagger > 0 ? 0 : 1; // a hit holds its swing too: shooting one buys you time
@@ -5795,10 +5806,14 @@ renderer.setAnimationLoop((time) => {
       npc.nextGrunt = now + DEMON_GRUNT_EVERY[0] + Math.random() * (DEMON_GRUNT_EVERY[1] - DEMON_GRUNT_EVERY[0]);
     }
     steer(npc.imp.model, move, NPC_WALK * pace, dt, FACING);
-    pushOutOfPlatform(p, 0.5); // hard collision: round the platform, its stairs and the columns, inside the walls
+    pushApart(npc);
+  }
+  for (const npc of npcs) { // hard collision, for every living one once they've all moved (a crowd shoves the ones standing,
+    if (npc.dead) continue; // swinging or waiting too: into a column or the platform, where they stayed)
+    const p = npc.imp.model.position;
+    pushOutOfPlatform(p, 0.5); // round the platform, its stairs and the columns, inside the walls
     pushOutOfStairs(p, 0.5);
     pushOutOfColumns(p);
-    pushApart(npc);
     p.x = THREE.MathUtils.clamp(p.x, -ARENA + 0.5, ARENA - 0.5); p.z = THREE.MathUtils.clamp(p.z, -ARENA + 0.5, ARENA - 0.5);
   }
 
