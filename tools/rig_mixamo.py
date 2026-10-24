@@ -9,8 +9,9 @@
 #   ... -- zombie.glb models/zombie.glb "Run=Zombie Running.fbx" "Idle=Zombie Idle.fbx" "Punch=Zombie Punching.fbx:keep"
 #   "Die=Zombie Dying.fbx:ground"
 # models/police.glb (image-to-3d out/police/textured_art_shaded.glb):
-#   ... -- police.glb models/police.glb "Idle=Rifle Idle.fbx" "Walk=Rifle Walk.fbx" "Run=Run Forward.fbx"
-#   "Fire=Firing Rifle.fbx" "Die=Zombie Dying.fbx:ground" --rifle models/m4/scene.gltf Fire
+#   ... -- police.glb models/police.glb "Idle=Rifle Idle.fbx" "Walk=Rifle Walk.fbx" "WalkAim=Walking.fbx"
+#   "Run=Run Forward.fbx" "Fire=Firing Rifle.fbx" "Die=Zombie Dying.fbx:ground" --rifle models/m4/scene.gltf Fire
+#   (Walking.fbx: Mixamo's "Walking" with the rifle up, aimed)
 # The rig: the X Bot's skeleton, each joint moved onto the character's (its middles found by slicing the mesh), each
 # bone turned the least it takes to point along the character's limb (so the arms hang in its A-pose); the fingers ride
 # with the hand (no weights of their own: the mesh's hands are mitts). Skinned by Blender's bone heat.
