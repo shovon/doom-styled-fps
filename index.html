@@ -1789,14 +1789,17 @@ const PISTOL_MUZZLE = [0, 0.0392, -0.1665], SLIDE_BACK = 0.025, SLIDE_TIME = 0.0
 // rifle), and the whole view shifted so the pistol sits higher, still out to the right in the right hand: the gun's
 // eye moved PISTOL_VIEW m right and down (so the hand and pistol show up left and up)
 const PISTOL_VIEW = [0, -0.085];
-// Aiming down the sights (the right mouse button: see ADS_TOGGLE; the pistol and the M4): over ADS_TIME s the gun's
-// eye moves from the hip view onto the sight line, some way behind the sights: the pistol's ADS_EYE m behind its
-// optic's window (OPTIC: its glass's middle, in the pistol's space), the M4's M4_ADS_EYE m behind its rear sight's
-// aperture (M4_SIGHT: its middle, in the rifle's own space, cm), in line with the front post. The view zooms to
-// ADS_FOV (the gun's own to ADS_GUN_FOV), the look slowing with it; the crosshair becomes the optic's red dot (the
-// M4's irons have none: the post's the aim), the walk's bob stills, and depth of field focuses on what's under the
-// crosshair (see DOF_ADS_APERTURE). Off while drawing or reloading.
+// Aiming down the sights (the right mouse button: see ADS_TOGGLE; the pistol, the M4 and the shotgun): over ADS_TIME s
+// the gun's eye moves from the hip view onto the sight line, some way behind the sights: the pistol's ADS_EYE m behind
+// its optic's window (OPTIC: its glass's middle, in the pistol's space), the M4's M4_ADS_EYE m behind its rear
+// sight's aperture (M4_SIGHT: its middle, in the rifle's own space, cm), in line with the front post, the shotgun's
+// SHOTGUN_ADS_EYE m behind its front sight's top (SHOTGUN_SIGHT, in its space: a blade at the muzzle, looked at
+// along the rib between the barrels). The view zooms to ADS_FOV (the gun's own to ADS_GUN_FOV), the look slowing
+// with it; the crosshair becomes the optic's red dot (the irons have none: the front sight's the aim), the walk's bob
+// stills, and depth of field focuses on what's under the crosshair (see DOF_ADS_APERTURE). Off while drawing or
+// reloading (the shotgun reloads after every shot: it comes back up to the sights after).
 const OPTIC = [0, 0.0685, -0.03], ADS_EYE = 0.25, M4_SIGHT = [-5.683, 153.2, 5.5], M4_ADS_EYE = 0.07; // m; m; cm; m
+const SHOTGUN_SIGHT = [0, 0.0995, -0.495], SHOTGUN_ADS_EYE = 0.7; // m; m
 const ADS_TIME = 0.15, ADS_FOV = 55, ADS_GUN_FOV = 45; // s; °; °
 // true: a right click aims, the next stops (and a weapon switch does); false: it aims while the button's held
 const ADS_TOGGLE = true;
@@ -2061,7 +2064,7 @@ function holdShotgun(root, draw, mainJoint, shotgun) {
   shells.visible = false;
   hinge.add(shells);
   splitLeftArm(root);
-  return { muzzle, hinge, shells, arm };
+  return { muzzle, hinge, shells, arm, ads: aimEye(root, draw, shotgun, SHOTGUN_SIGHT, SHOTGUN_ADS_EYE) };
 }
 // How far open it is through the reload clip (t: 0…1 of it), rad: tips open, held while the shells go in, snapped
 // shut (speeding up, as if flung) by the gun's flick up (see SWING_UP)
