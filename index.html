@@ -13,6 +13,8 @@ body:not(.debug) #ui{display:none} /* the debug toggles and stats: only in debug
 #start{position:fixed;inset:0;display:grid;place-content:center;justify-items:center;gap:8px;background:rgba(0,0,0,.5);color:#fff;font:bold 28px sans-serif;text-shadow:0 2px 6px #000;pointer-events:none}
 #start small{font:14px sans-serif;opacity:.75}
 #crosshair{position:fixed;left:50%;top:50%;width:4px;height:4px;margin:-2px 0 0 -2px;background:#fff;box-shadow:0 0 2px #000;pointer-events:none}
+body[data-aim=dot] #crosshair{width:3px;height:3px;margin:-1.5px 0 0 -1.5px;border-radius:50%;background:#ff3020;box-shadow:0 0 3px #ff2010} /* the pistol's optic's red dot (see OPTIC) */
+body[data-aim=irons] #crosshair{display:none} /* iron sights: the front post's the aim */
 #ammo{position:fixed;right:16px;bottom:12px;color:#fff;font:bold 28px ui-monospace,monospace;text-shadow:0 2px 4px #000;pointer-events:none}
 #health{position:fixed;left:16px;bottom:30px;color:#fff;font:bold 28px ui-monospace,monospace;text-shadow:0 2px 4px #000;pointer-events:none}
 #fps{position:fixed;top:8px;left:8px;z-index:1;color:#fff;opacity:.8;font:12px ui-monospace,monospace;text-shadow:0 1px 2px #000;pointer-events:none}
@@ -26,7 +28,7 @@ body.debug #fps{display:none} /* (the debug stats show it, there) */
 <body>
 <div id="ui"><div id="hud">Debug (` to hide) · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · F depth of field · M cycle blood · I sprite debug · = / - add/remove 10 demons</div>
 <div id="stats"></div></div>
-<div id="start"><div>Click to play</div><small>WASD move · Shift sprint · Space jump · mouse look · click fire · R reload · 1-4 weapons</small><small>Esc: this menu</small></div>
+<div id="start"><div>Click to play</div><small>WASD move · Shift sprint · Space jump · mouse look · click fire · right-click aim · R reload · 1-4 weapons</small><small>Esc: this menu</small></div>
 <div id="crosshair"></div>
 <div id="fps"></div>
 <div id="ammo"></div><div id="health"></div>
@@ -42,6 +44,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 RectAreaLightUniformsLib.init(); // rect area lights (the ceiling strips) need their lookup tables
 
@@ -1466,7 +1469,8 @@ if (BAKE_FIXTURES) {
 }
 
 // First-person camera: click to capture the mouse
-const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 200);
+const VIEW_FOV = 70; // ° (narrower while aiming: see ADS_FOV)
+const camera = new THREE.PerspectiveCamera(VIEW_FOV, innerWidth / innerHeight, 0.1, 200);
 camera.position.set(0, EYE_HEIGHT, 8); // in front of the centre platform, which you face
 
 // Post: the world renders into an HDR buffer, everything bleeds a glow in proportion to its brightness (so only the
@@ -1490,10 +1494,16 @@ composer.addPass(new RenderPass(scene, camera));
 // this pixel, so a sharp thing doesn't smear into the blur round it. Reads the scene's depth: the composer's targets
 // carry a depth texture. Before bloom, so blurred lights bloom wider. The gun is drawn after it all, always sharp.
 const DOF_SHARP = 12, DOF_SOFT = 30, DOF_MAX = 0.004, DOF_TAPS = 24; // m; m; of the screen height; samples
+// Aiming down the sights (see OPTIC), it's a lens instead, and an aggressive one: focused on what's drawn under the
+// crosshair (the scene's depth at the screen's middle; refocusing as that changes, over DOF_FOCUS_TIME s, eased in
+// dioptres, 1/m, as a lens's focus ring turns: see focusQuad), everything nearer or further blurred by how far off
+// that it is in dioptres, DOF_ADS_APERTURE of the screen's height a dioptre, up to DOF_ADS_MAX (a real lens: focused
+// near, the far wall's a blur; focused far, the near's, its blur spreading over the sharp things behind it)
+const DOF_ADS_APERTURE = 0.12, DOF_ADS_MAX = 0.02, DOF_FOCUS_TIME = 0.15; // of the screen height a dioptre; of it; s
 // Hurt: when you're hit the whole scene goes out of focus, near and far, and comes back over HURT_RECOVER s; hits
 // stack. The same pass, its blur raised everywhere to HURT_BLUR (of the screen height) × the hurt, eased.
 const HURT_BLUR = 0.02, HURT_PER_HIT = 0.7, HURT_RECOVER = 1.0; // of the screen height; per hit (of 1); s
-let hurt = 0, dofOn = true; // dofOn: the distance blur (F); the pass runs while either is wanted
+let hurt = 0, dofOn = true; // dofOn: the distance blur, and aiming's (F); the pass runs while either is wanted
 // The world's targets sized to the window at worldScale (on a resize or a scale step), each with a depth texture
 // (depth of field reads it) at its size. three r170's setSize doesn't resize a depth texture: the old one would stay
 // at the old size (an incomplete framebuffer: nothing drawn), so a new one. setSize let go of the target when its size
@@ -1532,10 +1542,35 @@ function scaleWorld(time, gap) { // each frame (time: its rAF time, ms; gap: sin
   }
 }
 function setWorldStep(k) { worldStep = k; worldScale = WORLD_SCALES[k]; sizeWorld(); }
+// Aiming's focus (see DOF_ADS_APERTURE), kept on the GPU, where the depth is: each frame it's aiming, one pixel eases
+// the last focus (in a 1×1 target; two, in turn) towards the depth at the screen's middle, in dioptres
+const focusRTs = [0, 1].map(() => new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType }));
+const focusQuad = new FullScreenQuad(new THREE.ShaderMaterial({
+  uniforms: { tDepth: { value: null }, tLast: { value: null }, uNear: { value: camera.near }, uFar: { value: camera.far }, uKeep: { value: 0 } },
+  vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `
+    #include <packing>
+    uniform sampler2D tDepth, tLast;
+    uniform float uNear, uFar, uKeep;
+    void main() {
+      float z = -perspectiveDepthToViewZ(texture2D(tDepth, vec2(0.5)).x, uNear, uFar);
+      gl_FragColor = vec4(mix(1.0 / max(z, 0.3), texture2D(tLast, vec2(0.5)).x, uKeep), 0.0, 0.0, 1.0);
+    }`,
+}));
+let focusAt = 0; // which of focusRTs holds the focus
 class DofPass extends ShaderPass {
   render(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
     this.uniforms.tDepth.value = readBuffer.depthTexture;
     this.uniforms.uRes.value.set(readBuffer.width, readBuffer.height);
+    if (this.uniforms.uAim.value > 0) { // refocus (see focusQuad)
+      const u = focusQuad.material.uniforms;
+      u.tDepth.value = readBuffer.depthTexture;
+      u.tLast.value = focusRTs[focusAt].texture;
+      u.uKeep.value = Math.exp(-deltaTime / DOF_FOCUS_TIME);
+      renderer.setRenderTarget(focusRTs[focusAt ^= 1]);
+      focusQuad.render(renderer);
+    }
+    this.uniforms.tFocus.value = focusRTs[focusAt].texture;
     super.render(renderer, writeBuffer, readBuffer, deltaTime, maskActive);
   }
 }
@@ -1543,33 +1578,44 @@ const dof = new DofPass({
   uniforms: {
     tDiffuse: { value: null }, tDepth: { value: null }, uRes: { value: new THREE.Vector2(1, 1) },
     uNear: { value: camera.near }, uFar: { value: camera.far }, uDof: { value: 1 }, uHurt: { value: 0 },
+    uAim: { value: 0 }, tFocus: { value: null },
   },
   vertexShader: `varying vec2 vUv;\nvoid main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `
     #include <packing>
-    uniform sampler2D tDiffuse, tDepth;
+    uniform sampler2D tDiffuse, tDepth, tFocus;
     uniform vec2 uRes;
-    uniform float uNear, uFar, uDof, uHurt;
+    uniform float uNear, uFar, uDof, uHurt, uAim;
     varying vec2 vUv;
+    float focus; // aiming's, in dioptres (see focusQuad)
     float viewDepth(vec2 uv) { return -perspectiveDepthToViewZ(texture2D(tDepth, uv).x, uNear, uFar); }
-    float coc(float z) { // px: the distance blur, or the hurt's (all over), whichever's more
-      return max(uDof * smoothstep(${DOF_SHARP.toFixed(1)}, ${DOF_SOFT.toFixed(1)}, z) * ${DOF_MAX}, uHurt * ${HURT_BLUR}) * uRes.y;
+    float coc(float z) { // px: the distance blur (giving way to aiming's lens), the lens, or the hurt's (all over): the most
+      float far = uDof * (1.0 - uAim) * smoothstep(${DOF_SHARP.toFixed(1)}, ${DOF_SOFT.toFixed(1)}, z) * ${DOF_MAX};
+      float lens = uAim * min(${DOF_ADS_APERTURE} * abs(focus - 1.0 / z), ${DOF_ADS_MAX});
+      return max(max(far, lens), uHurt * ${HURT_BLUR}) * uRes.y;
     }
     void main() {
+      focus = texture2D(tFocus, vec2(0.5)).x;
       vec4 base = texture2D(tDiffuse, vUv);
-      float c0 = coc(viewDepth(vUv));
+      float z0 = viewDepth(vUv), c0 = coc(z0);
+      // how far round to look: this pixel's own blur, or aiming, the lens's most (a blurred thing nearer can reach it)
+      float reach = max(c0, uAim * ${DOF_ADS_MAX} * uRes.y);
       // alpha: how sharp it is (1: in focus, 0: blurred), for the upscale to the screen (crisp, or smooth: see OutputPass)
-      if (c0 < 0.5) { gl_FragColor = vec4(base.rgb, 1.0); return; } // in focus
+      if (reach < 0.5) { gl_FragColor = vec4(base.rgb, 1.0); return; } // in focus, and nothing near to blur over it
       vec3 sum = base.rgb;
-      float wsum = 1.0;
+      float wsum = 1.0, spread = c0;
       for (int i = 0; i < ${DOF_TAPS}; i++) {
-        float fi = float(i) + 0.5, r = sqrt(fi / ${DOF_TAPS}.0) * c0, a = fi * 2.39996;
+        float fi = float(i) + 0.5, r = sqrt(fi / ${DOF_TAPS}.0) * reach, a = fi * 2.39996;
         vec2 uv = vUv + vec2(cos(a), sin(a)) * r / uRes;
-        float w = clamp(coc(viewDepth(uv)) - r + 1.0, 0.0, 1.0);
+        float zt = viewDepth(uv), ct = coc(zt);
+        // a sample counts where its own blur reaches this pixel; one behind this pixel only as far as this pixel's own
+        // blur reaches (a sharp thing behind doesn't smear onto a blurred one in front, nor the in-focus onto itself)
+        float w = clamp((zt < z0 ? ct : min(ct, c0)) - r + 1.0, 0.0, 1.0);
         sum += texture2D(tDiffuse, uv).rgb * w;
         wsum += w;
+        if (zt < z0 && w > 0.0) spread = max(spread, ct); // (blurred over by something nearer: not sharp)
       }
-      gl_FragColor = vec4(sum / wsum, 1.0 - smoothstep(0.5, 1.5, c0));
+      gl_FragColor = vec4(sum / wsum, 1.0 - smoothstep(0.5, 1.5, spread));
     }`,
 });
 composer.addPass(dof);
@@ -1607,7 +1653,7 @@ renderer.domElement.addEventListener('click', () => { if (!look.isLocked) look.l
 look.addEventListener('lock', () => document.body.classList.add('playing'));
 // Debug mode (the toggle keys, their states and the stats, over the game): the backquote key switches it, ?debug starts in it
 if (new URLSearchParams(location.search).has('debug')) document.body.classList.add('debug');
-look.addEventListener('unlock', () => { document.body.classList.remove('playing'); trigger = false; });
+look.addEventListener('unlock', () => { document.body.classList.remove('playing'); trigger = aimHeld = false; });
 
 const opts = {
   stage, resolution: RT_SIZES[0], snaps: 16, pitchSnaps: 8, distance: 5, animFps: 12,
@@ -1729,7 +1775,7 @@ gunScene.add(muzzleSprite);
 
 let gun = null;      // { root, mixer, actions, joint, muzzle, hinge, shells, arm, shellsOut, handOver, eyeBack, flick, lower, firedAt, ammo, busy, cooldown, animAcc, lastLights, dirty, flashUntil, flashVariant, flashMirror, flashFrame }
 let trigger = false; // left mouse held
-const _toGun = new THREE.Matrix4(), _gs = new THREE.Vector3(), _mw = new THREE.Vector3();
+const _toGun = new THREE.Matrix4(), _gs = new THREE.Vector3(), _mw = new THREE.Vector3(), _noAim = new THREE.Vector3(); // (_noAim: a gun that can't aim)
 const _tgp = new THREE.Vector3(), _tgq = new THREE.Quaternion();
 const _flickAt = new THREE.Vector3(), _flickAxis = new THREE.Vector3(), _flickQ = new THREE.Quaternion();
 
@@ -1743,6 +1789,31 @@ const PISTOL_MUZZLE = [0, 0.0392, -0.1665], SLIDE_BACK = 0.025, SLIDE_TIME = 0.0
 // rifle), and the whole view shifted so the pistol sits higher, still out to the right in the right hand: the gun's
 // eye moved PISTOL_VIEW m right and down (so the hand and pistol show up left and up)
 const PISTOL_VIEW = [0, -0.085];
+// Aiming down the sights (the right mouse button: see ADS_TOGGLE; the pistol and the M4): over ADS_TIME s the gun's
+// eye moves from the hip view onto the sight line, some way behind the sights: the pistol's ADS_EYE m behind its
+// optic's window (OPTIC: its glass's middle, in the pistol's space), the M4's M4_ADS_EYE m behind its rear sight's
+// aperture (M4_SIGHT: its middle, in the rifle's own space, cm), in line with the front post. The view zooms to
+// ADS_FOV (the gun's own to ADS_GUN_FOV), the look slowing with it; the crosshair becomes the optic's red dot (the
+// M4's irons have none: the post's the aim), the walk's bob stills, and depth of field focuses on what's under the
+// crosshair (see DOF_ADS_APERTURE). Off while drawing or reloading.
+const OPTIC = [0, 0.0685, -0.03], ADS_EYE = 0.25, M4_SIGHT = [-5.683, 153.2, 5.5], M4_ADS_EYE = 0.07; // m; m; cm; m
+const ADS_TIME = 0.15, ADS_FOV = 55, ADS_GUN_FOV = 45; // s; °; °
+// true: a right click aims, the next stops (and a weapon switch does); false: it aims while the button's held
+const ADS_TOGGLE = true;
+let aimHeld = false, aimT = 0, aim = 0; // aiming wanted (the button); how far in (0..1, linear); the same, eased
+// The aiming eye: back m behind a point on a gun's sight line (sight, in the gun's own space), in the eye's space, in
+// metres (its bone's in cm). At the ready pose (Draw's end) the guns' sights look where the eye does (the pistol's
+// placed so; the pack built the M4's so, to within 0.1°), so aiming is only a move.
+function aimEye(root, draw, gun, sight, back) {
+  draw.play();
+  draw.time = draw.getClip().duration;
+  draw.getMixer().update(0);
+  root.updateMatrixWorld(true);
+  const eye = root.getObjectByName('FPS_Camera_j_01');
+  const at = eye.worldToLocal(gun.localToWorld(new THREE.Vector3(...sight))).multiplyScalar(eye.getWorldScale(new THREE.Vector3()).x);
+  draw.stop();
+  return at.setZ(at.z + back);
+}
 function holdPistol(root, draw, mainJoint, pistol) {
   root.traverse((o) => { if (o.isMesh && !o.isSkinnedMesh) o.visible = false; });
   draw.play();
@@ -1755,10 +1826,11 @@ function holdPistol(root, draw, mainJoint, pistol) {
   pistol.matrix.decompose(pistol.position, pistol.quaternion, pistol.scale);
   mainJoint.add(pistol);
   draw.stop();
+  const ads = aimEye(root, draw, pistol, OPTIC, ADS_EYE);
   const muzzle = new THREE.Object3D();
   muzzle.position.fromArray(PISTOL_MUZZLE);
   pistol.add(muzzle);
-  return { muzzle, slide: pistol.getObjectByName('Slide') };
+  return { muzzle, slide: pistol.getObjectByName('Slide'), ads, adsDot: true };
 }
 // Fists: the rifle's meshes hidden; only the right arm is ever drawn, posed by us (reachArm, every pose); the left fist is
 // its image, mirrored left to right (drawn twice: the right arm posed as the left fist would be, into the mirror's image,
@@ -2241,7 +2313,7 @@ function setupGun(g, models) { // models: the pistol's and the shotgun's scenes
   const restore = () => { for (const [b, p, q, sc] of pristine) { b.position.copy(p); b.quaternion.copy(q); b.scale.copy(sc); } };
   const meshesOf = (o) => { const m = []; o.traverse((c) => { if (c.isMesh && !c.isSkinnedMesh) m.push(c); }); return m; };
   const leftArm = root.getObjectByName('LeftArm_026'); // (hidden, for the pistol: see PISTOL_VIEW; and fists: see holdFists)
-  const modes = { m4: { muzzle, meshes: meshesOf(root) } };
+  const modes = { m4: { muzzle, meshes: meshesOf(root), ads: aimEye(root, actions.Draw, main, M4_SIGHT, M4_ADS_EYE) } };
   modes.shotgun = { ...holdShotgun(root, actions.Draw, mainJoint, models.shotgun), meshes: meshesOf(models.shotgun) };
   restore();
   modes.pistol = { ...holdPistol(root, actions.Draw, mainJoint, models.pistol), meshes: meshesOf(models.pistol), offArm: leftArm };
@@ -2276,11 +2348,14 @@ function useWeapon(name) {
   muzzleSprite.scale.setScalar(w.flash);
   gunMirrorQuad.visible = FISTS;
   trigger = false;
+  if (ADS_TOGGLE) aimHeld = false; // (a new weapon comes up at the hip)
+  aimT = 0; // (at once, as everything else in a switch: easing out, the new one was drawn zoomed, the old one's sights)
   for (const [b, p, q, sc] of gun.pristine) { b.position.copy(p); b.quaternion.copy(q); b.scale.copy(sc); }
   for (const [k, mode] of Object.entries(gun.modes)) for (const o of mode.meshes) o.visible = k === name;
   Object.assign(gun, {
     muzzle: m.muzzle ?? gun.modes.m4.muzzle, hinge: m.hinge ?? null, shells: m.shells ?? null, arm: m.arm ?? null,
     slide: m.slide ?? null, offArm: m.offArm ?? null, fists: m.fists ?? null, ammo: gun.ammoOf[name] ?? MAG, busy: true,
+    adsAt: m.ads ?? null, adsDot: !!m.adsDot,
     cooldown: 0, firedAt: -Infinity, flashUntil: 0, punchLands: Infinity, handOver: false, eyeBack: 0, lower: 0, flick: 0,
     shellsOut: false, dirty: true, animAcc: 1 / opts.animFps, // (posed at once: else the rig's rest pose showed a moment)
   });
@@ -4615,7 +4690,11 @@ function updateGun(dt, now) {
 
   gun.root.updateMatrixWorld(true);
   gun.joint.matrixWorld.decompose(gunCam.position, gunCam.quaternion, _gs); // the animated camera joint is the eye
-  if (PISTOL) gunCam.translateX(PISTOL_VIEW[0]).translateY(PISTOL_VIEW[1]); // the pistol higher (see PISTOL_VIEW)
+  // the pistol higher (see PISTOL_VIEW); aiming, the eye down the sights (see OPTIC)
+  const hip = PISTOL ? PISTOL_VIEW : [0, 0], at = gun.adsAt ?? _noAim, lerp = THREE.MathUtils.lerp;
+  gunCam.translateX(lerp(hip[0], at.x, aim)).translateY(lerp(hip[1], at.y, aim)).translateZ(at.z * aim);
+  const gunFov = THREE.MathUtils.lerp(GUN_FOV, ADS_GUN_FOV, aim);
+  if (gunCam.fov !== gunFov) { gunCam.fov = gunFov; gunCam.updateProjectionMatrix(); }
   if (gun.eyeBack) gunCam.translateZ(gun.eyeBack); // (see RELOAD_EYE_BACK)
   if (gun.lower) gunCam.translateY(gun.lower); // (see RELOAD_LOWER: the eye up, so everything it sees is lower)
   // the kick (see RECOIL_BACK): back at you, at once, easing off
@@ -5193,8 +5272,12 @@ Promise.all([
 // ---------------------------------------------------------------------------
 const keys = {};
 const hud = document.getElementById('hud'), HUD = hud.textContent;
-addEventListener('mousedown', (e) => { if (e.button === 0 && look.isLocked) trigger = true; });
-addEventListener('mouseup', (e) => { if (e.button === 0) trigger = false; });
+addEventListener('mousedown', (e) => {
+  if (e.button === 0 && look.isLocked) trigger = true;
+  if (e.button === 2 && look.isLocked) aimHeld = ADS_TOGGLE ? !aimHeld : true;
+});
+addEventListener('mouseup', (e) => { if (e.button === 0) trigger = false; if (e.button === 2 && !ADS_TOGGLE) aimHeld = false; });
+addEventListener('contextmenu', (e) => e.preventDefault()); // (the right button aims: no menu)
 addEventListener('keydown', (e) => {
   keys[e.code] = true;
   if (!gun) return;
@@ -5527,8 +5610,20 @@ renderer.setAnimationLoop((time) => {
     }
   }
 
-  // Weapon bob: Doom's sideways sway + downward dip, snapped to whole weapon-sprite pixels
-  bobAmp += ((moving && grounded ? 1 : 0) - bobAmp) * (1 - Math.exp(-8 * dt)); // no footsteps in the air
+  // Aiming down the sights (see OPTIC): eased in and out, the view's zoom and the look's speed with it (the same turn
+  // for the same move across the screen)
+  aimT = THREE.MathUtils.clamp(aimT + (aimHeld && gun?.adsAt && !gun.busy ? dt : -dt) / ADS_TIME, 0, 1);
+  if (smooth(aimT, 0, 1) !== aim) {
+    aim = smooth(aimT, 0, 1);
+    gun.dirty = true;
+    camera.fov = THREE.MathUtils.lerp(VIEW_FOV, ADS_FOV, aim);
+    camera.updateProjectionMatrix();
+    look.pointerSpeed = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / Math.tan(THREE.MathUtils.degToRad(VIEW_FOV) / 2);
+    document.body.dataset.aim = aim > 0.5 ? (gun.adsDot ? 'dot' : 'irons') : '';
+  }
+
+  // Weapon bob: Doom's sideways sway + downward dip, snapped to whole weapon-sprite pixels; stilled while aiming
+  bobAmp += ((moving && grounded && !aim ? 1 : 0) - bobAmp) * (1 - Math.exp(-8 * dt)); // no footsteps in the air
   bobPhase += dt * (sprinting ? 11 : 8);
   const tx = 2 / gunRT.width, ty = 2 / gunRT.height;
   gunQuad.position.x = Math.round((Math.cos(bobPhase) * BOB * bobAmp) / tx) * tx;
@@ -5604,6 +5699,7 @@ renderer.setAnimationLoop((time) => {
   hurt = Math.max(hurt - dt / HURT_RECOVER, 0); // back into focus
   dof.uniforms.uHurt.value = hurt * hurt; // eased: clears fast at first, the last of it lingers less
   dof.uniforms.uDof.value = dofOn ? 1 : 0;
+  dof.uniforms.uAim.value = dofOn ? aim : 0;
   dof.enabled = dofOn || hurt > 0;
   bakeSheets();
   flushBlood(dt);
