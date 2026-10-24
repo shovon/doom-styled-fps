@@ -26,7 +26,7 @@ body.debug #fps{display:none} /* (the debug stats show it, there) */
 </script>
 </head>
 <body>
-<div id="ui"><div id="hud">Debug (` to hide) · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · F depth of field · M cycle blood · I sprite debug · = / - add/remove 10 demons</div>
+<div id="ui"><div id="hud">Debug (` to hide) · B bounds · V real 3D · N stepped anim · L lock RT dolly · K snap angles · P sprite res · O distance LOD · H sprite shadows · F depth of field · M cycle blood · I sprite debug · = / - add/remove 10 enemies</div>
 <div id="stats"></div></div>
 <div id="start"><div>Click to play</div><small>WASD move · Shift sprint · Space jump · mouse look · click fire · right-click aim · R reload · 1-4 weapons</small><small>Esc: this menu</small></div>
 <div id="crosshair"></div>
@@ -90,6 +90,7 @@ class SpriteImpostor extends THREE.Group {
     this.lastLights = 0;        // which flash lights were reaching it at the last render
     this.shadowKey = undefined; // same, for the shadow sprite
     this.frontOnly = false;     // only ever drawn from straight in front (see update)
+    this.frontAz = 0;           // ...or this far round from its front (π: from behind)
 
     // Render box from the bind pose (bone matrices start as zeros, so update them first)
     model.updateMatrixWorld(true);
@@ -279,7 +280,7 @@ class SpriteImpostor extends THREE.Group {
       const azIdx = this.frontOnly ? 0 : Math.round((Math.atan2(_toCam.x, _toCam.z) - yaw) / step);
       const elStep = Math.PI / 2 / o.pitchSnaps; // rows from 0° up to (not including) 90°: straight down has no "up"
       const elIdx = Math.min(Math.max(Math.round(Math.atan2(_toCam.y, Math.hypot(_toCam.x, _toCam.z)) / elStep), 0), o.pitchSnaps - 1);
-      const az = yaw + azIdx * step, el = this.frontOnly ? CORPSE_ELEVATION : elIdx * elStep;
+      const az = yaw + azIdx * step + this.frontAz, el = this.frontOnly ? CORPSE_ELEVATION : elIdx * elStep;
       const dist = o.lockDist ? o.distance : _toCam.length();
       cam.position.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)).multiplyScalar(dist).add(center);
       cam.lookAt(center);
@@ -372,6 +373,17 @@ let jumpY = 0, jumpV = 0;                  // height above standing, vertical sp
 const DEMON_WALK = 1.33;     // NPC demon m/s: Orc Walk stride (1.65 m per 1.13 s cycle) × 0.91 leg scale
 const DEMON_PACE = 1.5, DEMON_FAST = 2.2; // normal and fast pace multipliers; the walk clip speeds up by the same factor, so feet still match
 const DEMON_FACING = 0;      // demon.glb facing offset (0 = faces +Z); set Math.PI if they walk backwards
+// The enemy: zombies (models/zombie.glb: the image-to-3d zombie, rigged with Mixamo's skeleton and given its Run, Idle,
+// Punch and Die by tools/zombie.py), running at you and punching; 'demon' brings the demons back (demon.glb, Walk/Fire/
+// Death, shooting volleys, orbiting you, dodging your aim), all of it kept
+const ENEMY = 'zombie', ZOMBIE = ENEMY === 'zombie';
+const ZOMBIE_RUN = 2.35;     // m/s: Run's stride (a planted foot slides back at this; 0.8 s a cycle)
+const ZOMBIE_PACE = 1, ZOMBIE_FAST = 1.3; // it runs already: 2.35 / 3.05 m/s (you: MOVE)
+const NPC_WALK = ZOMBIE ? ZOMBIE_RUN : DEMON_WALK, NPC_PACE = ZOMBIE ? ZOMBIE_PACE : DEMON_PACE, NPC_FAST = ZOMBIE ? ZOMBIE_FAST : DEMON_FAST;
+const FACING = ZOMBIE ? 0 : DEMON_FACING; // (zombie.glb faces +Z too)
+const RIG = ZOMBIE // its clips, and its feet (GLTFLoader drops the ':' from Mixamo's bone names)
+  ? { walk: 'Run', fire: 'Punch', death: 'Die', feet: ['mixamorigLeftFoot', 'mixamorigRightFoot'] }
+  : { walk: 'Walk', fire: 'Fire', death: 'Death', feet: ['foot.L', 'foot.R'] };
 const RT_SIZES = [128, 256, 512, 64]; // sprite resolutions cycled with P (first is the default)
 let rtSizeIdx = 0;
 
@@ -912,6 +924,7 @@ const COLUMN_TINT = 0x35b8a0; // the bottom row of panels: a greenish-blue (teal
 const COLUMNS = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([i, j]) => new THREE.Vector2(i, j).multiplyScalar(COLUMN_SPACING));
 const COLUMN_APOTHEM = COLUMN_SIDE / 2 / Math.tan(Math.PI / 8);          // centre → middle of a face
 const COLUMN_REACH = COLUMN_APOTHEM / Math.cos(Math.PI / 8) + 0.4;       // centre → corner, plus the player's body
+const NPC_REACH = 0.8; // m: an enemy's body plus yours (you can't walk into the living)
 const slitTiles = []; // the columns' light slits: positions, each with .aim (where its spot points, relative)
 const columnLamps = []; // the columns' wall lamps (the walls' parallax fixture): where each one's glow sits
 {
@@ -2013,7 +2026,7 @@ function landPunch() {
   if (!best) return;
   // where it lands: on the near side of its body, along the line from you to it
   const c = _pt.copy(best.imp.model.position).add(best.imp.fit), dir = c.clone().sub(o).normalize();
-  const entry = c.clone().addScaledVector(dir, -best.imp.r * 0.35);
+  const entry = c.clone().addScaledVector(dir, -best.imp.r * (ZOMBIE ? 0.18 : 0.35)); // (a zombie's ~0.2 m deep, a demon's more)
   const hit = { entry, exit: entry.clone().addScaledVector(dir, 0.1), dir, npc: best };
   paintWound(best, entry);
   for (let k = 0; k < PUNCH_DAMAGE; k++) damageNpc(best, dir);
@@ -4795,6 +4808,24 @@ const healthEl = document.getElementById('health');
 const updateHealth = () => (healthEl.textContent = `+ ${Math.max(Math.ceil(playerHealth), 0)}`);
 updateHealth();
 const _shotFrom = new THREE.Vector3(), _shotDir = new THREE.Vector3();
+// You're hit, from world point from: health, a jolt away from it (turned from its side, tipped up, springing back),
+// a shake, and the HUD's blood and arc pointing at it
+function hurtPlayer(from, damage) {
+  playerHealth = Math.max(playerHealth - damage, 0);
+  updateHealth();
+  _hudV.copy(from).applyMatrix4(camera.matrixWorldInverse);
+  const side = Math.atan2(_hudV.x, -_hudV.z);
+  hitKickYaw += HIT_KICK * Math.sin(side); // from the right: the view's knocked left, and so on
+  hitKickPitch += HIT_KICK * 0.6;
+  shakeTrauma = Math.max(shakeTrauma, Math.min(shakeTrauma + 0.47, 1)); // (never lowering a punch's, above 1)
+  hudHit(from);
+}
+// Zombies (see ENEMY): one within ZOMBIE_REACH of you (its middle to your eye, across the floor) stops and swings, and
+// keeps swinging till you're past ZOMBIE_LET_GO; a blow lands ZOMBIE_HITS s into Punch (its fist at full stretch, ~0.9 m
+// out: an overhead, then a jab) for ZOMBIE_DAMAGE, unless you've jumped ZOMBIE_CLEAR clear of it. While you're up
+// where they can't follow (the platform, the top of the stairs), those within ZOMBIE_WAIT stand (Idle) and wait.
+const ZOMBIE_REACH = 1.2, ZOMBIE_LET_GO = 1.4, ZOMBIE_HITS = [1.27, 1.87], ZOMBIE_DAMAGE = 10, ZOMBIE_CLEAR = 0.6; // m; m; s; ; m
+const ZOMBIE_WAIT = 6, ZOMBIE_SPACING = 1.5; // m; m: how far apart they like to keep (closer than demons: they crowd you)
 function demonShot(npc) {
   const from = npc.muzzle.getWorldPosition(_shotFrom);
   muzzleFlash(from);
@@ -4808,15 +4839,7 @@ function demonShot(npc) {
   let chance = Math.max(DEMON_ACCURACY - dist * DEMON_ACCURACY_FALLOFF, DEMON_ACCURACY_MIN);
   if (playerMoving) chance *= DEMON_MOVING_AIM;
   if (Math.random() >= chance) return;
-  playerHealth = Math.max(playerHealth - DEMON_DAMAGE, 0);
-  updateHealth();
-  // a jolt: the view knocked away from the shot (turned from its side, tipped up), springing back; and a shake
-  _hudV.copy(from).applyMatrix4(camera.matrixWorldInverse);
-  const side = Math.atan2(_hudV.x, -_hudV.z);
-  hitKickYaw += HIT_KICK * Math.sin(side); // from the right: the view's knocked left, and so on
-  hitKickPitch += HIT_KICK * 0.6;
-  shakeTrauma = Math.max(shakeTrauma, Math.min(shakeTrauma + 0.47, 1)); // (never lowering a punch's, above 1)
-  hudHit(from);
+  hurtPlayer(from, DEMON_DAMAGE);
 }
 // The view's own effects, drawn over everything (after the gun): blood specks that landed on your view, and arcs
 // pointing at what hit you. One full-screen pass, a few uniforms: HUD_SPECKS splats and HUD_ARCS arcs at most.
@@ -5192,18 +5215,18 @@ function updateAmmo() {
 // ---------------------------------------------------------------------------
 // Demons
 // ---------------------------------------------------------------------------
-let demonGltf;
+let enemyGltf;
 // Demon footsteps: when each foot comes down in the walk clip, your footsteps pitched down (a bigger body), only from
 // demons within DEMON_STEP_RANGE m and falling off fast, so the nearest few carry. The moments are found once from the
 // clip itself: a stand-in plays it through, and a foot's down where its height drops into the bottom of its swing.
 const DEMON_STEP_RANGE = 20, DEMON_STEP_PITCH = 0.75;
-let demonFootfalls = []; // s into the walk clip
+let enemyFootfalls = []; // s into the walk clip
 function findFootfalls(gltf) {
   const model = cloneSkinned(gltf.scene), mixer = new THREE.AnimationMixer(model);
-  const clip = THREE.AnimationClip.findByName(gltf.animations, 'Walk');
+  const clip = THREE.AnimationClip.findByName(gltf.animations, RIG.walk);
   mixer.clipAction(clip).play();
-  const feet = ['foot.L', 'foot.R'].map((n) => model.getObjectByName(n) ?? model.getObjectByName(n.replace('.', '')));
-  if (feet.some((f) => !f)) return [];
+  const feet = RIG.feet.map((n) => model.getObjectByName(n) ?? model.getObjectByName(n.replace('.', '')));
+  if (feet.some((f) => !f)) { console.warn('no feet', RIG.feet); return []; }
   const N = 120, ys = feet.map(() => []), p = new THREE.Vector3(), out = [];
   for (let i = 0; i < N; i++) {
     mixer.setTime((clip.duration * i) / N);
@@ -5217,51 +5240,54 @@ function findFootfalls(gltf) {
   return out;
 }
 const _stepE = new THREE.Euler();
+// Did a clip's time (looping) pass f, going from was to t? (t wraps round at the loop)
+const crossed = (was, t, f) => (t >= was ? was < f && f <= t : f > was || f <= t);
 function demonSteps(npc, pace) { // after its walk has moved on this frame: did a foot come down?
   const t = npc.walk.time, was = npc.walkWas ?? t;
   npc.walkWas = t;
   if (pace < 0.05 || npc.walk.getEffectiveWeight() < 0.5) return;
-  const crossed = (f) => (t >= was ? was < f && f <= t : f > was || f <= t); // (t wraps round at the loop)
-  for (const f of demonFootfalls) if (crossed(f)) {
+  for (const f of enemyFootfalls) if (crossed(was, t, f)) {
     const m = npc.imp.model, d = m.position.distanceTo(camera.position);
-    const yaw = _stepE.setFromQuaternion(m.quaternion, 'YXZ').y - DEMON_FACING; // its heading (see steer)
-    footPrint(npc, m.position, Math.sin(yaw), Math.cos(yaw), true); // its claw print, if bloody
+    const yaw = _stepE.setFromQuaternion(m.quaternion, 'YXZ').y - FACING; // its heading (see steer)
+    footPrint(npc, m.position, Math.sin(yaw), Math.cos(yaw), !ZOMBIE); // its print, if bloody (a demon's claws; a zombie's boot)
     const wet = inWetBlood(npc);
     if (d < DEMON_STEP_RANGE) {
-      demonVoice(npc, `footstep_${(Math.random() * FOOTSTEPS) | 0}`, (wet ? 0.3 : 0.5) / (1 + d * 0.15), DEMON_STEP_PITCH);
+      demonVoice(npc, `footstep_${(Math.random() * FOOTSTEPS) | 0}`, (wet ? 0.3 : 0.5) / (1 + d * 0.15), ZOMBIE ? 0.95 : DEMON_STEP_PITCH);
       if (wet) playSquelch(0.6 / (1 + d * 0.15), 0.7);
     }
   }
 }
-const npcs = []; // { imp, walk, fire, death, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer, stagger, knock, shakeDir, health, dead }
+const npcs = []; // { imp, walk, fire, idle, death, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer, stagger, knock, shakeDir, health, dead, act, fireWas }
+const NPC_SPAWN_GAP = 10; // m: none starts nearer you than this
 const _v = new THREE.Vector3();
 
 function addNpcs(n) {
   for (let i = 0; i < n; i++) {
-    const model = cloneSkinned(demonGltf.scene);
-    model.position.set((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
+    const model = cloneSkinned(enemyGltf.scene);
+    do model.position.set((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
+    while (model.position.distanceTo(camera.position) < NPC_SPAWN_GAP); // (not on top of you)
     model.traverse((o) => { if (o.isMesh) o.castShadow = false; }); // blob/sprite shadows in both modes, so V compares fairly
     const bloodRT = new THREE.WebGLRenderTarget(WOUND_RES, WOUND_RES); // its wounds (see paintWound)
     let mesh;
     model.traverse((o) => { if (o.isSkinnedMesh) { mesh = o; o.material = bloodyMaterial(o.material, bloodRT.texture); } });
     const imp = new SpriteImpostor(model, new THREE.AnimationMixer(model), opts);
     scene.add(imp);
-    const clip = (name) => imp.mixer.clipAction(THREE.AnimationClip.findByName(demonGltf.animations, name));
-    const walk = clip('Walk'), fire = clip('Fire'), death = clip('Death');
+    const clip = (name) => imp.mixer.clipAction(THREE.AnimationClip.findByName(enemyGltf.animations, name));
+    const walk = clip(RIG.walk), fire = clip(RIG.fire), death = clip(RIG.death), idle = clip('Idle'); // (fire: a zombie's punch)
     death.setLoop(THREE.LoopOnce, 1);
     death.clampWhenFinished = true; // and stays lying there
     walk.play().time = Math.random() * walk.getClip().duration; // out of step with each other
     const npc = {
-      imp, walk, fire, muzzle: model.getObjectByName('muzzle'), mesh, bloodRT,
+      imp, walk, fire, idle, muzzle: model.getObjectByName('muzzle'), mesh, bloodRT,
       shooter: Math.random() < 0.5, firing: false, timer: nextVolley(),
-      pace: DEMON_PACE, paceTarget: DEMON_PACE, paceTimer: 0, // switches between normal and fast every few seconds
+      pace: NPC_PACE, paceTarget: NPC_PACE, paceTimer: 0, // switches between normal and fast every few seconds
       orbitR: AI_ORBIT[0] + Math.random() * (AI_ORBIT[1] - AI_ORBIT[0]),
       orbitDir: Math.random() < 0.5 ? -1 : 1,
       orbitTimer: 0, dodge: 0, dodgeSide: 1, // see thinkDemon
       stagger: 0, knock: new THREE.Vector3(), shakeDir: new THREE.Vector3(), // hit reaction (see staggerNpc)
       health: DEMON_HEALTH, dead: false, death, // see damageNpc
     };
-    imp.mixer.addEventListener('loop', (e) => { if (e.action === fire && !npc.dead) demonShot(npc); }); // each shot
+    if (!ZOMBIE) imp.mixer.addEventListener('loop', (e) => { if (e.action === fire && !npc.dead) demonShot(npc); }); // each shot
     npcs.push(npc);
   }
 }
@@ -5271,21 +5297,24 @@ function removeNpcs(n) {
 const nextVolley = () => 3 + Math.random() * 5; // seconds of walking between volleys
 
 const loader = new GLTFLoader();
+const enemyFiles = ZOMBIE ? ['models/zombie.glb'] : ['models/demon.glb', 'models/demon_walk.glb', 'models/demon_death.glb'];
 Promise.all([
-  loader.loadAsync('models/demon.glb'), loader.loadAsync('models/demon_walk.glb'), loader.loadAsync('models/m4/scene.gltf'),
-  loader.loadAsync('models/bullet_case/scene.gltf'), loader.loadAsync('models/demon_death.glb'),
+  loader.loadAsync('models/m4/scene.gltf'), loader.loadAsync('models/bullet_case/scene.gltf'),
   loader.loadAsync('models/pistol/pistol.glb'), loader.loadAsync('models/super_shotgun/super_shotgun.glb'),
-]).then(([demon, demonWalk, m4, bulletCase, demonDeath, pistol, shotgun]) => {
+  ...enemyFiles.map((f) => loader.loadAsync(f)),
+]).then(([m4, bulletCase, pistol, shotgun, enemy, demonWalk, demonDeath]) => {
   const brass = bulletCase.scene.getObjectByName('pCylinder3');
   bakeCasings(brass, 'rifle');
   bakeCasings(brass, 'pistol');
   bakeCasings(shellModel(), 'shell');
-  // demon_walk.glb: Mixamo "Orc Walk" retargeted onto the demon rig in Blender; replaces the built-in Walk
-  demon.animations = demon.animations.filter((c) => c.name !== 'Walk').concat(demonWalk.animations);
-  // demon_death.glb: Mixamo "Death From Back Headshot" retargeted the same way, grounded by the mesh
-  demon.animations.push(...demonDeath.animations);
-  demonGltf = demon;
-  demonFootfalls = findFootfalls(demon);
+  if (!ZOMBIE) {
+    // demon_walk.glb: Mixamo "Orc Walk" retargeted onto the demon rig in Blender; replaces the built-in Walk
+    enemy.animations = enemy.animations.filter((c) => c.name !== 'Walk').concat(demonWalk.animations);
+    // demon_death.glb: Mixamo "Death From Back Headshot" retargeted the same way, grounded by the mesh
+    enemy.animations.push(...demonDeath.animations);
+  }
+  enemyGltf = enemy;
+  enemyFootfalls = findFootfalls(enemy);
   setupGun(m4, { pistol: pistol.scene, shotgun: shotgun.scene });
   // ?n=100 spawns 100 demons (default 8), ?real starts in real-3D mode
   const params = new URLSearchParams(location.search);
@@ -5354,7 +5383,7 @@ function reportStats(cpuMs, sprites) {
   if (now - statStart < 500) return;
   const { calls, triangles } = renderer.info.render;
   fpsEl.textContent = `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps`;
-  statsEl.textContent = `${npcs.length} demons (${opts.real ? 'REAL 3D' : 'sprites'}) · world 1/${Math.round(1 / worldScale)}${fixedScale ? ' (fixed)' : ''} · ` +
+  statsEl.textContent = `${npcs.length} ${ENEMY}s (${opts.real ? 'REAL 3D' : 'sprites'}) · world 1/${Math.round(1 / worldScale)}${fixedScale ? ' (fixed)' : ''} · ` +
     `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps · CPU ${(statCpu / statFrames).toFixed(2)} ms/frame · ` +
     `${calls} draw calls · ${(triangles / 1000).toFixed(0)}k tris · ${(statSprites / statFrames).toFixed(1)} sprite renders/frame`;
   statFrames = statCpu = statSprites = 0; statStart = now;
@@ -5446,12 +5475,16 @@ function damageNpc(npc, dir) {
   npc.dead = true;
   demonVoice(npc, `demon_death_${(Math.random() * DEMON_DEATHS) | 0}`, 1.0); // its death cry, one of the calls
   npc.stagger = 0;
-  const m = npc.imp.model; // turns to face you as it dies, and from then on is only drawn from the front
-  m.quaternion.setFromAxisAngle(UP, Math.atan2(camera.position.x - m.position.x, camera.position.z - m.position.z) + DEMON_FACING);
+  // turns to face you as it dies, and from then on is only drawn from the front; a zombie turns its back on you instead
+  // (Die falls forward, 1-1.7 m: facing you, it would fall onto you), drawn from behind, your side
+  const m = npc.imp.model;
+  m.quaternion.setFromAxisAngle(UP, Math.atan2(camera.position.x - m.position.x, camera.position.z - m.position.z) + FACING + (ZOMBIE ? Math.PI : 0));
   npc.imp.frontOnly = true;
+  npc.imp.frontAz = ZOMBIE ? Math.PI : 0;
   npc.firing = false;
   npc.walk.fadeOut(0.15);
   npc.fire.fadeOut(0.15);
+  npc.idle.fadeOut(0.15);
   npc.death.reset().fadeIn(0.15).play();
 }
 function staggerNpc(npc, dir) {
@@ -5472,7 +5505,7 @@ function updateStagger(npc, dt) {
   pushOutOfPlatform(p, 0.5);
   pushOutOfStairs(p, 0.5);
   pushOutOfColumns(p);
-  steer(m, move.subVectors(camera.position, p).setY(0).normalize(), 0, dt, DEMON_FACING); // free to turn: towards you
+  steer(m, move.subVectors(camera.position, p).setY(0).normalize(), 0, dt, FACING); // free to turn: towards you
 }
 // Demons hunt you rather than wander. Each has its own distance from you (orbitR, somewhere in AI_ORBIT): further
 // out, it closes in on you (mostly straight at you, angling round a little); once there, it circles you one way or the
@@ -5489,6 +5522,13 @@ const AI_DODGE_TIME = 0.5, AI_DODGE_SPEED = 1.6, AI_AVOID = 2; // s; pace multip
 const _ai = new THREE.Vector3(), _aim = new THREE.Vector3(), _toMe = new THREE.Vector3(), _obs = new THREE.Vector3();
 const COLUMN_BODY = COLUMN_APOTHEM / Math.cos(Math.PI / 8) + 0.5; // a column's corner, plus a demon's body
 const TOWER_BODY = TOWER_HALF * Math.SQRT2 + 0.5; // a tower's corner post, plus a demon's body
+// What a zombie goes round when it's between it and you (see thinkDemon): its centre, the radius it's steered round
+// (its body's, padded), and its solid radius, what blocks the way (null: the platform, by its own shape and stairs)
+const ZOMBIE_AROUND = [[new THREE.Vector2(), Math.hypot(PLATFORM_APOTHEM + 3 * STAIR_RUN, STAIR_HALF) + 0.5, null],
+  ...COLUMNS.map((c) => [c, COLUMN_BODY, COLUMN_APOTHEM / Math.cos(Math.PI / 8)]),
+  ...TOWERS.map((c) => [c, TOWER_BODY, TOWER_HALF * Math.SQRT2])];
+let youUp = false; // you're up on the platform or the stairs (see the floor, in the main loop)
+const _zo = new THREE.Vector3(), _zd = new THREE.Vector3();
 // Is your aim on this demon? (its body within AI_AIM_MARGIN of your line of fire); if so, which side of it it's on
 function aimedAt(p, centreY) {
   camera.getWorldDirection(_aim);
@@ -5506,32 +5546,61 @@ function thinkDemon(npc, dt, out) {
   _ai.subVectors(camera.position, p).setY(0);
   const dist = Math.max(_ai.length(), 1e-3);
   _ai.divideScalar(dist); // towards you
-  const tx = -_ai.z * npc.orbitDir, tz = _ai.x * npc.orbitDir; // round you
-  const side = aimedAt(p, p.y + npc.imp.fit.y);
-  if (side && npc.dodge <= 0) {
-    npc.dodge = AI_DODGE_TIME; npc.dodgeSide = side;
-    if (npc.firing) { // aimed at: abandon the volley and move
-      npc.firing = false; npc.timer = nextVolley();
-      npc.fire.fadeOut(0.1); npc.walk.reset().fadeIn(0.1).play();
-    }
-  }
   let pace = 1;
-  if (npc.dodge > 0) { // break sideways off your line of fire (perpendicular to it, the side it's on), a little forward
-    npc.dodge -= dt;
-    camera.getWorldDirection(_aim).setY(0).normalize();
-    out.set(-_aim.z * npc.dodgeSide * -1, 0, _aim.x * npc.dodgeSide * -1).addScaledVector(_ai, 0.2);
-    npc.orbitDir = Math.sign(out.x * tx + out.z * tz) || npc.orbitDir; // carry on round you that way after
-    pace = AI_DODGE_SPEED;
-  } else if (dist > npc.orbitR + 1) { // further out: close in on you, angling round a little
-    out.set(tx, 0, tz).multiplyScalar(0.35).add(_ai);
-  } else { // there or inside it: circle round you, opening the gap back up the closer it is
-    out.set(tx, 0, tz).addScaledVector(_ai, -THREE.MathUtils.clamp((npc.orbitR - dist) / 2, 0, 1) * 0.8);
+  if (ZOMBIE) { // a zombie: straight at you (no circling, no dodging, no backing off), and past anything big in the way,
+    // along the line that just clears its edge on your side (pushing straight at it, the obstacle's push and the pull
+    // to you cancelled out: it stood there running on the spot); right by it, that's round its edge
+    out.copy(_ai);
+    const ex = camera.position.x - p.x, ez = camera.position.z - p.z, len = Math.hypot(ex, ez);
+    let nearest = Infinity;
+    for (const [c, R, solid] of ZOMBIE_AROUND) {
+      const cx = c.x - p.x, cz = c.y - p.z, d0 = Math.hypot(cx, cz);
+      if (cx * ex + cz * ez <= 0 || d0 >= nearest) continue; // behind it; or a nearer one's in the way already
+      if (solid === null) { // the platform: unless you're up on it, is it (or a flight of stairs) really between you?
+        if (youUp) continue;
+        _zo.set(p.x, 0.2, p.z); _zd.set(ex / len, 0, ez / len);
+        const hits = [rayOctagon(_zo, _zd, 0, 0, PLATFORM_APOTHEM, PLATFORM_H), ...STAIR_PIECES.map((s) => rayConvex(_zo, _zd, s))];
+        if (!hits.some((h) => h && h.t < len)) continue;
+      } else { // a column or a tower: does the way to you pass through it?
+        const u = THREE.MathUtils.clamp((cx * ex + cz * ez) / (len * len), 0, 1); // the way to you: nearest to c
+        if (Math.hypot(cx - ex * u, cz - ez * u) >= solid + 0.2) continue;
+      }
+      nearest = d0;
+      const a = Math.asin(Math.min(R / d0, 1)), ca = Math.cos(a), sa = Math.sin(a);
+      const lx = cx * ca - cz * sa, lz = cx * sa + cz * ca, rx = cx * ca + cz * sa, rz = -cx * sa + cz * ca; // either edge
+      if (lx * ex + lz * ez >= rx * ex + rz * ez) out.set(lx, 0, lz).divideScalar(d0); else out.set(rx, 0, rz).divideScalar(d0);
+      if (d0 < R) out.addScaledVector(_zd.set(-cx / d0, 0, -cz / d0), Math.min((R - d0) / 2, 1)); // inside: out too (past stairs)
+    }
+  } else {
+    const tx = -_ai.z * npc.orbitDir, tz = _ai.x * npc.orbitDir; // round you
+    const side = aimedAt(p, p.y + npc.imp.fit.y);
+    if (side && npc.dodge <= 0) {
+      npc.dodge = AI_DODGE_TIME; npc.dodgeSide = side;
+      if (npc.firing) { // aimed at: abandon the volley and move
+        npc.firing = false; npc.timer = nextVolley();
+        npc.fire.fadeOut(0.1); npc.walk.reset().fadeIn(0.1).play();
+      }
+    }
+    if (npc.dodge > 0) { // break sideways off your line of fire (perpendicular to it, the side it's on), a little forward
+      npc.dodge -= dt;
+      camera.getWorldDirection(_aim).setY(0).normalize();
+      out.set(-_aim.z * npc.dodgeSide * -1, 0, _aim.x * npc.dodgeSide * -1).addScaledVector(_ai, 0.2);
+      npc.orbitDir = Math.sign(out.x * tx + out.z * tz) || npc.orbitDir; // carry on round you that way after
+      pace = AI_DODGE_SPEED;
+    } else if (dist > npc.orbitR + 1) { // further out: close in on you, angling round a little
+      out.set(tx, 0, tz).multiplyScalar(0.35).add(_ai);
+    } else { // there or inside it: circle round you, opening the gap back up the closer it is
+      out.set(tx, 0, tz).addScaledVector(_ai, -THREE.MathUtils.clamp((npc.orbitR - dist) / 2, 0, 1) * 0.8);
+    }
   }
   out.normalize();
   // obstacles: pushed away as it nears them, and nudged round them the way it's going
+  // (a zombie closing on you feels them less and less: backed up to a wall or a column, you were held just out of its
+  // reach; the hard collisions still keep it out of them)
+  const near = ZOMBIE ? THREE.MathUtils.clamp((dist - ZOMBIE_REACH) / AI_AVOID, 0, 1) : 1;
   const avoid = (nx, nz, gap) => { // (nx, nz): unit, away from the obstacle; gap: m to its surface
     if (gap >= AI_AVOID) return;
-    const k = (1 - gap / AI_AVOID) * 2.5, round = out.x * -nz + out.z * nx >= 0 ? 1 : -1;
+    const k = (1 - gap / AI_AVOID) * 2.5 * near, round = out.x * -nz + out.z * nx >= 0 ? 1 : -1;
     out.x += (nx + -nz * round) * k; out.z += (nz + nx * round) * k;
   };
   for (const [c, r] of [...COLUMNS.map((c) => [c, COLUMN_BODY]), ...TOWERS.map((c) => [c, TOWER_BODY])]) {
@@ -5550,8 +5619,9 @@ function thinkDemon(npc, dt, out) {
   for (const o of npcs) { // each other: pushed apart, harder the closer (the dead are left to lie)
     if (o === npc || o.dead) continue;
     const q = o.imp.model.position, dx = p.x - q.x, dz = p.z - q.z, d = Math.hypot(dx, dz);
-    if (d >= AI_SPACING || d < 1e-4) continue;
-    const k = (1 - d / AI_SPACING) * 2;
+    const spacing = ZOMBIE ? ZOMBIE_SPACING : AI_SPACING;
+    if (d >= spacing || d < 1e-4) continue;
+    const k = (1 - d / spacing) * 2;
     out.x += dx / d * k; out.z += dz / d * k;
   }
   for (const [nx, nz, gap] of [[-1, 0, ARENA - p.x], [1, 0, ARENA + p.x], [0, -1, ARENA - p.z], [0, 1, ARENA + p.z]]) avoid(nx, nz, gap - 0.6);
@@ -5610,6 +5680,7 @@ renderer.setAnimationLoop((time) => {
     if (jumpY >= b.h - PLATFORM_STEP) floorY = Math.max(floorY, b.h);
     else pushOutOfStairBox(camera.position, b, 0.4);
   }
+  youUp = floorY > 0.5;
   const grounded = jumpY <= floorY;
   if (grounded && keys.Space) jumpV = Math.sqrt(2 * GRAVITY * JUMP_HEIGHT);
   jumpV -= GRAVITY * dt;
@@ -5634,6 +5705,11 @@ renderer.setAnimationLoop((time) => {
       camera.position.x = c.x + (d > 1e-6 ? dx * k : reach);
       camera.position.z = c.y + dz * k;
     }
+  }
+  for (const n of npcs) { // and the living: you can't walk into one (or be shoved into one)
+    if (n.dead) continue;
+    const q = n.imp.model.position, dx = camera.position.x - q.x, dz = camera.position.z - q.z, d = Math.hypot(dx, dz);
+    if (d < NPC_REACH && d > 1e-6) { camera.position.x = q.x + dx / d * NPC_REACH; camera.position.z = q.z + dz / d * NPC_REACH; }
   }
 
   // Aiming down the sights (see OPTIC): eased in and out, the view's zoom and the look's speed with it (the same turn
@@ -5661,31 +5737,51 @@ renderer.setAnimationLoop((time) => {
 
   for (const npc of npcs) {
     if (npc.dead) continue; // lies where it fell
-    if (npc.stagger > 0) updateStagger(npc, dt); // knocked back, but still free to turn and shoot
-    // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on
-    npc.timer -= dt;
-    if (npc.firing) {
-      if (npc.timer > 0) { // stand still while firing, turned to you (unless you aim at it: thinkDemon breaks it off)
-        steer(npc.imp.model, move.subVectors(camera.position, npc.imp.model.position).setY(0).normalize(), 0, dt, DEMON_FACING);
-        if (!aimedAt(npc.imp.model.position, npc.imp.model.position.y + npc.imp.fit.y)) continue;
-        thinkDemon(npc, 0, move); // aimed at: it drops the volley and dodges (from next frame on)
+    if (npc.stagger > 0) updateStagger(npc, dt); // knocked back, but still free to turn (and a demon to shoot)
+    if (ZOMBIE) { // waiting below you (you're up where it can't follow), swinging at you, or running at you
+      const m = npc.imp.model, p = m.position, dist = Math.hypot(camera.position.x - p.x, camera.position.z - p.z);
+      const act = floorY > 0.5 && dist < ZOMBIE_WAIT ? npc.idle
+        : dist < (npc.act === npc.fire ? ZOMBIE_LET_GO : ZOMBIE_REACH) ? npc.fire : npc.walk;
+      if (act !== (npc.act ??= npc.walk)) { npc.act.fadeOut(0.2); act.reset().fadeIn(0.2).play(); npc.act = act; npc.fireWas = undefined; }
+      npc.fire.timeScale = npc.stagger > 0 ? 0 : 1; // a hit holds its swing too: shooting one buys you time
+      if (act !== npc.walk) {
+        steer(m, move.subVectors(camera.position, p).setY(0).normalize(), 0, dt, FACING); // stands, turned to you
+        if (act === npc.fire) {
+          const t = npc.fire.time, was = npc.fireWas ?? t;
+          npc.fireWas = t;
+          if (dist < ZOMBIE_LET_GO && jumpY < ZOMBIE_CLEAR && ZOMBIE_HITS.some((f) => crossed(was, t, f))) {
+            hurtPlayer(_shotFrom.copy(p).add(npc.imp.fit), ZOMBIE_DAMAGE); // from its chest: the HUD's arc points at it
+            demonVoice(npc, 'punch', 1, 0.75); // (your fists' thud, lower)
+          }
+        }
         continue;
       }
-      npc.firing = false;
-      npc.timer = nextVolley();
-      npc.fire.fadeOut(0.2);
-      npc.walk.reset().fadeIn(0.2).play();
-    } else if (npc.shooter && npc.timer <= 0) {
-      npc.firing = true;
-      npc.timer = (2 + Math.floor(Math.random() * 3)) * npc.fire.getClip().duration; // Fire loops, so N shots
-      npc.walk.fadeOut(0.2);
-      npc.fire.reset().fadeIn(0.2).play();
-      demonShot(npc); // first shot; later ones come from the loop event
-      continue;
+    } else {
+      // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on
+      npc.timer -= dt;
+      if (npc.firing) {
+        if (npc.timer > 0) { // stand still while firing, turned to you (unless you aim at it: thinkDemon breaks it off)
+          steer(npc.imp.model, move.subVectors(camera.position, npc.imp.model.position).setY(0).normalize(), 0, dt, FACING);
+          if (!aimedAt(npc.imp.model.position, npc.imp.model.position.y + npc.imp.fit.y)) continue;
+          thinkDemon(npc, 0, move); // aimed at: it drops the volley and dodges (from next frame on)
+          continue;
+        }
+        npc.firing = false;
+        npc.timer = nextVolley();
+        npc.fire.fadeOut(0.2);
+        npc.walk.reset().fadeIn(0.2).play();
+      } else if (npc.shooter && npc.timer <= 0) {
+        npc.firing = true;
+        npc.timer = (2 + Math.floor(Math.random() * 3)) * npc.fire.getClip().duration; // Fire loops, so N shots
+        npc.walk.fadeOut(0.2);
+        npc.fire.reset().fadeIn(0.2).play();
+        demonShot(npc); // first shot; later ones come from the loop event
+        continue;
+      }
     }
     if (npc.stagger > 0) continue; // no walking while staggered
     if ((npc.paceTimer -= dt) <= 0) {
-      npc.paceTarget = Math.random() < 0.5 ? DEMON_PACE : DEMON_FAST;
+      npc.paceTarget = Math.random() < 0.5 ? NPC_PACE : NPC_FAST;
       npc.paceTimer = 2 + Math.random() * 4;
     }
     npc.pace += (npc.paceTarget - npc.pace) * (1 - Math.exp(-3 * dt)); // ease between paces
@@ -5698,7 +5794,7 @@ renderer.setAnimationLoop((time) => {
       demonVoice(npc, `demon_grunt_${(Math.random() * DEMON_GRUNTS) | 0}`, 0.8);
       npc.nextGrunt = now + DEMON_GRUNT_EVERY[0] + Math.random() * (DEMON_GRUNT_EVERY[1] - DEMON_GRUNT_EVERY[0]);
     }
-    steer(npc.imp.model, move, DEMON_WALK * pace, dt, DEMON_FACING);
+    steer(npc.imp.model, move, NPC_WALK * pace, dt, FACING);
     pushOutOfPlatform(p, 0.5); // hard collision: round the platform, its stairs and the columns, inside the walls
     pushOutOfStairs(p, 0.5);
     pushOutOfColumns(p);
