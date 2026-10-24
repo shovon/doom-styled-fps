@@ -1500,6 +1500,7 @@ const DOF_SHARP = 12, DOF_SOFT = 30, DOF_MAX = 0.004, DOF_TAPS = 24; // m; m; of
 // that it is in dioptres, DOF_ADS_APERTURE of the screen's height a dioptre, up to DOF_ADS_MAX (a real lens: focused
 // near, the far wall's a blur; focused far, the near's, its blur spreading over the sharp things behind it)
 const DOF_ADS_APERTURE = 0.12, DOF_ADS_MAX = 0.02, DOF_FOCUS_TIME = 0.15; // of the screen height a dioptre; of it; s
+const DOF_NEAR_TAPS = 16; // samples for the near blur spreading over what's behind it (see DofPass)
 // Hurt: when you're hit the whole scene goes out of focus, near and far, and comes back over HURT_RECOVER s; hits
 // stack. The same pass, its blur raised everywhere to HURT_BLUR (of the screen height) × the hurt, eased.
 const HURT_BLUR = 0.02, HURT_PER_HIT = 0.7, HURT_RECOVER = 1.0; // of the screen height; per hit (of 1); s
@@ -1598,24 +1599,46 @@ const dof = new DofPass({
       focus = texture2D(tFocus, vec2(0.5)).x;
       vec4 base = texture2D(tDiffuse, vUv);
       float z0 = viewDepth(vUv), c0 = coc(z0);
-      // how far round to look: this pixel's own blur, or aiming, the lens's most (a blurred thing nearer can reach it)
-      float reach = max(c0, uAim * ${DOF_ADS_MAX} * uRes.y);
+      vec3 col = base.rgb;
       // alpha: how sharp it is (1: in focus, 0: blurred), for the upscale to the screen (crisp, or smooth: see OutputPass)
-      if (reach < 0.5) { gl_FragColor = vec4(base.rgb, 1.0); return; } // in focus, and nothing near to blur over it
-      vec3 sum = base.rgb;
-      float wsum = 1.0, spread = c0;
-      for (int i = 0; i < ${DOF_TAPS}; i++) {
-        float fi = float(i) + 0.5, r = sqrt(fi / ${DOF_TAPS}.0) * reach, a = fi * 2.39996;
-        vec2 uv = vUv + vec2(cos(a), sin(a)) * r / uRes;
-        float zt = viewDepth(uv), ct = coc(zt);
-        // a sample counts where its own blur reaches this pixel; one behind this pixel only as far as this pixel's own
-        // blur reaches (a sharp thing behind doesn't smear onto a blurred one in front, nor the in-focus onto itself)
-        float w = clamp((zt < z0 ? ct : min(ct, c0)) - r + 1.0, 0.0, 1.0);
-        sum += texture2D(tDiffuse, uv).rgb * w;
-        wsum += w;
-        if (zt < z0 && w > 0.0) spread = max(spread, ct); // (blurred over by something nearer: not sharp)
+      float sharp = 1.0 - smoothstep(0.5, 1.5, c0);
+      // Its own blur: a disc its own size, each sample counted where its own blur reaches this pixel (so a sharp thing
+      // doesn't smear into the blur round it)
+      if (c0 >= 0.5) {
+        vec3 sum = base.rgb;
+        float wsum = 1.0;
+        for (int i = 0; i < ${DOF_TAPS}; i++) {
+          float fi = float(i) + 0.5, r = sqrt(fi / ${DOF_TAPS}.0) * c0, a = fi * 2.39996;
+          vec2 uv = vUv + vec2(cos(a), sin(a)) * r / uRes;
+          float w = clamp(coc(viewDepth(uv)) - r + 1.0, 0.0, 1.0);
+          sum += texture2D(tDiffuse, uv).rgb * w;
+          wsum += w;
+        }
+        col = sum / wsum;
       }
-      gl_FragColor = vec4(sum / wsum, 1.0 - smoothstep(0.5, 1.5, spread));
+      // Aiming, a blurred thing nearer spreads over what's behind it, as a lens's near blur does, out to the lens's
+      // most: each sample a share of this pixel, the nearer thing's colour where its blur reaches here, this pixel's
+      // own where not (so the spread fades out from the edge)
+      float reach = uAim * ${DOF_ADS_MAX} * uRes.y;
+      if (reach >= 0.5) {
+        vec3 near = vec3(0.0);
+        float cover = 0.0;
+        for (int i = 0; i < ${DOF_NEAR_TAPS}; i++) {
+          float fi = float(i) + 0.5, r = sqrt(fi / ${DOF_NEAR_TAPS}.0) * reach, a = fi * 2.39996 + 1.0;
+          vec2 uv = vUv + vec2(cos(a), sin(a)) * r / uRes;
+          float zt = viewDepth(uv);
+          if (zt >= z0) continue;
+          float w = clamp(coc(zt) - r + 1.0, 0.0, 1.0);
+          near += texture2D(tDiffuse, uv).rgb * w;
+          cover += w;
+        }
+        if (cover > 0.0) {
+          float share = cover / ${DOF_NEAR_TAPS}.0;
+          col = mix(col, near / cover, share);
+          sharp *= 1.0 - clamp(share * 4.0, 0.0, 1.0); // (blurred over: not sharp)
+        }
+      }
+      gl_FragColor = vec4(col, sharp);
     }`,
 });
 composer.addPass(dof);
