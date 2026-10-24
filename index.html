@@ -1628,7 +1628,7 @@ const GUN_FOV = 60;
 // sawn-off side-by-side: see holdShotgun). Each one's:
 //   mag: rounds (M4 30, full auto at 800 rpm, mid M4A1 range; the shotgun 2 shells, both barrels at once, 8 pellets
 //     each, then it reloads; the pistol 20, the extended magazine, one shot a click; fists: a punch every interval s
-//     while it's held, left and right in turn: see punch)
+//     while it's held, left and right in turn, each going out as the last gets back, a seesaw: see punch)
 //   interval: s between shots; pellets a shot, up to spread rad off the aim
 //   power: how hard a shot hits (shotgun 1): the camera's kick and shake, the gun's recoil, and how long a demon it
 //     hits goes on bleeding (see KICK_PER_SHOT, RECOIL_BACK, BLEED_TIME)
@@ -1636,7 +1636,7 @@ const GUN_FOV = 60;
 //   reload: how much faster the reload clips play (3.6 s → 1.45 s at 2.5; the shotgun's 1.6 s): the demons don't wait
 //   flash: the muzzle flash's size (the shotgun: both barrels' in one; the pistol: a 9 mm through a compensator)
 const WEAPONS = {
-  fists: { key: 'Digit1', mag: 1, interval: 0.3, pellets: 1, spread: 0, power: 0.3, splat: 1, reload: 2.5, flash: 1 },
+  fists: { key: 'Digit1', mag: 1, interval: 0.28, pellets: 1, spread: 0, power: 0.3, splat: 1, reload: 2.5, flash: 1 },
   pistol: { key: 'Digit2', mag: 20, interval: 0.12, pellets: 1, spread: 0, power: 0.3, splat: 1, reload: 2.8, flash: 0.7 },
   m4: { key: 'Digit3', mag: 30, interval: 0.075, pellets: 1, spread: 0, power: 0.15, splat: 1, reload: 2.5, flash: 1 },
   shotgun: { key: 'Digit4', mag: 2, interval: 0.25, pellets: 16, spread: 0.05, power: 1, splat: 1.5, reload: 2.3, flash: 1.4 },
@@ -1776,19 +1776,21 @@ const FIST_SHOULDER = [32, -47, -11], FIST_SHOULDER_OUT = [16, -30, -20], FIST_G
 // ...the arm stretched PUNCH_STRETCH longer at full stretch (a smear: the shoulder can't come further forward, so the
 // reach comes from the arm)
 const PUNCH_STRETCH = 0.3;
-// ...while the other fist pulls back to the chin (the body turning into the punch): to FIST_BACK (nearer you: bigger,
-// still in view), its shoulder to FIST_SHOULDER_BACK
-const FIST_SHOULDER_BACK = [33, -47, -8], FIST_BACK = [13, -15, -28];
+// ...while the other fist pulls back (the body turning into the punch): to FIST_BACK (nearer you and down in the
+// corner, just its top still in view), its shoulder to FIST_SHOULDER_BACK
+const FIST_SHOULDER_BACK = [35, -47, -4], FIST_BACK = [15, -18, -24];
 const FIST_ELBOW = [65, -100, -40]; // the way the elbow bends: down and out from under the fist
+const FIST_ELBOW_BACK = [100, -120, 70]; // ...and pulled back: out, down and back by your side (the forearm lying forward)
 // A tight fist: each finger from straight (the rig's bind pose) bent this far at its three knuckles (rad); the thumb
 // from straight bent the way the rig's own pose bends it (round the rifle's grip), times FIST_THUMB_CLOSE at its base,
 // knuckle and last joint (so it closes along the joints' own axes: aimed at points instead, it twisted and tore), then
 // turned FIST_THUMB_LOWER rad down the fist at its base (it sat high); the guard breathing FIST_SWAY cm up and down
 const FIST_BEND = [1.45, 1.75, 1.1], FIST_THUMB_CLOSE = [1.7, 1.9, 1.85], FIST_THUMB_LOWER = 0.7;
-const FIST_SWAY = 0.5, FIST_SWAY_HZ = 0.8, PUNCH_TIME = 0.17; // cm; Hz; s
-// ...and a punch turns the fist over PUNCH_TWIST rad about the forearm on its way out (a corkscrew: the thumb side
-// rolling in and down, the pinky up), the turn running ahead of the reach (and staying till the fist's nearly back)
-const PUNCH_TWIST = 2.9, PUNCH_TWIST_FORE = 0.65; // rad; the forearm's share (the rest's the wrist's)
+const FIST_SWAY = 0.5, FIST_SWAY_HZ = 0.8, PUNCH_TIME = 0.34; // cm; Hz; s
+// ...and a punch turns the fist over PUNCH_TWIST rad about the forearm on its way out (a corkscrew: palm down at full
+// stretch, the pinky a little up), the turn running ahead of the reach (and staying till the fist's nearly back); the
+// fist pulling back turns PULL_TWIST over the same way (palm down along its forearm)
+const PUNCH_TWIST = 1.65, PULL_TWIST = 1.57, PUNCH_TWIST_FORE = 0.65; // rad; the forearm's share (the rest's the wrist's)
 // A punch lands on the nearest demon in front, its body within PUNCH_REACH m of your eye and within PUNCH_CONE (rad)
 // of your aim, PUNCH_HIT of the way into the punch, for PUNCH_DAMAGE (a shot does 1; each point knocks it back too),
 // shaking the view with PUNCH_SHAKE trauma (see shakeCamera: a shotgun blast is 1, the most a gun can add) and
@@ -1796,7 +1798,7 @@ const PUNCH_TWIST = 2.9, PUNCH_TWIST_FORE = 0.65; // rad; the forearm's share (t
 const PUNCH_REACH = 1.4, PUNCH_CONE = 0.45, PUNCH_HIT = 0.12, PUNCH_DAMAGE = 3, PUNCH_SHAKE = 2, PUNCH_JOLT = 0.07;
 // A punch is timed from PUNCH_LEAD s before the click (a fifth of its way out, in time: half way, as it's fastest at
 // the start), and posed every frame till it's out (see updateGun): the click's frame shows the fist half way out, the
-// next all the way out, as it lands; no frame of it still in the guard (s)
+// next two (at 60 fps) the rest of the way, as it lands; no frame of it still in the guard (s)
 const PUNCH_LEAD = PUNCH_TIME * PUNCH_HIT * 0.2;
 // The fists, [left, right]: the right arm with all it needs to pose; the left only its punch (it's the right, mirrored)
 function holdFists(root, draw) {
@@ -1863,12 +1865,13 @@ function poseFist(arm, punchAt, otherAt, now) {
   const wrist = eye.localToWorld(_fa.setY(_fa.y + sway));
   _fb.fromArray(FIST_SHOULDER).lerp(_fc.fromArray(FIST_SHOULDER_BACK), back);
   const shoulder = eye.localToWorld(_fb.lerp(_fc.fromArray(FIST_SHOULDER_OUT), out));
-  const elbowAt = eye.localToWorld(_fc.fromArray(FIST_ELBOW));
+  // (the pulled-back elbow only as the fist gets back: on a fist still out in front, it swung the elbow over the top)
+  const elbowAt = eye.localToWorld(_fc.fromArray(FIST_ELBOW).lerp(_fd.fromArray(FIST_ELBOW_BACK), back * (1 - out)));
   reachArm(arm, wrist, shoulder, 1, elbowAt);
   // the fist: knuckles along the forearm (elbow to wrist), the curled fingers facing the other fist in the guard,
-  // turned over (PUNCH_TWIST) as it punches out
+  // turned over as it punches out (PUNCH_TWIST) or pulls back (PULL_TWIST)
   const A = arm.hand.getWorldPosition(_fa).sub(arm.fore.getWorldPosition(_fb)).normalize();
-  const twist = -PUNCH_TWIST * (1 - (1 - out) ** 2);
+  const twist = -Math.max(PUNCH_TWIST * (1 - (1 - out) ** 2), PULL_TWIST * back); // (both palm down: the larger)
   turnAbout(arm.fore, A, twist * PUNCH_TWIST_FORE); // (the rig has no twist bones: all of it at the wrist pinched it)
   const D = eye.localToWorld(_fc.set(-1, 0, 0)).sub(eye.getWorldPosition(_fd)).normalize();
   D.addScaledVector(A, -D.dot(A)).normalize().applyAxisAngle(A, twist);
