@@ -4548,7 +4548,7 @@ function tryFire(now) {
   gun.flashMirror = Math.random() < 0.5;
   gun.flashFrame = -1; // a new shot: re-render now
   shakeKick += KICK_PER_SHOT;
-  shakeTrauma = Math.min(shakeTrauma + TRAUMA_PER_SHOT, 1);
+  shakeTrauma = Math.max(shakeTrauma, Math.min(shakeTrauma + TRAUMA_PER_SHOT, 1)); // (never lowering a punch's, above 1)
   firePellets();
   updateAmmo();
 }
@@ -4700,7 +4700,7 @@ function demonShot(npc) {
   const side = Math.atan2(_hudV.x, -_hudV.z);
   hitKickYaw += HIT_KICK * Math.sin(side); // from the right: the view's knocked left, and so on
   hitKickPitch += HIT_KICK * 0.6;
-  shakeTrauma = Math.min(shakeTrauma + 0.47, 1);
+  shakeTrauma = Math.max(shakeTrauma, Math.min(shakeTrauma + 0.47, 1)); // (never lowering a punch's, above 1)
   hudHit(from);
 }
 // The view's own effects, drawn over everything (after the gun): blood specks that landed on your view, and arcs
