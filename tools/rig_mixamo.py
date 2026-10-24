@@ -1,41 +1,59 @@
-# Makes models/zombie.glb: the image-to-3d zombie (an unrigged mesh, standing in an A-pose), rigged with the Mixamo
-# skeleton fitted to it, with Mixamo's Running, Idle, Punching and Dying (downloaded on the stock X Bot) retargeted
-# onto it as "Run", "Idle", "Punch" and "Die". Run with:
-#   Blender -b --factory-startup --python tools/zombie.py -- <dir with the 4 Zombie *.fbx> <zombie.glb> models/zombie.glb [preview dir]
-# The rig: the X Bot's skeleton, each joint moved onto the zombie's (its middles found by slicing the mesh), each bone
-# turned the least it takes to point along the zombie's limb (so the arms hang in its A-pose); the fingers ride with the
-# hand (no weights of their own: the mesh's hands are mitts). Skinned by Blender's bone heat.
-# The clips: every bone takes the X Bot's turn in the world each frame (the mesh is bound in the zombie's own pose, so
-# its limbs follow from there), and the hips' height scaled to the zombie's; Run's forward travel taken out (the game
-# moves it), Die's fall kept, grounded by the body.
+# Rigs an image-to-3d character (an unrigged mesh, standing in an A-pose) with the Mixamo skeleton fitted to it, and
+# retargets Mixamo clips (downloaded on the stock X Bot) onto it; optionally puts a rifle (the M4 pack's) in its hands.
+# Run with:
+#   Blender -b --factory-startup --python tools/rig_mixamo.py -- <character.glb> <out.glb> <Name>=<clip.fbx>[:<root>] ...
+#     [--rifle <models/m4/scene.gltf> <Name of the clip to fit it in>] [--preview <dir>]
+# root: 'in place' (the default: its travel taken out; the game moves it), 'keep' (its travel kept, from where it
+# starts), 'ground' (kept, and the body put on the floor each frame: a death).
+# models/zombie.glb (image-to-3d out/zombie/zombie.glb; the clips from Mixamo):
+#   ... -- zombie.glb models/zombie.glb "Run=Zombie Running.fbx" "Idle=Zombie Idle.fbx" "Punch=Zombie Punching.fbx:keep"
+#   "Die=Zombie Dying.fbx:ground"
+# models/police.glb (image-to-3d out/police/textured_art_shaded.glb):
+#   ... -- police.glb models/police.glb "Idle=Rifle Idle.fbx" "Walk=Rifle Walk.fbx" "Run=Run Forward.fbx"
+#   "Fire=Firing Rifle.fbx" "Die=Zombie Dying.fbx:ground" --rifle models/m4/scene.gltf Fire
+# The rig: the X Bot's skeleton, each joint moved onto the character's (its middles found by slicing the mesh), each
+# bone turned the least it takes to point along the character's limb (so the arms hang in its A-pose); the fingers ride
+# with the hand (no weights of their own: the mesh's hands are mitts). Skinned by Blender's bone heat.
+# The clips: every bone takes the X Bot's turn in the world each frame (the mesh is bound in the character's own pose,
+# so its limbs follow from there), and the hips' height scaled to the character's.
+# The rifle: in the right hand, its grip in the palm, pointing at the left hand, as they are in the clip named (a hold
+# every Mixamo rifle clip shares), riding on the right hand from then on; a "muzzle" empty at its barrel's end.
 import bpy, sys, math, os
 import numpy as np
 from mathutils import Vector, Matrix, Quaternion
 
 args = sys.argv[sys.argv.index('--') + 1:]
-fbx_dir, zombie_glb, out_glb = args[:3]
-preview = args[3] if len(args) > 3 else None
+def option(name, n=1):
+    if name not in args: return None
+    i = args.index(name); v = args[i + 1:i + 1 + n]; del args[i:i + 1 + n]
+    return v
+preview = (option('--preview') or [None])[0]
+rifle_args = option('--rifle', 2)
+char_glb, out_glb, *clip_args = args
 HEIGHT = 1.82      # m: the X Bot's, so the clips' poses fit
 FACES = 12000      # decimated to: plenty for a sprite a couple of hundred pixels tall
 TEX = 512          # texture size
-CLIPS = [('Run', 'Zombie Running.fbx', 'in place'), ('Idle', 'Zombie Idle.fbx', 'in place'),
-         ('Punch', 'Zombie Punching.fbx', 'keep'), ('Die', 'Zombie Dying.fbx', 'ground')]
+CLIPS = []
+for c in clip_args:
+    name, rest = c.split('=', 1)
+    path, _, root = rest.partition(':')
+    CLIPS.append((name, path, root or 'in place'))
 P = 'mixamorig:'
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 scene.render.fps = 30
 
-def import_fbx(name):
+def import_fbx(path):
     before = set(bpy.data.objects)
-    bpy.ops.import_scene.fbx(filepath=os.path.join(fbx_dir, name))
+    bpy.ops.import_scene.fbx(filepath=path)
     new = [o for o in bpy.data.objects if o not in before]
     arm = [o for o in new if o.type == 'ARMATURE'][0]
     return arm, [o for o in new if o.type == 'MESH']
 
 # --- the zombie mesh: 1.82 m tall, feet on the floor, decimated, its texture shrunk
 before = set(bpy.data.objects)
-bpy.ops.import_scene.gltf(filepath=zombie_glb)
+bpy.ops.import_scene.gltf(filepath=char_glb)
 body = [o for o in bpy.data.objects if o not in before and o.type == 'MESH'][0]
 for o in [o for o in bpy.data.objects if o not in before and o is not body]:
     bpy.data.objects.remove(o)
@@ -50,9 +68,7 @@ bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 dec = body.modifiers.new('decimate', 'DECIMATE')
 dec.ratio = FACES / len(body.data.polygons)
 bpy.ops.object.modifier_apply(modifier=dec.name)
-body.name = body.data.name = 'Zombie'
-for img in bpy.data.images:
-    if img.size[0] > TEX: img.scale(TEX, TEX * img.size[1] // img.size[0])
+body.name = body.data.name = os.path.splitext(os.path.basename(out_glb))[0].capitalize()
 co = np.empty(len(body.data.vertices) * 3); body.data.vertices.foreach_get('co', co); co = co.reshape(-1, 3)
 print('zombie', len(body.data.vertices), 'verts', len(body.data.polygons), 'faces')
 
@@ -60,6 +76,13 @@ print('zombie', len(body.data.vertices), 'verts', len(body.data.polygons), 'face
 def middle(z, xlo, xhi, dz=0.015):
     sel = co[(np.abs(co[:, 2] - z) < dz) & (co[:, 0] > xlo) & (co[:, 0] < xhi)]
     c = (sel.min(axis=0) + sel.max(axis=0)) / 2
+    return Vector((c[0], c[1], z))
+def outer(z, sgn, dz=0.015):  # an arm's slice: what's past the widest gap across x on that side (torso to arm: the
+    # decimated mesh has smaller gaps inside a limb, and a stray vertex or two out past it)
+    sel = co[(np.abs(co[:, 2] - z) < dz) & (np.sign(co[:, 0]) == sgn)]
+    xs = np.sort(sel[:, 0] * sgn); g = np.diff(xs)
+    arm = sel[sel[:, 0] * sgn >= (xs[np.argmax(g) + 1] if len(g) and g.max() > 0.03 else xs[0])]
+    c = (arm.min(axis=0) + arm.max(axis=0)) / 2
     return Vector((c[0], c[1], z))
 J = {}
 for side, sgn in (('Left', 1), ('Right', -1)):
@@ -70,11 +93,10 @@ for side, sgn in (('Left', 1), ('Right', -1)):
     toe = co[(co[:, 2] < 0.06) & (np.sign(co[:, 0]) == sgn)]
     J[side + 'ToeBase'] = Vector((J[side + 'Foot'].x, (J[side + 'Foot'].y + toe[:, 1].min()) / 2, 0.02))  # the ball
     J[side + 'Toe_End'] = Vector((J[side + 'Foot'].x, toe[:, 1].min(), 0.02))
-    arm = lambda x: (x, 0.7) if sgn > 0 else (-0.7, -x)  # outside the torso (its edge, at each height)
     J[side + 'Arm'] = Vector((0.19 * sgn, middle(1.40, -0.3, 0.3).y, 1.40))  # the shoulder joint
-    J[side + 'ForeArm'] = middle(1.15, *arm(0.22))                            # the elbow
-    J[side + 'Hand'] = middle(0.96, *arm(0.33))                               # the wrist
-    J[side + 'HandEnd'] = middle(0.84, *arm(0.33))                            # the hand's end
+    J[side + 'ForeArm'] = outer(1.15, sgn)                                    # the elbow
+    J[side + 'Hand'] = outer(0.96, sgn)                                       # the wrist
+    J[side + 'HandEnd'] = outer(0.84, sgn)                                    # the hand's end
     J[side + 'Shoulder'] = Vector((0.05 * sgn, J[side + 'Arm'].y, 1.45))
 J['Hips'] = Vector((0, middle(0.86, -0.3, 0.3).y, 0.86))
 J['Neck'] = Vector((0, middle(1.56, -0.2, 0.2).y, 1.56))
@@ -262,6 +284,65 @@ for clip, fbx, root in CLIPS:
     bpy.data.objects.remove(s2)
 bpy.data.objects.remove(src)
 
+# --- the rifle: the M4 pack's (its body, magazine, bolt, catch, trigger and safety), in the right hand
+if rifle_args:
+    m4, fit = rifle_args
+    before = set(bpy.data.objects)
+    bpy.ops.import_scene.gltf(filepath=m4)
+    new = [o for o in bpy.data.objects if o not in before]
+    bpy.context.view_layer.update()
+    keep = ('Main_M4', 'Mag1_M4', 'Bolt_M4', 'BoltCatch_M4', 'Trigger_M4', 'Safety_M4')
+    parts = [o for o in new if o.type == 'MESH' and not o.find_armature() and o.name.startswith(keep)]
+    wv = lambda o: np.array([o.matrix_world @ v.co for v in o.data.vertices])
+    main = wv([o for o in parts if o.name.startswith('Main_M4')][0])
+    trig = wv([o for o in parts if o.name.startswith('Trigger_M4')][0]).mean(axis=0)
+    mag = wv([o for o in parts if o.name.startswith('Mag1_M4')][0]).mean(axis=0)
+    # its length: the way its vertices spread furthest (it comes in posed by the pack's first clip: at a slant); the
+    # muzzle end, the thinner of the two ends (the stock's the bulkier)
+    mid = main.mean(axis=0)
+    length = np.linalg.eigh((main - mid).T @ (main - mid))[1][:, -1]
+    t = (main - mid) @ length
+    ends = [main[t < t.min() + 0.02], main[t > t.max() - 0.02]]
+    tip = ends[int(np.argmin([np.ptp(e, axis=0).sum() for e in ends]))].mean(axis=0)
+    axis = Vector(length) * (1 if np.dot(tip - mid, length) > 0 else -1)
+    up = Vector(main.mean(axis=0) - mag); up -= axis * up.dot(axis); up.normalize()  # (the magazine hangs below)
+    grip = Vector(trig) - axis * 0.045 - up * 0.05  # the pistol grip: behind and below the trigger
+    new_names = [o.name for o in new]  # (the parts are gone once joined: kept by name)
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in parts: o.select_set(True)
+    bpy.context.view_layer.objects.active = parts[0]
+    bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')  # (off their bones, where they sit, in metres)
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    bpy.ops.object.join()
+    gun = bpy.context.view_layer.objects.active
+    gun.name = gun.data.name = 'Rifle'
+    for n in new_names:  # the rest of the pack: its arms, rig and spare magazine
+        if n in bpy.data.objects and bpy.data.objects[n] is not gun: bpy.data.objects.remove(bpy.data.objects[n])
+    # the rifle's own frame: grip at its origin, the barrel along -Y, up +Z (Blender: so it exports barrel +Z, up +Y)
+    rot = Matrix((up.cross(axis), -axis, up)).transposed().to_4x4()  # columns: its x, y (back), z (up) in the world
+    gun.data.transform(rot.inverted() @ Matrix.Translation(-grip))
+    muzzle = bpy.data.objects.new('muzzle', None); scene.collection.objects.link(muzzle)
+    muzzle.parent = gun; muzzle.location = rot.inverted().to_3x3() @ (Vector(tip) - grip)
+    # the hold: in the named clip, a little way in, the right palm and the left
+    for tr in rig.animation_data.nla_tracks: tr.mute = tr.name != fit
+    scene.frame_set(int(bpy.data.actions[fit].frame_range[1]) // 3)
+    bpy.context.view_layer.update()
+    at = lambda n: rig.matrix_world @ rig.pose.bones[P + n].head
+    right = (at('RightHand') + at('RightHandMiddle1')) / 2
+    left = (at('LeftHand') + at('LeftHandMiddle1')) / 2
+    d = (left - right).normalized(); u = Vector((0, 0, 1)); u = (u - d * u.dot(d)).normalized()
+    want = Matrix((u.cross(d), -d, u)).transposed().to_4x4(); want.translation = right
+    # on the right hand: its place on the hand, from the hand as it is in that pose (a bone's child hangs off its tail)
+    pb = rig.pose.bones[P + 'RightHand']
+    hand = rig.matrix_world @ pb.matrix @ Matrix.Translation((0, pb.bone.length, 0))
+    gun.parent = rig; gun.parent_type = 'BONE'; gun.parent_bone = P + 'RightHand'
+    gun.matrix_parent_inverse = Matrix.Identity(4)
+    gun.matrix_basis = hand.inverted() @ want
+    bpy.context.view_layer.update()
+    print('rifle placed: barrel', [round(v, 2) for v in (gun.matrix_world.to_3x3() @ Vector((0, -1, 0)))], 'wanted', [round(v, 2) for v in d])
+    for tr in rig.animation_data.nla_tracks: tr.mute = False
+    print('rifle', round((Vector(tip) - grip).length, 3), 'm from grip to muzzle; hands', round((left - right).length, 3), 'm apart')
+
 # --- previews: a few frames of each clip, front and side
 if preview:
     os.makedirs(preview, exist_ok=True)
@@ -286,9 +367,13 @@ if preview:
     for track in rig.animation_data.nla_tracks: track.mute = False
     bpy.data.objects.remove(cam)
 
-for img in bpy.data.images: img.pack()
+for img in bpy.data.images:
+    if img.size[0] > TEX: img.scale(TEX, TEX * img.size[1] // img.size[0])
+    img.pack()
 bpy.ops.object.select_all(action='DESELECT')
 body.select_set(True); rig.select_set(True)
+for o in bpy.data.objects:
+    if o.name in ('Rifle', 'muzzle'): o.select_set(True)
 bpy.ops.export_scene.gltf(filepath=out_glb, export_format='GLB', use_selection=True, export_animation_mode='NLA_TRACKS',
                           export_force_sampling=True, export_image_format='AUTO')
 print('wrote', out_glb)
