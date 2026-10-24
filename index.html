@@ -1836,6 +1836,7 @@ function holdFists(root, draw) {
   // nothing else puts them back between poses (bent from wherever they were, they wound round and round)
   R.fingerBind = R.fingers.map(bindTurn);
   R.thumbBind = R.thumb.map(bindTurn);
+  R.handBind = bindTurn(R.hand); // (the wrist straight)
   // ...and the arm as the clip leaves it (Draw's end): each pose starts from there. Once Draw has ended nothing else puts
   // the arm back (three only writes a bone when the clip's value changes), and reachArm turns the forearm the least it
   // can from wherever it was, so its roll about its length crept ~6° a punch, for good
@@ -1845,7 +1846,7 @@ function holdFists(root, draw) {
   return [L, R];
 }
 const _fa = new THREE.Vector3(), _fb = new THREE.Vector3(), _fc = new THREE.Vector3(), _fd = new THREE.Vector3();
-const _fm = new THREE.Matrix4(), _fn = new THREE.Matrix4(), _fq = new THREE.Quaternion(), _fp = new THREE.Quaternion();
+const _fm = new THREE.Matrix4(), _fn = new THREE.Matrix4(), _fq = new THREE.Quaternion(), _fp = new THREE.Quaternion(), _fr = new THREE.Quaternion();
 // How far out a punch thrown at punchAt is at now (0: in the guard, 1: all the way out): out at full speed from the
 // first frame, easing into the hit (cubic ease-out), then eased slower back to the guard
 function punchOut(punchAt, now) {
@@ -1872,12 +1873,18 @@ function poseFist(arm, punchAt, otherAt, now) {
   // turned over as it punches out (PUNCH_TWIST) or pulls back (PULL_TWIST)
   const A = arm.hand.getWorldPosition(_fa).sub(arm.fore.getWorldPosition(_fb)).normalize();
   const twist = -Math.max(PUNCH_TWIST * (1 - (1 - out) ** 2), PULL_TWIST * back); // (both palm down: the larger)
-  turnAbout(arm.fore, A, twist * PUNCH_TWIST_FORE); // (the rig has no twist bones: all of it at the wrist pinched it)
   const D = eye.localToWorld(_fc.set(-1, 0, 0)).sub(eye.getWorldPosition(_fd)).normalize();
   D.addScaledVector(A, -D.dot(A)).normalize().applyAxisAngle(A, twist);
   _fm.makeBasis(A, D, _fb.crossVectors(A, D)); // world: along, curl, side
   _fn.makeBasis(arm.along, arm.curl, _fd.crossVectors(arm.along, arm.curl)).transpose(); // (local, inverted)
   _fq.setFromRotationMatrix(_fm.multiply(_fn));
+  // The hand's turn on the forearm about its length (from the wrist straight), PUNCH_TWIST_FORE of it rolled into the
+  // forearm instead: the rig has no twist bones, and all of it at the wrist pinched the cuff. Measured, not the twist
+  // asked for: where the elbow's bend comes out the other way round, the forearm's rolled over with it.
+  _fr.copy(arm.fore.getWorldQuaternion(_fp)).invert().multiply(_fq).multiply(_fp.copy(arm.handBind).invert());
+  if (_fr.w < 0) _fr.set(-_fr.x, -_fr.y, -_fr.z, -_fr.w);
+  const length = _fd.copy(arm.boneLength[1]).normalize();
+  turnAbout(arm.fore, A, PUNCH_TWIST_FORE * 2 * Math.atan2(_fr.x * length.x + _fr.y * length.y + _fr.z * length.z, _fr.w));
   arm.hand.quaternion.copy(arm.fore.getWorldQuaternion(_fp).invert().multiply(_fq));
   arm.hand.updateMatrixWorld(true);
   const side = _fa.copy(arm.side).applyQuaternion(arm.hand.getWorldQuaternion(_fp));
