@@ -375,23 +375,23 @@ const DEMON_PACE = 1.5, DEMON_FAST = 2.2; // normal and fast pace multipliers; t
 const DEMON_FACING = 0;      // demon.glb facing offset (0 = faces +Z); set Math.PI if they walk backwards
 // The enemy, one kind at a time (the others' code kept, for when there are more):
 // - 'police': zombie police officers with rifles (models/police.glb: image-to-3d, rigged with Mixamo's skeleton and
-//   given Mixamo's rifle Idle, Walk, Run and Fire, and the zombie's Die, holding the M4: tools/rig_mixamo.py), keeping
-//   their distance, circling you, dodging your aim, and stopping to fire bursts (see POLICE_BURST)
+//   given Mixamo's rifle Idle, Walk, WalkAim, Run and Fire, and the zombie's Die, holding the M4: tools/rig_mixamo.py), standing
+//   about and strolling till they're on to you (see POLICE_SIGHT), then running at you, circling you, running off your
+//   aim, and stopping to fire bursts (see POLICE_BURST)
 // - 'zombie': models/zombie.glb (the same, with Run, Idle, Punch, Die), running at you and punching
 // - 'demon': demon.glb (Walk/Fire/Death), shooting volleys, orbiting you, dodging your aim
 const ENEMY = 'police', ZOMBIE = ENEMY === 'zombie', POLICE = ENEMY === 'police', DEMON = ENEMY === 'demon';
 const ZOMBIE_RUN = 2.35;     // m/s: Run's stride (a planted foot slides back at this; 0.8 s a cycle)
 const ZOMBIE_PACE = 1, ZOMBIE_FAST = 1.3; // it runs already: 2.35 / 3.05 m/s (you: MOVE)
-// m/s: the police's Walk and Run strides (a planted foot slides back at these); they break into a run further than
-// POLICE_RUN_FROM + POLICE_GAIT_BAND m from you, and drop back to a walk nearer than POLICE_RUN_FROM - POLICE_GAIT_BAND
-// (one line: backing off at the right speed, it flipped every few frames, legs frozen)
-const POLICE_WALK = 0.94, POLICE_RUN = 3.74, POLICE_RUN_FROM = 16, POLICE_GAIT_BAND = 2;
+// m/s: the police's Walk (the rifle held low: not on to you), WalkAim (the rifle up, aimed: on to you) and Run strides
+// (a planted foot slides back at these)
+const POLICE_WALK = 0.94, POLICE_AIM_WALK = 0.77, POLICE_RUN = 3.74;
 const NPC_WALK = ZOMBIE ? ZOMBIE_RUN : POLICE ? POLICE_WALK : DEMON_WALK;
 const NPC_PACE = ZOMBIE ? ZOMBIE_PACE : POLICE ? 1 : DEMON_PACE, NPC_FAST = ZOMBIE ? ZOMBIE_FAST : POLICE ? 1 : DEMON_FAST;
 const FACING = DEMON ? DEMON_FACING : 0; // (Mixamo's characters face +Z too)
 const FEET = ['mixamorigLeftFoot', 'mixamorigRightFoot']; // (GLTFLoader drops the ':' from Mixamo's bone names)
 const RIG = ZOMBIE ? { walk: 'Run', fire: 'Punch', death: 'Die', feet: FEET } // its clips, and its feet
-  : POLICE ? { walk: 'Walk', run: 'Run', fire: 'Fire', death: 'Die', feet: FEET }
+  : POLICE ? { walk: 'Walk', aimWalk: 'WalkAim', run: 'Run', fire: 'Fire', death: 'Die', feet: FEET }
   : { walk: 'Walk', fire: 'Fire', death: 'Death', feet: ['foot.L', 'foot.R'] };
 const FALLS_FORWARD = !DEMON; // Mixamo's Dying: so one turns its back to you to die, and falls away (see damageNpc)
 const RT_SIZES = [128, 256, 512, 64]; // sprite resolutions cycled with P (first is the default)
@@ -4687,6 +4687,7 @@ function tryFire(now) {
   shakeKick += KICK_PER_SHOT;
   shakeTrauma = Math.max(shakeTrauma, Math.min(shakeTrauma + TRAUMA_PER_SHOT, 1)); // (never lowering a punch's, above 1)
   firePellets();
+  if (POLICE) policeHear(camera.position, camera.position.x, camera.position.z, now); // (see POLICE_HEAR)
   updateAmmo();
 }
 
@@ -4851,6 +4852,7 @@ function demonShot(npc, damage = DEMON_DAMAGE) {
   muzzleFlash(from);
   // its gun (sounds/demon_shot.wav: freesound "submachine gun", one shot and its tail), quieter the further off
   demonVoice(npc, 'demon_shot', 0.9);
+  if (POLICE) policeHear(from, npc.seenAt.x, npc.seenAt.y, clock.elapsedTime); // (the others too: at where it thinks you are)
   _shotDir.subVectors(camera.position, from);
   const dist = _shotDir.length();
   _shotDir.divideScalar(dist);
@@ -5286,6 +5288,7 @@ function addNpcs(n) {
     const model = cloneSkinned(enemyGltf.scene);
     do model.position.set((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
     while (model.position.distanceTo(camera.position) < NPC_SPAWN_GAP); // (not on top of you)
+    if (POLICE) model.rotation.y = Math.random() * 2 * Math.PI; // (facing all ways: what they see, see policeLook)
     model.traverse((o) => { if (o.isMesh) o.castShadow = false; }); // blob/sprite shadows in both modes, so V compares fairly
     const bloodRT = new THREE.WebGLRenderTarget(WOUND_RES, WOUND_RES); // its wounds (see paintWound)
     let mesh;
@@ -5294,17 +5297,22 @@ function addNpcs(n) {
     scene.add(imp);
     const clip = (name) => imp.mixer.clipAction(THREE.AnimationClip.findByName(enemyGltf.animations, name));
     const walk = clip(RIG.walk), fire = clip(RIG.fire), death = clip(RIG.death), idle = clip('Idle'); // (fire: a zombie's punch)
-    const run = RIG.run ? clip(RIG.run) : null; // (the police's: walk is whichever gait it's in)
+    const run = RIG.run ? clip(RIG.run) : null, aimWalk = RIG.aimWalk ? clip(RIG.aimWalk) : null; // (the police's: walk is
+    // whichever it's in, standing, walking, walking with the rifle up or running)
     death.setLoop(THREE.LoopOnce, 1);
     death.clampWhenFinished = true; // and stays lying there
-    walk.play().time = Math.random() * walk.getClip().duration; // out of step with each other
+    const stand = POLICE ? idle : walk; // (the police start out standing about: see POLICE_SIGHT)
+    stand.play().time = Math.random() * stand.getClip().duration; // out of step with each other
     const npc = {
-      imp, walk, fire, idle, run, walkGait: walk, muzzle: model.getObjectByName('muzzle'), mesh, bloodRT,
+      imp, walk: stand, fire, idle, run, aimWalk, walkGait: walk, muzzle: model.getObjectByName('muzzle'), mesh, bloodRT,
       shooter: POLICE || Math.random() < 0.5, firing: false, timer: nextVolley(), // (every officer has a rifle)
       pace: NPC_PACE, paceTarget: NPC_PACE, paceTimer: 0, // switches between normal and fast every few seconds
       orbitR: AI_ORBIT[0] + Math.random() * (AI_ORBIT[1] - AI_ORBIT[0]),
       orbitDir: Math.random() < 0.5 ? -1 : 1,
-      orbitTimer: 0, dodge: 0, dodgeSide: 1, // see thinkDemon
+      orbitTimer: 0, dodge: 0, dodgeSide: 1, closing: false, // see thinkDemon
+      alert: false, sees: false, seenAt: new THREE.Vector2(), seenTime: -Infinity, // the police's (see policeLook):
+      strolling: false, strollTo: new THREE.Vector2(), standUntil: clock.elapsedTime + Math.random() * POLICE_STAND[1],
+      bestGap: Infinity, bestBy: 0, // (see stalled)
       stagger: 0, knock: new THREE.Vector3(), shakeDir: new THREE.Vector3(), // hit reaction (see staggerNpc)
       health: DEMON_HEALTH, dead: false, death, // see damageNpc
     };
@@ -5336,7 +5344,7 @@ Promise.all([
     enemy.animations.push(...demonDeath.animations);
   }
   enemyGltf = enemy;
-  for (const name of [RIG.walk, RIG.run]) if (name) enemyFootfalls[name] = findFootfalls(enemy, name);
+  for (const name of [RIG.walk, RIG.aimWalk, RIG.run]) if (name) enemyFootfalls[name] = findFootfalls(enemy, name);
   setupGun(m4, { pistol: pistol.scene, shotgun: shotgun.scene });
   // ?n=100 spawns 100 demons (default 8), ?real starts in real-3D mode
   const params = new URLSearchParams(location.search);
@@ -5493,7 +5501,10 @@ function demonVoice(npc, name, level, pitch = 1) {
 }
 function damageNpc(npc, dir) {
   if (npc.dead) return;
-  if (--npc.health > 0) return staggerNpc(npc, dir);
+  if (--npc.health > 0) {
+    if (POLICE) policeAlert(npc, clock.elapsedTime); // (shot, or punched: it knows where you are)
+    return staggerNpc(npc, dir);
+  }
   npc.dead = true;
   demonVoice(npc, `demon_death_${(Math.random() * DEMON_DEATHS) | 0}`, 1.0); // its death cry, one of the calls
   npc.stagger = 0;
@@ -5508,6 +5519,7 @@ function damageNpc(npc, dir) {
   npc.fire.fadeOut(0.15);
   npc.idle.fadeOut(0.15);
   npc.run?.fadeOut(0.15);
+  npc.aimWalk?.fadeOut(0.15);
   npc.walkGait.fadeOut(0.15);
   npc.death.reset().fadeIn(0.15).play();
 }
@@ -5520,7 +5532,7 @@ function updateStagger(npc, dt) {
   const m = npc.imp.model, p = m.position, left = npc.stagger / STAGGER_TIME;
   npc.stagger = Math.max(npc.stagger - dt, 0);
   npc.walk.timeScale = 0; // frozen mid-stride; the pace eases it back after
-  npc.pace = 0;
+  if (!POLICE) npc.pace = 0; // (the police: straight back to it after; easing up from 0, their run was slow motion, a walk)
   // shudder: a velocity whose integral is SHUDDER × sin, so it shakes about where the knock carries it
   const phase = (STAGGER_TIME - npc.stagger) * SHUDDER_RATE;
   p.addScaledVector(npc.knock, dt).addScaledVector(npc.shakeDir, SHUDDER * SHUDDER_RATE * Math.cos(phase) * left * dt);
@@ -5543,12 +5555,13 @@ function updateStagger(npc, dt) {
 const AI_ORBIT = [6, 12], AI_AIM_MARGIN = 1.3, AI_AIM_RANGE = 40; // m, m, m
 const AI_SPACING = 3, AI_BODY = 1.2; // m: how far apart demons like to keep; closest they ever get (centre to centre)
 const AI_DODGE_TIME = 0.5, AI_DODGE_SPEED = 1.6, AI_AVOID = 2; // s; pace multiplier while dodging; m an obstacle is felt from
+const AI_AHEAD = 4; // m: how far ahead it looks for something big in its way (see wayTo)
 const _ai = new THREE.Vector3(), _aim = new THREE.Vector3(), _toMe = new THREE.Vector3(), _obs = new THREE.Vector3();
 const COLUMN_BODY = COLUMN_APOTHEM / Math.cos(Math.PI / 8) + 0.5; // a column's corner, plus a demon's body
 const TOWER_BODY = TOWER_HALF * Math.SQRT2 + 0.5; // a tower's corner post, plus a demon's body
-// What a zombie goes round when it's between it and you (see thinkDemon): its centre, the radius it's steered round
-// (its body's, padded), and its solid radius, what blocks the way (null: the platform, by its own shape and stairs)
-const ZOMBIE_AROUND = [[new THREE.Vector2(), Math.hypot(PLATFORM_APOTHEM + 3 * STAIR_RUN, STAIR_HALF) + 0.5, null],
+// What an enemy goes round when it's in its way (see wayTo): its centre, the radius it's steered round (its body's,
+// padded), and its solid radius, what blocks the way (null: the platform, by its own shape and stairs)
+const AROUND = [[new THREE.Vector2(), Math.hypot(PLATFORM_APOTHEM + 3 * STAIR_RUN, STAIR_HALF) + 0.5, null],
   ...COLUMNS.map((c) => [c, COLUMN_BODY, COLUMN_APOTHEM / Math.cos(Math.PI / 8)]),
   ...TOWERS.map((c) => [c, TOWER_BODY, TOWER_HALF * Math.SQRT2])];
 let youUp = false; // you're up on the platform or the stairs, above their bottom step (see the floor, in the main loop)
@@ -5580,57 +5593,55 @@ function thinkDemon(npc, dt, out) {
   const dist = Math.max(_ai.length(), 1e-3);
   _ai.divideScalar(dist); // towards you
   let pace = 1;
-  if (ZOMBIE) { // a zombie: straight at you (no circling, no dodging, no backing off), and past anything big in the way,
-    // along the line that just clears its edge on your side (pushing straight at it, the obstacle's push and the pull
-    // to you cancelled out: it stood there running on the spot); right by it, that's round its edge
-    out.copy(_ai);
-    const ex = camera.position.x - p.x, ez = camera.position.z - p.z, len = Math.hypot(ex, ez);
-    let nearest = Infinity;
-    for (const [c, R, solid] of ZOMBIE_AROUND) {
-      const cx = c.x - p.x, cz = c.y - p.z, d0 = Math.hypot(cx, cz);
-      if (cx * ex + cz * ez <= 0 || d0 >= nearest) continue; // behind it; or a nearer one's in the way already
-      if (solid === null) { // the platform: unless you're up on it, is it (or a flight of stairs) really between you?
-        if (youUp) continue;
-        _zo.set(p.x, 0.2, p.z); _zd.set(ex / len, 0, ez / len);
-        const hits = [rayOctagon(_zo, _zd, 0, 0, PLATFORM_APOTHEM, PLATFORM_H), ...STAIR_PIECES.map((s) => rayConvex(_zo, _zd, s))];
-        if (!hits.some((h) => h && h.t < len)) continue;
-      } else { // a column or a tower: does the way to you pass through it?
-        const u = THREE.MathUtils.clamp((cx * ex + cz * ez) / (len * len), 0, 1); // the way to you: nearest to c
-        if (Math.hypot(cx - ex * u, cz - ez * u) >= solid + 0.2) continue;
-      }
-      nearest = d0;
-      const a = Math.asin(Math.min(R / d0, 1)), ca = Math.cos(a), sa = Math.sin(a);
-      const lx = cx * ca - cz * sa, lz = cx * sa + cz * ca, rx = cx * ca + cz * sa, rz = -cx * sa + cz * ca; // either edge
-      if (lx * ex + lz * ez >= rx * ex + rz * ez) out.set(lx, 0, lz).divideScalar(d0); else out.set(rx, 0, rz).divideScalar(d0);
-      if (d0 < R) out.addScaledVector(_zd.set(-cx / d0, 0, -cz / d0), Math.min((R - d0) / 2, 1)); // inside: out too (past stairs)
-    }
+  if (ZOMBIE) { // a zombie: straight at you (no circling, no dodging, no backing off), past anything big in the way
+    wayTo(npc, p, camera.position.x, camera.position.z, youUp, out);
   } else {
     const tx = -_ai.z * npc.orbitDir, tz = _ai.x * npc.orbitDir; // round you
     const side = aimedAt(p, p.y + npc.imp.fit.y);
+    npc.dodge -= dt; // (first: still aimed at as it runs out, it dodges on, never a frame off it, the run restarting)
     if (side && npc.dodge <= 0) {
-      npc.dodge = AI_DODGE_TIME; npc.dodgeSide = side;
+      npc.dodge = POLICE ? POLICE_DODGE : AI_DODGE_TIME; npc.dodgeSide = side;
       if (npc.firing) { // aimed at: abandon the volley and move
         npc.firing = false; npc.timer = nextVolley();
         npc.fire.fadeOut(0.1); npc.walk.reset().fadeIn(0.1).play();
       }
     }
+    // closing in till it's within orbitR + 0.5, and again once it's out past orbitR + 3 (at the one line, orbitR + 1, it
+    // flicked between the two as it circled; the police fire only in among it, not closing); or, you up on the platform,
+    // till it's at its edge, as near as it gets (else it circled there, closing in, for good, and never fired)
+    npc.closing = dist > npc.orbitR + (npc.closing ? 0.5 : 3) && !(youUp && platformGap(p.x, p.z) < 0.5 + AI_AVOID + 0.2);
     if (npc.dodge > 0) { // break sideways off your line of fire (perpendicular to it, the side it's on), a little forward
-      npc.dodge -= dt;
       camera.getWorldDirection(_aim).setY(0).normalize();
       out.set(-_aim.z * npc.dodgeSide * -1, 0, _aim.x * npc.dodgeSide * -1).addScaledVector(_ai, 0.2);
       npc.orbitDir = Math.sign(out.x * tx + out.z * tz) || npc.orbitDir; // carry on round you that way after
-      pace = AI_DODGE_SPEED;
-    } else if (dist > npc.orbitR + 1) { // further out: close in on you, angling round a little
+      pace = POLICE ? 1 : AI_DODGE_SPEED; // (the police: at a run)
+    } else if (npc.closing) { // further out: close in on you, angling round a little
       out.set(tx, 0, tz).multiplyScalar(0.35).add(_ai);
-    } else { // there or inside it: circle round you, opening the gap back up the closer it is
-      out.set(tx, 0, tz).addScaledVector(_ai, -THREE.MathUtils.clamp((npc.orbitR - dist) / 2, 0, 1) * 0.8);
+    } else { // there: circle round you, opening the gap back up the closer it is (and drifting back in, outside it)
+      out.set(tx, 0, tz).addScaledVector(_ai, -THREE.MathUtils.clamp((npc.orbitR - dist) / 2, -0.5, 1) * 0.8);
+    }
+    // and past anything big that way (its circle round you often ran through the platform: it ran on the spot at its
+    // edge, pushed off it as it pushed on)
+    out.normalize();
+    wayTo(npc, p, p.x + out.x * AI_AHEAD, p.z + out.z * AI_AHEAD, false, out);
+    // circling on into a wall it's up against: round you the other way (where its circle met the wall, the wall's push
+    // and its own cancelled out: on the spot); not again for a second (in a corner it flicked from one way to the other)
+    const alongX = Math.abs(p.x) > Math.abs(p.z), wall = Math.sign(alongX ? p.x : p.z) || 1; // the nearest wall's way
+    if (!npc.closing && npc.dodge <= 0 && ARENA - Math.max(Math.abs(p.x), Math.abs(p.z)) < AI_AVOID + 0.6
+      && (alongX ? out.x : out.z) * wall > 0.3 && clock.elapsedTime > (npc.flipAt ?? 0)) {
+      npc.orbitDir = -npc.orbitDir; npc.flipAt = clock.elapsedTime + 1;
     }
   }
+  // (a zombie closing on you feels obstacles less and less: backed up to a wall or a column, you were held just out of
+  // its reach; the hard collisions still keep it out of them)
+  steerClear(npc, out, ZOMBIE ? THREE.MathUtils.clamp((dist - ZOMBIE_REACH) / AI_AVOID, 0, 1) : 1);
+  return pace;
+}
+// out (a way to go, XZ), pushed off what's near: obstacles, as it nears them, and nudged round them the way it's going;
+// the others; the walls (near: how much the obstacles count, 0-1); made unit
+function steerClear(npc, out, near) {
+  const p = npc.imp.model.position;
   out.normalize();
-  // obstacles: pushed away as it nears them, and nudged round them the way it's going
-  // (a zombie closing on you feels them less and less: backed up to a wall or a column, you were held just out of its
-  // reach; the hard collisions still keep it out of them)
-  const near = ZOMBIE ? THREE.MathUtils.clamp((dist - ZOMBIE_REACH) / AI_AVOID, 0, 1) : 1;
   const avoid = (nx, nz, gap) => { // (nx, nz): unit, away from the obstacle; gap: m to its surface
     if (gap >= AI_AVOID) return;
     const k = (1 - gap / AI_AVOID) * 2.5 * near, round = out.x * -nz + out.z * nx >= 0 ? 1 : -1;
@@ -5659,7 +5670,125 @@ function thinkDemon(npc, dt, out) {
   }
   for (const [nx, nz, gap] of [[-1, 0, ARENA - p.x], [1, 0, ARENA + p.x], [0, -1, ARENA - p.z], [0, 1, ARENA + p.z]]) avoid(nx, nz, gap - 0.6);
   out.normalize();
-  return pace;
+}
+// The way for npc, from p to (gx, gz), into out (unit, XZ): straight there, or past anything big in the way (see
+// AROUND), along the line that just clears whichever of its edges is more on the way (pushing straight at it, the
+// obstacle's push and the pull on cancelled out: a zombie stood there running on the spot); right by it, that's round
+// its edge. That edge it keeps to till it's been clear of it a moment, or the way on's turned back from it (head on, it
+// picked one, then the other, frame by frame: on the spot again; kept when it had turned round, it went back and forth,
+// the obstacle in its way one frame and not the next). up: (gx, gz) is up on the platform or its stairs (so they're
+// where it's going, not in the way)
+function wayTo(npc, p, gx, gz, up, out) {
+  const ex = gx - p.x, ez = gz - p.z, len = Math.max(Math.hypot(ex, ez), 1e-3);
+  out.set(ex / len, 0, ez / len);
+  let nearest = Infinity, round = null;
+  for (const it of AROUND) {
+    const [c, R, solid] = it;
+    const cx = c.x - p.x, cz = c.y - p.z, d0 = Math.hypot(cx, cz);
+    if (cx * ex + cz * ez <= 0 || d0 >= nearest) continue; // behind it; or a nearer one's in the way already
+    if (solid === null) { // the platform: unless it's going up there, is it (or a flight of stairs) really in the way?
+      if (up) continue;
+      _zo.set(p.x, 0.2, p.z); _zd.set(ex / len, 0, ez / len);
+      const hits = [rayOctagon(_zo, _zd, 0, 0, PLATFORM_APOTHEM, PLATFORM_H), ...STAIR_PIECES.map((s) => rayConvex(_zo, _zd, s))];
+      if (!hits.some((h) => h && h.t < len)) continue;
+    } else { // a column or a tower: does the way pass through it?
+      const u = THREE.MathUtils.clamp((cx * ex + cz * ez) / (len * len), 0, 1); // the way there: nearest to c
+      if (Math.hypot(cx - ex * u, cz - ez * u) >= solid + 0.2) continue;
+    }
+    nearest = d0; round = it;
+  }
+  if (!round) return;
+  const [c, R] = round, cx = c.x - p.x, cz = c.y - p.z, d0 = nearest, now = clock.elapsedTime;
+  const a = Math.asin(Math.min(R / d0, 1)), ca = Math.cos(a), sa = Math.sin(a);
+  const lx = cx * ca - cz * sa, lz = cx * sa + cz * ca, rx = cx * ca + cz * sa, rz = -cx * sa + cz * ca; // either edge
+  const onL = (lx * ex + lz * ez) / (d0 * len), onR = (rx * ex + rz * ez) / (d0 * len); // how much each is on the way (cos)
+  if (npc.round !== round || now > npc.roundUntil || (npc.roundLeft ? onL : onR) < -0.3) { npc.round = round; npc.roundLeft = onL >= onR; }
+  npc.roundUntil = now + 0.5;
+  if (npc.roundLeft) out.set(lx, 0, lz).divideScalar(d0); else out.set(rx, 0, rz).divideScalar(d0);
+  if (d0 < R) out.addScaledVector(_zd.set(-cx / d0, 0, -cz / d0), Math.min((R - d0) / 2, 1)); // inside: out too (past stairs)
+}
+// The police aren't always on to you. Till they are, they stand about (POLICE_STAND s) and stroll somewhere near
+// (POLICE_STROLL m off), at a walk. They're on to you once they see you (your eye from theirs, nothing in the way, within
+// POLICE_SIGHT m and inside their view, POLICE_VIEW either side of where they face, or within POLICE_FEEL m, any way),
+// hear a shot (yours, or another officer's, within POLICE_HEAR m of them) or are hurt. On to you, they run at you (see
+// thinkDemon) till they're in among their circling range, walk round you there with the rifle up, stopping to fire,
+// and run off your line of fire when you aim at them (for POLICE_DODGE s). Out of sight, they run to where they last
+// saw (or heard) you; not seeing you for POLICE_FORGET s, they give up, and stand about again.
+const POLICE_SIGHT = 30, POLICE_VIEW = THREE.MathUtils.degToRad(60), POLICE_FEEL = 3, POLICE_HEAR = 24, POLICE_EYE = 1.6; // m; ; m; m; m
+const POLICE_FORGET = 6, POLICE_STAND = [2, 6], POLICE_STROLL = [3, 8], POLICE_DODGE = 0.9, POLICE_LOOK_EVERY = 0.2; // s; s; m; s; s
+const POLICE_STALL = 1; // s: getting no nearer where it's going for this long, it stops there (see stalled)
+const between = ([a, b]) => a + Math.random() * (b - a);
+const _eye = new THREE.Vector3(), _toYou = new THREE.Vector3();
+// Is it on to you? It looks every POLICE_LOOK_EVERY s or so (a ray through the world)
+function policeLook(npc, now) {
+  if (now >= (npc.lookAt ?? 0)) {
+    npc.lookAt = now + POLICE_LOOK_EVERY * (0.5 + Math.random()); // (not all on the same frame)
+    const m = npc.imp.model, p = m.position;
+    _eye.set(p.x, p.y + POLICE_EYE, p.z);
+    _toYou.subVectors(camera.position, _eye);
+    const d = _toYou.length(), across = Math.hypot(_toYou.x, _toYou.z);
+    const yaw = _stepE.setFromQuaternion(m.quaternion, 'YXZ').y - FACING; // where it's facing (see steer)
+    const off = Math.acos(THREE.MathUtils.clamp((Math.sin(yaw) * _toYou.x + Math.cos(yaw) * _toYou.z) / Math.max(across, 1e-3), -1, 1));
+    let sees = d < POLICE_SIGHT && (npc.alert || across < POLICE_FEEL || off < POLICE_VIEW); // (on to you: it looks round for you)
+    if (sees) { const w = rayWorld(_eye, _toYou.divideScalar(d)); sees = !w || w.t > d - 0.3; }
+    npc.sees = sees;
+    if (!sees) npc.closing = true; // (out of sight: in range again before it fires; else, seeing you again from far off, it
+    // stopped and fired a whole volley there, then ran in)
+    if (sees) policeAlert(npc, now); // (only as it looks: between, it would see where you'd gone, out of sight)
+  }
+  if (!npc.sees && npc.alert && now - npc.seenTime > POLICE_FORGET) { npc.alert = false; npc.strolling = false; npc.standUntil = now + between(POLICE_STAND); }
+}
+function policeAlert(npc, now, x = camera.position.x, z = camera.position.z) { // on to you, at (x, z): where you are now
+  if (!npc.alert) demonVoice(npc, `demon_grunt_${(Math.random() * DEMON_GRUNTS) | 0}`, 1); // (a growl: it's on to you)
+  npc.alert = true; npc.seenTime = now; npc.seenAt.set(x, z); npc.bestGap = Infinity;
+}
+// Is it getting no nearer to where it's going (gap m off) for POLICE_STALL s? (others got there first, and it was
+// pushed off them; or it's in the way of something: it ran on the spot)
+function stalled(npc, gap, now) {
+  if (gap < npc.bestGap - 0.5) { npc.bestGap = gap; npc.bestBy = now + POLICE_STALL; }
+  if (now <= npc.bestBy) return false;
+  npc.bestGap = -Infinity; // (and stays so till it's going somewhere new: else, nudged nearer, it set off again, and stalled)
+  return true;
+}
+// A shot, from from (x, z: you, there, as far as they can tell): those in earshot are on to you (an officer's shot gives
+// away where it's shooting, not where you are: when it couldn't see you, they all ran straight to you)
+function policeHear(from, x, z, now) {
+  for (const npc of npcs) {
+    const q = npc.imp.model.position;
+    if (!npc.dead && !npc.sees && Math.hypot(q.x - from.x, q.z - from.z) < POLICE_HEAR) policeAlert(npc, now, x, z);
+  }
+}
+// Not on to you: standing about, then strolling somewhere near, and standing again; somewhere out in the open, clear of
+// the platform, the columns, the towers and the walls by more than they're felt from (AI_AVOID: else it was pushed off
+// short of it, round and round it); into out (unit, XZ) the way it's going; returns its pace (0: standing)
+function policeStroll(npc, now, out) {
+  const p = npc.imp.model.position, g = npc.strollTo;
+  if (npc.strolling && (Math.hypot(g.x - p.x, g.y - p.z) < 0.7 || stalled(npc, Math.hypot(g.x - p.x, g.y - p.z), now))) { // there, or near as it gets
+    npc.strolling = false; npc.standUntil = now + between(POLICE_STAND);
+  }
+  if (!npc.strolling) {
+    if (now < npc.standUntil) return 0;
+    const a = Math.random() * 2 * Math.PI, r = between(POLICE_STROLL);
+    const edge = ARENA - 0.6 - AI_AVOID - 0.3;
+    g.set(THREE.MathUtils.clamp(p.x + Math.sin(a) * r, -edge, edge), THREE.MathUtils.clamp(p.z + Math.cos(a) * r, -edge, edge));
+    if (platformGap(g.x, g.y) < 0.5 + AI_AVOID + 0.3 || AROUND.some(([c, R], i) => i > 0 && c.distanceTo(g) < R + AI_AVOID + 0.3)) {
+      npc.standUntil = now + 0.5; return 0; // (somewhere else, in a moment)
+    }
+    npc.strolling = true; npc.bestGap = Infinity;
+  }
+  wayTo(npc, p, g.x, g.y, false, out);
+  steerClear(npc, out, 1);
+  return 1;
+}
+// On to you, not seeing you: to where it last saw (or heard) you, and there (near enough: it may be right by a column,
+// where it's pushed off) it waits; at the platform's edge, if you were up on it; or as near as it gets (see stalled);
+// into out (unit, XZ) the way it's going; returns its pace (0: waiting)
+function policeSearch(npc, now, out) {
+  const p = npc.imp.model.position, g = npc.seenAt, up = platformGap(g.x, g.y) === 0, gap = Math.hypot(g.x - p.x, g.y - p.z);
+  if (gap < 2 || (up && platformGap(p.x, p.z) < 0.5 + AI_AVOID + 0.2) || stalled(npc, gap, now)) return 0;
+  wayTo(npc, p, g.x, g.y, up, out);
+  steerClear(npc, out, 1);
+  return 1;
 }
 function pushApart(npc) { // two living demons never overlap: each moves half the overlap
   const p = npc.imp.model.position;
@@ -5791,8 +5920,11 @@ renderer.setAnimationLoop((time) => {
         continue;
       }
     } else {
-      // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on
-      npc.timer -= dt;
+      // Shooters: walk a while, stop, fire 2–4 shots where they're facing, walk on (the police: only on to you, seeing
+      // you, in among their circling range and not dodging; and losing sight of you, they stop: see POLICE_SIGHT)
+      if (POLICE) policeLook(npc, now);
+      if (!POLICE || npc.alert) npc.timer -= dt;
+      if (POLICE && npc.firing && !npc.sees) npc.timer = 0;
       if (npc.firing) {
         if (npc.timer > 0) { // stand still while firing, turned to you (unless you aim at it: thinkDemon breaks it off)
           steer(npc.imp.model, move.subVectors(camera.position, npc.imp.model.position).setY(0).normalize(), 0, dt, FACING);
@@ -5811,7 +5943,7 @@ renderer.setAnimationLoop((time) => {
         npc.timer = nextVolley();
         npc.fire.fadeOut(0.2);
         npc.walk.reset().fadeIn(0.2).play();
-      } else if (npc.shooter && npc.timer <= 0) {
+      } else if (npc.shooter && npc.timer <= 0 && (!POLICE || (npc.sees && !npc.closing && npc.dodge <= 0))) {
         npc.firing = true;
         npc.walk.fadeOut(0.2);
         npc.fire.reset().fadeIn(0.2).play();
@@ -5831,21 +5963,23 @@ renderer.setAnimationLoop((time) => {
       npc.paceTimer = 2 + Math.random() * 4;
     }
     npc.pace += (npc.paceTarget - npc.pace) * (1 - Math.exp(-3 * dt)); // ease between paces
-    const p = npc.imp.model.position;
-    if (POLICE) { // far off, it runs; nearer, it walks
-      const d = Math.hypot(camera.position.x - p.x, camera.position.z - p.z);
-      const gait = d > POLICE_RUN_FROM + (npc.walk === npc.run ? -POLICE_GAIT_BAND : POLICE_GAIT_BAND) ? npc.run : npc.walkGait;
+    // which way, and how fast (the police: standing about or strolling, on to you, or looking for you: see POLICE_SIGHT)
+    const how = !POLICE || npc.sees ? thinkDemon(npc, dt, move) : npc.alert ? policeSearch(npc, now, move) : policeStroll(npc, now, move);
+    const pace = npc.pace * how;
+    if (POLICE) { // standing; strolling (Walk); on to you: round you, the rifle up (WalkAim: at the other, between its
+      // bursts, it looked as if it couldn't care less), else running (at you, off your aim, or to where it saw you)
+      const gait = how === 0 ? npc.idle : !npc.alert ? npc.walkGait : !npc.sees || npc.closing || npc.dodge > 0 ? npc.run : npc.aimWalk;
       if (gait !== npc.walk) { npc.walk.fadeOut(0.25); gait.reset().fadeIn(0.25).play(); npc.walk = gait; npc.walkWas = undefined; }
     }
-    const pace = npc.pace * thinkDemon(npc, dt, move);
-    npc.walk.timeScale = pace;
+    npc.walk.timeScale = npc.walk === npc.idle ? 1 : pace;
     demonSteps(npc, pace);
     npc.nextGrunt ??= now + Math.random() * DEMON_GRUNT_EVERY[1]; // (spread out from the start)
     if (now >= npc.nextGrunt) { // walking: now and then, a grunt
       demonVoice(npc, `demon_grunt_${(Math.random() * DEMON_GRUNTS) | 0}`, 0.8);
       npc.nextGrunt = now + DEMON_GRUNT_EVERY[0] + Math.random() * (DEMON_GRUNT_EVERY[1] - DEMON_GRUNT_EVERY[0]);
     }
-    steer(npc.imp.model, move, (npc.walk === npc.run ? POLICE_RUN : NPC_WALK) * pace, dt, FACING);
+    const stride = npc.walk === npc.run ? POLICE_RUN : npc.walk === npc.aimWalk ? POLICE_AIM_WALK : NPC_WALK;
+    if (how > 0) steer(npc.imp.model, move, stride * pace, dt, FACING); // (standing: as it was)
     pushApart(npc);
   }
   for (const npc of npcs) { // hard collision, for every living one once they've all moved (a crowd shoves the ones standing,
