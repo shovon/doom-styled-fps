@@ -390,8 +390,9 @@ const DEMON_FACING = 0;      // demon.glb facing offset (0 = faces +Z); set Math
 //   aim, and stopping to fire bursts (see POLICE_BURST)
 // - 'zombie': models/zombie.glb (the same, with Run, Idle, Punch, Die), running at you and punching
 // - 'demon': demon.glb (Walk/Fire/Death), shooting volleys, orbiting you, dodging your aim
-// and, whichever it is, flying skulls with them (see SKULLS)
-const ENEMY = 'police', ZOMBIE = ENEMY === 'zombie', POLICE = ENEMY === 'police', DEMON = ENEMY === 'demon';
+// and, whichever it is, flying skulls with them (see SKULLS). ?enemy=police (or demon) tries another one.
+const ENEMY = { police: 'police', demon: 'demon' }[new URLSearchParams(location.search).get('enemy')] ?? 'zombie';
+const ZOMBIE = ENEMY === 'zombie', POLICE = ENEMY === 'police', DEMON = ENEMY === 'demon';
 const ZOMBIE_RUN = 2.35;     // m/s: Run's stride (a planted foot slides back at this; 0.8 s a cycle)
 const ZOMBIE_PACE = 1, ZOMBIE_FAST = 1.3; // it runs already: 2.35 / 3.05 m/s (you: MOVE)
 // m/s: the police's Walk (the rifle held low: not on to you), WalkAim (the rifle up, aimed: on to you) and Run strides
@@ -404,7 +405,6 @@ const FEET = ['mixamorigLeftFoot', 'mixamorigRightFoot']; // (GLTFLoader drops t
 const RIG = ZOMBIE ? { walk: 'Run', fire: 'Punch', death: 'Die', feet: FEET } // its clips, and its feet
   : POLICE ? { walk: 'Walk', aimWalk: 'WalkAim', run: 'Run', fire: 'Fire', death: 'Die', feet: FEET }
   : { walk: 'Walk', fire: 'Fire', death: 'Death', feet: ['foot.L', 'foot.R'] };
-const FALLS_FORWARD = !DEMON; // Mixamo's Dying: so one turns its back to you to die, and falls away (see damageNpc)
 const RT_SIZES = [128, 256, 512, 64]; // sprite resolutions cycled with P (first is the default)
 let rtSizeIdx = 0;
 
@@ -4636,7 +4636,12 @@ const FOOTSTEPS = 11; // sounds/footstep_0..10.wav: single steps from "walking u
 const GRUNTS = 5; // sounds/hurt_grunt_0..4.wav: from heckingfeck's royalty-free "male pain grunts" (its 0:00, 0:02, 0:03, 0:07, 0:13)
 const DEMON_GRUNTS = 4; // sounds/demon_grunt_0..3.wav: freesound "monster chase grunts" (its four)
 const DEMON_DEATHS = 4; // sounds/demon_death_0..3.wav: the four calls in dragon-studio "monster call"
+// sounds/zombie_00..17.wav: the zombies' snarls and groans as they chase you, from "assortment of zombie sounds" (split
+// at its silences, mono, trimmed, faded, and peak-normalized like the others); sounds/zombie_death.wav, its death, from
+// "zombie dying" (one, whole: its gasps and last rattle, trimmed and levelled the same)
+const ZOMBIE_SOUNDS = 18, zombieSound = (k) => `zombie_${String(k).padStart(2, '0')}`;
 for (const name of ['rifle_shot', 'shotgun_blast', 'punch', 'shell_drop', 'reload', 'demon_shot', ...Array.from({ length: DEMON_GRUNTS }, (_, k) => `demon_grunt_${k}`),
+  ...(ZOMBIE ? [...Array.from({ length: ZOMBIE_SOUNDS }, (_, k) => zombieSound(k)), 'zombie_death'] : []),
   ...Array.from({ length: DEMON_DEATHS }, (_, k) => `demon_death_${k}`),
   ...Array.from({ length: GRUNTS }, (_, k) => `hurt_grunt_${k}`),
   ...Array.from({ length: FOOTSTEPS }, (_, k) => `footstep_${k}`)])
@@ -5255,10 +5260,9 @@ function updateAmmo() {
 // Demons
 // ---------------------------------------------------------------------------
 let enemyGltf;
-// Demon footsteps: when each foot comes down in the walk clip, your footsteps pitched down (a bigger body), only from
-// demons within DEMON_STEP_RANGE m and falling off fast, so the nearest few carry. The moments are found once from the
-// clip itself: a stand-in plays it through, and a foot's down where its height drops into the bottom of its swing.
-const DEMON_STEP_RANGE = 20, DEMON_STEP_PITCH = 0.75;
+// Enemy footfalls: when each foot comes down in the walk clip, a print if it's bloody (no sound: their footsteps were
+// cut). The moments are found once from the clip itself: a stand-in plays it through, and a foot's down where its
+// height drops into the bottom of its swing.
 let enemyFootfalls = {}; // s into each walking clip (by its name)
 function findFootfalls(gltf, name) {
   const model = cloneSkinned(gltf.scene), mixer = new THREE.AnimationMixer(model);
@@ -5286,14 +5290,9 @@ function demonSteps(npc, pace) { // after its walk has moved on this frame: did 
   npc.walkWas = t;
   if (pace < 0.05 || npc.walk.getEffectiveWeight() < 0.5) return;
   for (const f of enemyFootfalls[npc.walk.getClip().name] ?? []) if (crossed(was, t, f)) {
-    const m = npc.imp.model, d = m.position.distanceTo(camera.position);
+    const m = npc.imp.model;
     const yaw = _stepE.setFromQuaternion(m.quaternion, 'YXZ').y - FACING; // its heading (see steer)
     footPrint(npc, m.position, Math.sin(yaw), Math.cos(yaw), DEMON); // its print, if bloody (a demon's claws; else a boot)
-    const wet = inWetBlood(npc);
-    if (d < DEMON_STEP_RANGE) {
-      demonVoice(npc, `footstep_${(Math.random() * FOOTSTEPS) | 0}`, (wet ? 0.3 : 0.5) / (1 + d * 0.15), DEMON ? DEMON_STEP_PITCH : 0.95);
-      if (wet) playSquelch(0.6 / (1 + d * 0.15), 0.7);
-    }
   }
 }
 const npcs = []; // { imp, walk, fire, idle, death, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer, stagger, knock, shakeDir, health, dead, act, fireWas }
@@ -5524,14 +5523,17 @@ function damageNpc(npc, dir) {
     return staggerNpc(npc, dir);
   }
   npc.dead = true;
-  demonVoice(npc, `demon_death_${(Math.random() * DEMON_DEATHS) | 0}`, 1.0); // its death cry, one of the calls
+  if (ZOMBIE) demonVoice(npc, 'zombie_death', 1.2); // its death cry (a zombie's: quieter, made up for)
+  else demonVoice(npc, `demon_death_${(Math.random() * DEMON_DEATHS) | 0}`, 1.0); // (one of the calls)
   npc.stagger = 0;
-  // turns to face you as it dies, and from then on is only drawn from the front; a zombie turns its back on you instead
-  // (Die falls forward, 1-1.7 m: facing you, it would fall onto you), drawn from behind, your side
-  const m = npc.imp.model;
-  m.quaternion.setFromAxisAngle(UP, Math.atan2(camera.position.x - m.position.x, camera.position.z - m.position.z) + FACING + (FALLS_FORWARD ? Math.PI : 0));
+  // a demon turns to face you as it dies (it falls back); a zombie or an officer falls forward whichever way it's facing,
+  // as Mixamo's Zombie Dying does (turned away, it spun round as it died). From then on it's only drawn from one side:
+  // where you were as it died
+  const m = npc.imp.model, toYou = Math.atan2(camera.position.x - m.position.x, camera.position.z - m.position.z);
+  if (DEMON) m.quaternion.setFromAxisAngle(UP, toYou + FACING);
+  _v.set(0, 0, 1).applyQuaternion(m.quaternion);
   npc.imp.frontOnly = true;
-  npc.imp.frontAz = FALLS_FORWARD ? Math.PI : 0;
+  npc.imp.frontAz = toYou - Math.atan2(_v.x, _v.z); // (round from its front: see SpriteImpostor)
   npc.firing = false;
   npc.walk.fadeOut(0.15);
   npc.fire.fadeOut(0.15);
@@ -6215,8 +6217,11 @@ renderer.setAnimationLoop((time) => {
     npc.walk.timeScale = npc.walk === npc.idle ? 1 : pace;
     demonSteps(npc, pace);
     npc.nextGrunt ??= now + Math.random() * DEMON_GRUNT_EVERY[1]; // (spread out from the start)
-    if (now >= npc.nextGrunt) { // walking: now and then, a grunt
-      demonVoice(npc, `demon_grunt_${(Math.random() * DEMON_GRUNTS) | 0}`, 0.8);
+    if (now >= npc.nextGrunt) { // walking: now and then, a grunt (a zombie, chasing you: one of its sounds, never the last one again)
+      if (ZOMBIE) {
+        npc.lastSound = ((npc.lastSound ?? -1) + 1 + Math.floor(Math.random() * (ZOMBIE_SOUNDS - 1))) % ZOMBIE_SOUNDS;
+        demonVoice(npc, zombieSound(npc.lastSound), 1);
+      } else demonVoice(npc, `demon_grunt_${(Math.random() * DEMON_GRUNTS) | 0}`, 0.8);
       npc.nextGrunt = now + DEMON_GRUNT_EVERY[0] + Math.random() * (DEMON_GRUNT_EVERY[1] - DEMON_GRUNT_EVERY[0]);
     }
     const stride = npc.walk === npc.run ? POLICE_RUN : npc.walk === npc.aimWalk ? POLICE_AIM_WALK : NPC_WALK;
