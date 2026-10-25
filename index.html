@@ -6095,7 +6095,7 @@ function hitSkull(s, at, dir, dmg) {
 // edge on). Lit like the blood (see bloodLight): the light where it lies, capped at MEAT_LIGHT_MAX, from its main
 // direction onto each pixel's normal (the texture's: the pile's own shape), with a glint where it's wet; fogged like
 // the world. Not solid: you, the enemies and the shots go through them.
-const MEAT_KINDS = ['heap', 'heap_bone', 'guts', 'ribs'], MEAT_W = 72 * 0.015, MEAT_H = 32 * 0.015; // m (its W×H px at its PX)
+const MEAT_KINDS = ['heap', 'heap_bone', 'guts', 'mound'], MEAT_W = 72 * 0.015, MEAT_H = 32 * 0.015; // m (its W×H px at its PX)
 const MEAT_LEAN = THREE.MathUtils.degToRad(70), MEAT_LIGHT_MAX = 3;
 const meatMap = (file, color, onLoad) => { // a meat texture: pixels (nearest, as the sprites'), no mipmaps (they ate the silhouettes away with distance)
   const t = texLoader.load(`textures/${file}.png`, onLoad);
@@ -6175,16 +6175,16 @@ function updateMeat() { // each card turned to you and leant back towards you, a
 // away from you, tumbling (the sheet's frames: a full turn), each splatting where it lands (GIB_BIT_STAIN m), lying
 // there for good (the oldest reused past GIB_MAX). Each bit's a quad facing you, lit like the piles (the light where
 // it is, from its main direction on the sheet's normals, a wet glint), fogged like the casings.
-const GIB_TRAUMA = 12, GIB_TAU = 1.2, GIB_BITS = 30, GIB_MAX = 400; // hits; s; bits a burst; bits at once (14 of 16
+const GIB_TRAUMA = 12, GIB_TAU = 1.2, GIB_BITS = 24, GIB_MAX = 400; // hits; s; bits a burst; bits at once (14 of 16
 // pellets: a blast up close often had only 13 land; the pistol, as fast as it fires, tops out at 10.5)
 const GIB_KILL_MIN = 5, GIB_KILL_WINDOW = 1.5; // hits; s (see above: shredded as it dies)
-const GIB_SCALE = [1.1, 1.8]; // × a bit's frame (a body's pieces: big)
+const GIB_SCALE = [1.3, 2.0]; // × a bit's frame (a body's pieces: big; small, many and strewn wide, they were litter)
 const GIB_BURSTS = 1, GIB_BLOOD_SPEED = 1.3, GIB_BLOOD_SPLAT = 1.2, GIB_STAINS = 60, GIB_GUSH = 40; // ; × a hit's; × the
 // weapon's splats; gobs; spurts (about 3 s): the burst a big splash (three, harder, was too much), the stump's gush the show
 const GIB_BIT_STAIN = [0.1, 0.25]; // m: a landing bit's splat
 const GIB_KINDS = 6, GIB_FRAMES = 8, GIB_SIZE = 16 * 0.015; // the sheet's rows (chunk, fatty, bone, gut, flap, clot) and
 // frames; m a frame (its BIT px at PX)
-const GIB_PICK = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5]; // which kinds fly out, by share: chunks most
+const GIB_PICK = [0, 0, 0, 0, 0, 1, 2, 3, 3, 4, 4, 5, 5]; // which kinds fly out, by share: chunks most
 const TOP_HALF = /spine|chest|neck|head|shoulder|arm|hand|gun/i; // a body's top half: its bones' names, Mixamo's or the
 // demon's (its gun arm too; the hips and legs not)
 // Each vertex's share of the top half (aUpper: how much of it the top half's bones move), on the enemy's own geometry
@@ -6304,8 +6304,9 @@ function burstFrom(c, hit, bones) {
   splashLens(mid);
   for (let k = 0; k < GIB_BITS; k++) {
     const from = bones[(Math.random() * bones.length) | 0].getWorldPosition(_gibP);
-    const a = Math.random() * 2 * Math.PI, out = 1.2 + Math.random() * 2.8;
-    _gibV.set(Math.cos(a) * out, 1.5 + Math.random() * 3, Math.sin(a) * out).addScaledVector(hit.dir, 1 + Math.random() * 2.5);
+    const a = Math.random() * 2 * Math.PI, out = 0.6 + Math.random() * 1.8; // (landing mostly within a couple of metres: a mess,
+    // not a scatter)
+    _gibV.set(Math.cos(a) * out, 1.5 + Math.random() * 3, Math.sin(a) * out).addScaledVector(hit.dir, 0.5 + Math.random() * 1.5);
     spawnGib(from, _gibV);
   }
   const fall = 1 + mid.distanceTo(camera.position) * 0.12; // (quieter the further off, as a demon's voice)
@@ -6329,7 +6330,7 @@ function cutBody(c, hit) {
   const waist = (spine ?? hips).getWorldPosition(new THREE.Vector3());
   startBleed({ npc: c, entry: waist, dir: _gibV.set(0, -1, 0) }, now, GIB_GUSH);
   if (spine && hips) Object.assign(bleeds.at(-1), { bone: spine, root: hips });
-  addMeatPile(waist.x + hit.dir.x * 0.4, waist.z + hit.dir.z * 0.4, (Math.random() * MEAT_KINDS.length) | 0, 0.6 + Math.random() * 0.15, Math.random() < 0.5);
+  addMeatPile(waist.x + hit.dir.x * 0.4, waist.z + hit.dir.z * 0.4, (Math.random() * MEAT_KINDS.length) | 0, 0.75 + Math.random() * 0.15, Math.random() < 0.5);
 }
 // A carcass (see corpses: a whole body, or a cut one's legs) shot to pieces: all that's left of it
 function gibBody(c, hit) {
@@ -6337,7 +6338,7 @@ function gibBody(c, hit) {
   corpses.splice(corpses.indexOf(c), 1);
   for (let k = bleeds.length - 1; k >= 0; k--) if ((bleeds[k].npc.corpse ?? bleeds[k].npc) === c) bleeds.splice(k, 1);
   const mid = burstFrom(c, hit, c.imp.bones.filter((b) => NOT_FINGERS(b) && !(c.cut && TOP_HALF.test(b.name)))); // (its legs, if that's all)
-  addMeatPile(mid.x, mid.z, (Math.random() * MEAT_KINDS.length) | 0, (c.cut ? 0.6 : 0.8) + Math.random() * 0.15, Math.random() < 0.5);
+  addMeatPile(mid.x, mid.z, (Math.random() * MEAT_KINDS.length) | 0, (c.cut ? 0.75 : 0.9) + Math.random() * 0.15, Math.random() < 0.5);
   c.imp.dispose(); c.bloodRT.dispose(); c.mesh.material.dispose();
 }
 const _gibL = [0, 0, 0], _gibD = [0, 0, 0];
