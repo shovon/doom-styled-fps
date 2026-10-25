@@ -72,6 +72,7 @@ const silhouetteMat = new THREE.MeshBasicMaterial({ color: 0x000000 }); // shado
 const _cs = new THREE.Vector3(), _rc = new THREE.Vector3(), _toCam = new THREE.Vector3(), _facing = new THREE.Vector3(), _center = new THREE.Vector3();
 const CORPSE_ELEVATION = THREE.MathUtils.degToRad(20); // a body's one view: this far above the horizontal
 const SPRITE_NEAR = 0.1, SPRITE_FAR = 200, SPRITE_DEPTH_BIAS = 0.1; // m: the RT camera's clip range; card depth pulled towards you
+const STILL_RELIGHT = 0.25; // s: a still sprite's relight, at most this often, while you move (see SpriteImpostor's still)
 const _dir = new THREE.Vector3(), _look = new THREE.Vector3(), _bb = new THREE.Box3(), _bv3 = new THREE.Vector3();
 const _frustum = new THREE.Frustum(), _vp = new THREE.Matrix4(), _sphere = new THREE.Sphere();
 
@@ -92,6 +93,10 @@ class SpriteImpostor extends THREE.Group {
     this.frontOnly = false;     // only ever drawn from straight in front (see update)
     this.frontAz = 0;           // ...or this far round from its front (π: from behind)
     this.below = false;         // seen from below too (a flyer): else never from lower than level
+    this.still = false;         // a settled corpse: no more poses (it was redrawn 12 times a second, the same picture);
+                                // redrawn when the view or the flashes on it change, it's wounded, or (at most every
+                                // STILL_RELIGHT s) you've moved: the light pools and ceiling lights follow you
+    this.litFrom = new THREE.Vector3(Infinity, 0, 0); // (where you were when it was last drawn)
 
     // Render box from the bind pose (bone matrices start as zeros, so update them first)
     model.updateMatrixWorld(true);
@@ -234,8 +239,9 @@ class SpriteImpostor extends THREE.Group {
 
     // Stepped animation: hold each pose, then jump by the time banked since the last step
     this.animAcc += dt;
-    const posed = !o.stepped || this.animAcc >= 1 / o.animFps;
+    const posed = !this.still && (!o.stepped || this.animAcc >= 1 / o.animFps);
     if (posed) { this.mixer.update(this.animAcc); this.animAcc = 0; this.refit(); }
+    if (this.still && this.animAcc >= STILL_RELIGHT && !camera.position.equals(this.litFrom)) { this.animAcc = 0; this.lastKey = undefined; }
 
     const at = this.frozenAt ?? m.position;
     this.blob.position.set(at.x, 0.02, at.z);
@@ -257,7 +263,8 @@ class SpriteImpostor extends THREE.Group {
 
     const center = _center.copy(at).add(this.fit);
     this.applyLod(camera, center);
-    let renders = o.spriteShadows ? this.updateShadow(renderer, center, posed) : 0;
+    let renders = o.spriteShadows ? this.updateShadow(renderer, center, posed) : (this.shadowKey = undefined, 0); // (off a while: its
+    // silhouette may be from before it died)
     if (this.hidden) { this.lastKey = undefined; return renders; } // no card, no sprite render
 
     // Card: parallel to the image plane, pulled toward the eye and shrunk by the same ratio, so it covers
@@ -295,7 +302,7 @@ class SpriteImpostor extends THREE.Group {
       cam.position.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)).multiplyScalar(dist).add(center);
       cam.lookAt(center);
       // Locked distance + snapped view: the picture only changes when the snap or the pose changes.
-      if (o.lockDist) key = ((azIdx % o.snaps) + o.snaps) % o.snaps + o.snaps * elIdx;
+      if (o.lockDist) key = ((azIdx % o.snaps) + o.snaps) % o.snaps + o.snaps * (this.frontOnly ? 0 : elIdx); // (a body: one view, at any height)
     } else {
       if (o.lockDist) cam.position.copy(camera.position).sub(center).setLength(o.distance).add(center);
       else cam.position.copy(camera.position);
@@ -315,6 +322,7 @@ class SpriteImpostor extends THREE.Group {
     cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
     this.renderModel(renderer, this.rt, cam);
     this.renderedAt = performance.now(); // (for the sprite debug view)
+    this.litFrom.copy(camera.position);
     return renders + 1;
   }
 
@@ -356,7 +364,8 @@ class SpriteImpostor extends THREE.Group {
     this.shadowCam.position.copy(center).addScaledVector(_dir, 10);
     this.shadowCam.lookAt(center);
     this.shadowCam.updateMatrixWorld();
-    this.renderModel(renderer, this.shadowRt, this.shadowCam, silhouetteMat);
+    this.renderModel(renderer, this.shadowRt, this.shadowCam, this.ownShadow ? null : silhouetteMat); // (ownShadow: a cut body's,
+    // from its own material, which leaves its top half out; only the shadow's alpha counts)
     return 1;
   }
 
@@ -1417,7 +1426,7 @@ function updatePool(tiles, lights, reach, fade, intensity) {
 // Ceiling lights: rect area lights, the strip's own shape (1.6 × 0.2 m, the lens on the tile), shining down
 // only: soft, shaped highlights instead of a point's pinprick. Pricier per pixel than a point light and no
 // shadows, so again a pool over the nearest; not in the sprites' light mask (no `distance`), so a demon's
-// sprite picks up changes on its next pose step.
+// sprite picks up changes on its next pose step (a still one's: as you move, see STILL_RELIGHT).
 // Intensity scales with the ceiling height squared to keep the floor as lit: 120 at 4 m, so 480 at 8 m
 const CEIL_POOL = 8, CEIL_REACH = 20, CEIL_FADE = 6, CEIL_INTENSITY = 120 * (WALL_ROWS * TILE / 4) ** 2;
 const ceilLight = () => {
@@ -2039,8 +2048,7 @@ function landPunch() {
   gun.punchLands = Infinity;
   const o = camera.position, aim = camera.getWorldDirection(_pa);
   let best = null, bestT = Infinity;
-  for (const npc of npcs.concat(skulls)) {
-    if (npc.dead) continue;
+  for (const npc of npcs.concat(skulls)) { // (the living: punches don't land on the dead)
     const c = _pt.copy(npc.imp.model.position).add(npc.imp.fit).sub(o), r = npc.imp.r * 0.5;
     const t = c.dot(aim), d = c.length();
     if (t <= 0 || d - r > PUNCH_REACH || Math.acos(Math.min(t / d, 1)) > PUNCH_CONE + Math.atan2(r, d)) continue;
@@ -2976,7 +2984,7 @@ const player = { under: { depth: 0, wet: 0 }, boot: 0, foot: 1 };
 const offFloor = (x, z) => !onBloodFloor(x, 0, z) || platformDist(x, z) < PLATFORM_APOTHEM; // (the platform: not the floor's map)
 function probeFeet() { // after flushBlood: sample under every foot; read back (when the last read's back)
   if (probing) return;
-  const who = [player, ...npcs.filter((n) => !n.dead).slice(0, BLOOD_PROBES - 1)], xz = feetGeo.attributes.aXZ.array;
+  const who = [player, ...npcs.slice(0, BLOOD_PROBES - 1)], xz = feetGeo.attributes.aXZ.array;
   who.forEach((w, i) => {
     const p = w === player ? camera.position : w.imp.model.position;
     xz[i * 2] = p.x; xz[i * 2 + 1] = p.z;
@@ -3369,19 +3377,22 @@ function burstBlood({ entry, dir }, gobs = FL_GOBS, strength = 1, scale = 1) { /
 // to need it). The wound moves with the demon.
 const BLEED_TIME = 0.5, BLEED_EVERY = 0.08, BLEED_GOBS = 2, BLEED_MAX = 12; // s at POWER 1, s, gobs a spurt, wounds at once
 let BLEED_SPURTS = Math.floor(BLEED_TIME * POWER / BLEED_EVERY + 1e-6); // (see useWeapon)
-const bleeds = []; // { npc, at (from the demon's origin, m), dir, next (s), left }
+const bleeds = []; // { npc, at (from the demon's origin, m), dir, next (s), left, spurts } and a stump's bone, root (see cutBody)
 function startBleed(hit, now, spurts) { // (spurts: the BLEED_SPURTS of the weapon that fired: it may be put away since)
   if (!spurts) return;
   if (bleeds.length >= BLEED_MAX) bleeds.shift();
   bleeds.push({ npc: hit.npc, at: hit.entry.clone().sub(hit.npc.imp.model.position), dir: hit.dir.clone(), next: now + BLEED_EVERY, left: spurts, spurts });
 }
-const _bleedAt = new THREE.Vector3();
+const _bleedAt = new THREE.Vector3(), _bleedDir = new THREE.Vector3();
 function updateBleeds(now) {
   for (let k = bleeds.length - 1; k >= 0; k--) {
     const b = bleeds[k];
     if (now < b.next) continue;
     b.next += BLEED_EVERY;
-    burstBlood({ entry: _bleedAt.copy(b.npc.imp.model.position).add(b.at), dir: b.dir }, BLEED_GOBS, 0.4 + 0.5 * b.left / b.spurts);
+    // (a stump's: from its bone, out along the spine where the top half was, as its legs fall; it hung in the air)
+    const at = b.bone ? b.bone.getWorldPosition(_bleedAt) : _bleedAt.copy(b.npc.imp.model.position).add(b.at);
+    const dir = b.bone ? b.root.getWorldPosition(_bleedDir).sub(at).normalize() : b.dir;
+    burstBlood({ entry: at, dir }, BLEED_GOBS, 0.4 + 0.5 * b.left / b.spurts);
     if (--b.left <= 0) bleeds.splice(k, 1);
   }
   for (let k = unflown.length - 1; k >= 0; k--) { // (see throwUnflown) the stains of gobs that weren't flown, as they land
@@ -4410,8 +4421,8 @@ const _toC = new THREE.Vector3();
 // when that's read back, a frame or two later, to the hit (see firePellets), or nothing (a miss: it's left a hole)
 function fireShot(dir) {
   const o = camera.position.clone();
-  const near = []; // demons (and skulls) whose sphere the shot passes through, nearest first
-  for (const npc of npcs.concat(skulls)) {
+  const near = []; // demons (skulls, the dead) whose sphere the shot passes through, nearest first
+  for (const npc of npcs.concat(skulls, corpses)) {
     const { imp } = npc;
     const R = imp.r * 0.5;
     _toC.copy(imp.model.position).add(imp.fit).sub(o);
@@ -4449,14 +4460,20 @@ function firePellets() {
   const splat = SPLAT_SCALE, spurts = BLEED_SPURTS; // (this weapon's: the hits land a frame or two later, maybe after a switch)
   Promise.all(shots).then((hits) => {
     const byDemon = new Map(); // the demon → its first hit, and how many pellets hit it
+    const now = clock.elapsedTime;
     for (const hit of hits) {
-      if (!hit) continue;
+      if (!hit || (hit.npc.corpse ?? hit.npc).gone) continue; // (gone: burst by an earlier shot, still in the air)
       const b = byDemon.get(hit.npc);
       if (b) b.n++; else byDemon.set(hit.npc, { hit, n: 1 });
-      if (!hit.npc.skull) { paintWound(hit.npc, hit.entry); damageNpc(hit.npc, hit.dir); }
+      if (!hit.npc.skull) { traumatize(hit.npc.corpse ?? hit.npc, 1, now); paintWound(hit.npc, hit.entry); damageNpc(hit.npc, hit.dir); }
     }
     for (const { hit, n } of byDemon.values()) {
       if (hit.npc.skull) { hitSkull(hit.npc, hit.entry, hit.dir, n); continue; } // (bone: no blood; one knock a shot)
+      const body = hit.npc.corpse ?? hit.npc; // (killed by this shot: its corpse)
+      if (body.dead && !DEMON && !body.cut && body.trauma >= GIB_TRAUMA && body.deathTrauma >= GIB_KILL_MIN && now - body.diedAt < GIB_KILL_WINDOW) {
+        cutBody(body, hit); continue; // shredded as it died: its top half
+      }
+      if (body.dead && body.imp.still && body.carcass >= GIB_TRAUMA) { gibBody(body, hit); continue; } // a carcass, down: all of it
       const gobs = Math.min(FL_GOBS + n - 1, BURST_GOBS_MAX);
       burstBlood(hit, gobs, 1, splat);
       throwUnflown(hit, n * FL_GOBS - gobs, clock.elapsedTime); // the rest, a gob burst a pellet, only on the floor
@@ -4497,8 +4514,11 @@ const WOUND_STREAKS = 5, WOUND_STREAK_LEN = 0.9, WOUND_SPATTER = 0.7; // runs do
 const woundVertex = `
   #include <common>
   #include <skinning_pars_vertex>
+  attribute float aUpper; // (see markTopHalf)
   varying vec3 vWorld;
+  varying float vUpper;
   void main() {
+    vUpper = aUpper;
     #include <skinbase_vertex>
     #include <begin_vertex>
     #include <skinning_vertex>
@@ -4511,8 +4531,10 @@ const woundVertex = `
   #endif
   }`;
 const probeMat = new THREE.ShaderMaterial({
+  uniforms: { uCut: { value: 0 } }, // (1: its top half's gone, shots go through where it was: see cutBody)
   vertexShader: woundVertex,
-  fragmentShader: `varying vec3 vWorld;\nvoid main() { gl_FragColor = vec4(distance(vWorld, cameraPosition), 0.0, 0.0, 1.0); }`,
+  fragmentShader: `uniform float uCut;\nvarying vec3 vWorld;\nvarying float vUpper;
+void main() { if (uCut > 0.5 && vUpper > 0.5) discard; gl_FragColor = vec4(distance(vWorld, cameraPosition), 0.0, 0.0, 1.0); }`,
   side: THREE.DoubleSide,
 });
 const PROBE_MAX = 8; // the most demons one shot probes (the nearest along it)
@@ -4522,6 +4544,7 @@ const probeCam = new THREE.OrthographicCamera(-0.005, 0.005, 0.005, -0.005, 0.01
 // first or drawn over what's there; the renderer's state is put back after
 function renderDemon(npc, mat, target, cam, clear) {
   const model = npc.imp.model, mesh = npc.mesh, keep = mesh.material, culled = mesh.frustumCulled, parent = model.parent;
+  probeMat.uniforms.uCut.value = (npc.corpse ?? npc).cut ? 1 : 0;
   const autoClear = renderer.autoClear, alpha = renderer.getClearAlpha(), rt = renderer.getRenderTarget();
   renderer.getClearColor(_clearColor);
   renderer.setClearColor(0x000000, 0);
@@ -4606,17 +4629,24 @@ function paintWound(npc, at) {
 function bloodyMaterial(mat, mask) {
   const m = mat.clone();
   m.roughnessMap = mask;
+  m.userData.cut = { value: 0 }; // (1: its top half blown off: see cutBody)
+  m.side = THREE.DoubleSide; // (from the start: its back faces dropped till it's cut, see below; switched by a cut, its
+  // program was rebuilt mid-burst, a stall)
   m.onBeforeCompile = bloodOnBeforeCompile;
   return m;
 }
-function bloodOnBeforeCompile(shader) {
-  shader.fragmentShader = shader.fragmentShader.replace('#include <roughnessmap_fragment>', `float roughnessFactor = roughness;
+function bloodOnBeforeCompile(shader) { // (this: the material)
+  shader.uniforms.uCut = this.userData.cut;
+  shader.vertexShader = 'attribute float aUpper;\nvarying float vUpper;\n' + shader.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n  vUpper = aUpper;');
+  shader.fragmentShader = 'uniform float uCut;\nvarying float vUpper;\n' + shader.fragmentShader.replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
+  if (uCut > 0.5 ? vUpper > 0.5 : !gl_FrontFacing) discard; // cut: its top half blown off (see markTopHalf); else its back faces, as culling would`).replace('#include <roughnessmap_fragment>', `float roughnessFactor = roughness;
 #ifdef USE_ROUGHNESSMAP
   float blood = texture2D(roughnessMap, vRoughnessMapUv).r; // the wound mask (see paintWound)
   // wet red: brighter scarlet where it's thin (the edges, runs and specks), deep red where it's pooled; glossy
   diffuseColor.rgb = mix(diffuseColor.rgb, mix(vec3(0.45, 0.015, 0.025), vec3(0.2, 0.004, 0.01), blood), min(blood * 1.6, 1.0));
   roughnessFactor = mix(roughnessFactor, 0.15, blood);
-#endif`);
+#endif
+  if (!gl_FrontFacing) { diffuseColor.rgb = vec3(0.3, 0.025, 0.03); roughnessFactor = 0.2; } // inside, open at a cut: wet flesh`);
 }
 
 // Sound: the rifle's report on every shot (sounds/rifle_shot.wav: freesound "assaultrifle2", trimmed to its crack and
@@ -5296,6 +5326,18 @@ function demonSteps(npc, pace) { // after its walk has moved on this frame: did 
   }
 }
 const npcs = []; // { imp, walk, fire, idle, death, muzzle, shooter, firing, timer, pace, paceTarget, paceTimer, stagger, knock, shakeDir, health, dead, act, fireWas }
+// The dead: when an enemy dies its body goes on as a corpse, and the enemy (its mind, its moves) is dropped. A corpse
+// keeps what a body needs: its sprite (imp: the model, its death clip playing out), its mesh and wound mask (shots still
+// wound it: see paintWound) and, a skull's, its fall (see fallSkull). Once it's settled (its death clip over; a skull at
+// rest, its fire out), its sprite stops being re-posed (see SpriteImpostor's still).
+const corpses = []; // { imp, mesh, dead: true, bloodRT, death, trauma, hurtAt, carcass, diedAt, deathTrauma, cut, gone } or a skull's { imp, mesh, dead: true, skull: true, fire, glow, vel, spin, fade, resting }
+function updateCorpses(dt) {
+  for (const c of corpses) {
+    if (c.skull) fallSkull(c, dt);
+    else if (!c.imp.still && !c.death.isRunning()) { c.imp.still = true; c.carcass = 0; } // (down: a carcass from now, see Gibs;
+    // counted from its death, a demon burst a moment after it, as it fell: as if it, not its carcass, had)
+  }
+}
 const NPC_SPAWN_GAP = 10; // m: none starts nearer you than this
 const _v = new THREE.Vector3();
 
@@ -5361,6 +5403,7 @@ Promise.all([
   }
   enemyGltf = enemy;
   for (const name of [RIG.walk, RIG.aimWalk, RIG.run]) if (name) enemyFootfalls[name] = findFootfalls(enemy, name);
+  markTopHalf(enemy.scene); // (for cutBody)
   setupGun(m4, { pistol: pistol.scene, shotgun: shotgun.scene });
   // ?n=100 spawns 100 demons (default 8), ?skulls=n that many skulls (default SKULLS), ?real starts in real-3D mode
   const params = new URLSearchParams(location.search);
@@ -5405,7 +5448,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyP') {
     rtSizeIdx = (rtSizeIdx + 1) % RT_SIZES.length;
     opts.resolution = RT_SIZES[rtSizeIdx];
-    for (const { imp } of npcs.concat(skulls)) imp.setResolution(opts.resolution);
+    for (const { imp } of npcs.concat(skulls, corpses)) imp.setResolution(opts.resolution);
   }
   if (e.code === 'Equal') addNpcs(10);
   if (e.code === 'Minus') removeNpcs(10);
@@ -5430,7 +5473,7 @@ function reportStats(cpuMs, sprites) {
   if (now - statStart < 500) return;
   const { calls, triangles } = renderer.info.render;
   fpsEl.textContent = `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps`;
-  statsEl.textContent = `${npcs.length} ${POLICE ? 'police' : ENEMY + 's'} + ${skulls.length} skulls (${opts.real ? 'REAL 3D' : 'sprites'}) · world 1/${Math.round(1 / worldScale)}${fixedScale ? ' (fixed)' : ''} · ` +
+  statsEl.textContent = `${npcs.length} ${POLICE ? 'police' : ENEMY + 's'} + ${skulls.length} skulls, ${corpses.length} dead (${opts.real ? 'REAL 3D' : 'sprites'}) · world 1/${Math.round(1 / worldScale)}${fixedScale ? ' (fixed)' : ''} · ` +
     `${(statFrames * 1000 / (now - statStart)).toFixed(0)} fps · CPU ${(statCpu / statFrames).toFixed(2)} ms/frame · ` +
     `${calls} draw calls · ${(triangles / 1000).toFixed(0)}k tris · ${(statSprites / statFrames).toFixed(1)} sprite renders/frame`;
   statFrames = statCpu = statSprites = 0; statStart = now;
@@ -5451,7 +5494,7 @@ function updateSpriteDebug() {
   spriteDebugThumbs.forEach((t) => (t.visible = false));
   if (!spriteDebug) return;
   const aspect = innerWidth / innerHeight, h = 2 * SPRITE_DEBUG_SIZE, w = h / aspect; // a thumbnail, in clip units
-  npcs.slice(0, SPRITE_DEBUG_MAX).forEach((n, i) => {
+  npcs.concat(corpses).slice(0, SPRITE_DEBUG_MAX).forEach((n, i) => {
     if (!spriteDebugMarks[i]) { // made on first use
       spriteDebugMarks[i] = spriteDebugLayer.appendChild(Object.assign(document.createElement('div'), { style: 'position:absolute;width:14px;height:14px;border:2px solid' }));
       spriteDebugLabels[i] = spriteDebugLayer.appendChild(Object.assign(document.createElement('div'), { style: 'position:absolute;color:#fff;text-shadow:0 0 2px #000;font-size:10px' }));
@@ -5542,6 +5585,11 @@ function damageNpc(npc, dir) {
   npc.aimWalk?.fadeOut(0.15);
   npc.walkGait.fadeOut(0.15);
   npc.death.reset().fadeIn(0.15).play();
+  const k = npcs.indexOf(npc); // its body goes on as a corpse; the enemy goes
+  if (k >= 0) npcs.splice(k, 1);
+  const now = clock.elapsedTime, leak = Math.exp(-(now - (npc.hurtAt ?? now)) / GIB_TAU), trauma = (npc.trauma ?? 0) * leak; // (see Gibs)
+  npc.corpse = { imp: npc.imp, mesh: npc.mesh, dead: true, bloodRT: npc.bloodRT, death: npc.death, trauma, hurtAt: now, carcass: 0, diedAt: now, deathTrauma: trauma };
+  corpses.push(npc.corpse); // (and the enemy names it: a shot's later pellets still name the enemy)
 }
 function staggerNpc(npc, dir) {
   npc.stagger = STAGGER_TIME;
@@ -5680,8 +5728,8 @@ function steerClear(npc, out, near) {
     const d = Math.hypot(de, da);
     if (d > 1e-3) avoid((b.n.x * de + b.t.x * da) / d, (b.n.y * de + b.t.y * da) / d, d - 0.5);
   }
-  for (const o of npcs) { // each other: pushed apart, harder the closer (the dead are left to lie)
-    if (o === npc || o.dead) continue;
+  for (const o of npcs) { // each other: pushed apart, harder the closer
+    if (o === npc) continue;
     const q = o.imp.model.position, dx = p.x - q.x, dz = p.z - q.z, d = Math.hypot(dx, dz);
     const spacing = ZOMBIE ? ZOMBIE_SPACING : AI_SPACING;
     if (d >= spacing || d < 1e-4) continue;
@@ -5775,7 +5823,7 @@ function stalled(npc, gap, now) {
 function policeHear(from, x, z, now) {
   for (const npc of npcs) {
     const q = npc.imp.model.position;
-    if (!npc.dead && !npc.sees && Math.hypot(q.x - from.x, q.z - from.z) < POLICE_HEAR) policeAlert(npc, now, x, z);
+    if (!npc.sees && Math.hypot(q.x - from.x, q.z - from.z) < POLICE_HEAR) policeAlert(npc, now, x, z);
   }
 }
 // Not on to you: standing about, then strolling somewhere near, and standing again; somewhere out in the open, clear of
@@ -5964,19 +6012,6 @@ function skullRecover(s, now) { s.state = 'recover'; s.stateAt = now; }
 function updateSkull(s, dt, now) {
   const m = s.imp.model, p = m.position, v = s.vel, you = camera.position;
   s.imp.blob.scale.setScalar(0.4 * THREE.MathUtils.clamp(1 - (p.y - 0.25) / 1.5, 0, 1)); // (a contact shadow: only near the floor)
-  if (s.dead) { // falling, its fire going out; then lying there
-    s.fade = Math.max(s.fade - dt / 0.6, 0);
-    s.fire.material.uniforms.uFade.value = s.fade; s.fire.visible = s.fade > 0;
-    s.glow.value = SKULL_GLOW * s.fade;
-    if (s.resting) return;
-    v.y -= 9.8 * dt;
-    m.rotateX(s.spin * dt);
-    if (keepSkullIn(p, v, dt, 0.25) && v.y < 0 && p.y <= floorAt(p.x, p.z) + 0.25) { // landed
-      if (v.y < -3) { v.y *= -0.3; v.x *= 0.5; v.z *= 0.5; s.spin *= 0.5; } else { s.resting = true; v.set(0, 0, 0); } // (a bounce, then still)
-    }
-    if (v.y > 0 && p.y >= WALL_ROWS * TILE - 0.5) v.y *= -0.3; // (off the ceiling: shot up there, it stuck to it)
-    return;
-  }
   _sk.subVectors(you, p);
   const dist = Math.max(_sk.length(), 1e-3);
   if (s.state === 'cruise' || s.state === 'recover') { // to its place round you: its distance, its height (bobbing)
@@ -6007,7 +6042,7 @@ function updateSkull(s, dt, now) {
     } else if ((s.left -= SKULL_CHARGE * dt) <= 0) skullRecover(s, now);
   }
   for (const o of skulls) { // the others: kept apart
-    if (o === s || o.dead) continue;
+    if (o === s) continue;
     _skG.subVectors(p, o.imp.model.position);
     const d = _skG.length();
     if (d < 1.5 && d > 1e-4) v.addScaledVector(_skG, (1.5 - d) / d * 3 * dt);
@@ -6020,23 +6055,352 @@ function updateSkull(s, dt, now) {
   s.fire.material.uniforms.uAxis.value.set(-v.x * 0.12, 1 - v.y * 0.12, -v.z * 0.12); // (up, and back from its flight)
   s.glow.value = SKULL_GLOW * (0.85 + 0.15 * Math.sin(now * 13 + s.phase) * Math.sin(now * 7.3)); // (flickering)
 }
+// A dead skull (its corpse, c): falling, its fire going out, then lying there; at rest, its fire out, it's settled
+function fallSkull(c, dt) {
+  const m = c.imp.model, p = m.position, v = c.vel;
+  c.imp.blob.scale.setScalar(0.4 * THREE.MathUtils.clamp(1 - (p.y - 0.25) / 1.5, 0, 1)); // (a contact shadow: only near the floor)
+  c.fade = Math.max(c.fade - dt / 0.6, 0);
+  c.fire.material.uniforms.uFade.value = c.fade; c.fire.visible = c.fade > 0;
+  c.glow.value = SKULL_GLOW * c.fade;
+  if (c.resting) { // (still once its fire's out; drawn once more then: its last picture was still faintly alight)
+    if (c.fade === 0 && !c.imp.still) { c.imp.still = true; c.imp.lastKey = undefined; }
+    return;
+  }
+  v.y -= 9.8 * dt;
+  m.rotateX(c.spin * dt);
+  if (keepSkullIn(p, v, dt, 0.25) && v.y < 0 && p.y <= floorAt(p.x, p.z) + 0.25) { // landed
+    if (v.y < -3) { v.y *= -0.3; v.x *= 0.5; v.z *= 0.5; c.spin *= 0.5; } else { c.resting = true; v.set(0, 0, 0); } // (a bounce, then still)
+  }
+  if (v.y > 0 && p.y >= WALL_ROWS * TILE - 0.5) v.y *= -0.3; // (off the ceiling: shot up there, it stuck to it)
+}
 // Hit (a shot, all its pellets that got it; or a punch) at, along dir, for dmg: a puff of bone dust, knocked back, a
-// swoop broken off; dead at 0
+// swoop broken off; dead at 0 (its body goes on as a corpse: see corpses); a dead one's knocked about
 function hitSkull(s, at, dir, dmg) {
   puffSmoke(at);
-  if (s.dead) { s.resting = false; s.vel.addScaledVector(dir, 1).y = Math.max(s.vel.y, 2); return; } // (a dead one: a hop along the shot)
+  if (s.dead) { s.resting = false; s.imp.still = false; s.vel.addScaledVector(dir, 1).y = Math.max(s.vel.y, 2); return; } // (a hop along the shot)
   if (s.state === 'charge') s.vel.set(0, 0, 0); // (its swoop stopped dead: else it came on regardless)
   s.vel.addScaledVector(dir, SKULL_KNOCK);
   if (s.state !== 'cruise') skullRecover(s, clock.elapsedTime);
   if ((s.health -= dmg) > 0) return;
-  s.dead = true; s.spin = (Math.random() - 0.5) * 12;
+  s.dead = true;
   demonVoice(s, `demon_death_${(Math.random() * DEMON_DEATHS) | 0}`, 1, 1.5);
   puffSmoke(s.imp.model.position);
+  const k = skulls.indexOf(s);
+  if (k >= 0) skulls.splice(k, 1);
+  corpses.push({ imp: s.imp, mesh: s.mesh, dead: true, skull: true, fire: s.fire, glow: s.glow, vel: s.vel, spin: (Math.random() - 0.5) * 12, fade: 1, resting: false });
+}
+// Meat: gore piles on the floor, what's left where a body's top half was shot to pieces (see cutBody);
+// textures/meat_*.png (see tools/meat_textures.py), the game's one true billboard: a picture on a card that turns to
+// face you, standing on its bottom edge, and leaning back as you look down on it (up to MEAT_LEAN: from above it went
+// edge on). Lit like the blood (see bloodLight): the light where it lies, capped at MEAT_LIGHT_MAX, from its main
+// direction onto each pixel's normal (the texture's: the pile's own shape), with a glint where it's wet; fogged like
+// the world. Not solid: you, the enemies and the shots go through them.
+const MEAT_KINDS = ['heap', 'heap_bone', 'guts', 'ribs'], MEAT_W = 72 * 0.015, MEAT_H = 32 * 0.015; // m (its W×H px at its PX)
+const MEAT_LEAN = THREE.MathUtils.degToRad(70), MEAT_LIGHT_MAX = 3;
+const meatMap = (file, color, onLoad) => { // a meat texture: pixels (nearest, as the sprites'), no mipmaps (they ate the silhouettes away with distance)
+  const t = texLoader.load(`textures/${file}.png`, onLoad);
+  t.colorSpace = color ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  t.magFilter = t.minFilter = THREE.NearestFilter; t.generateMipmaps = false;
+  return t;
+};
+const meatMaps = MEAT_KINDS.map((k) => [meatMap(`meat_${k}`, true), meatMap(`meat_${k}_n`, false)]);
+const meatGeo = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0); // (its foot: the bottom edge's middle)
+const meatPiles = [];
+function addMeatPile(x, z, kind, size, mirror) { // a pile of a kind (MEAT_KINDS' index), size × its own, maybe mirrored
+  const [color, normal] = meatMaps[kind];
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog), uColor: { value: color }, uNormal: { value: normal },
+      uLight: { value: new THREE.Vector3() }, uLightDir: { value: new THREE.Vector3(0, 1, 0) }, uMirror: { value: mirror ? 1 : 0 } },
+    fog: true,
+    vertexShader: `
+      varying vec2 vUv;
+      #include <fog_pars_vertex>
+      void main() {
+        vUv = uv;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        #include <fog_vertex>
+      }`,
+    fragmentShader: `
+      uniform sampler2D uColor, uNormal;
+      uniform vec3 uLight, uLightDir; // the light where it lies, and where it comes from (in the card's own axes)
+      uniform float uMirror;
+      varying vec2 vUv;
+      #include <fog_pars_fragment>
+      void main() {
+        vec2 uv = vec2(uMirror > 0.5 ? 1.0 - vUv.x : vUv.x, vUv.y);
+        vec4 c = texture2D(uColor, uv);
+        if (c.a < 0.5) discard;
+        vec4 t = texture2D(uNormal, uv);
+        vec3 n = normalize(t.xyz * 2.0 - 1.0);
+        if (uMirror > 0.5) n.x = -n.x;
+        float d = max(dot(n, uLightDir), 0.0); // (towards the light, and a little all round: the room's other lights)
+        float glint = pow(max(dot(n, normalize(uLightDir + vec3(0.0, 0.0, 1.0))), 0.0), 40.0) * t.a; // (wet: t.a)
+        gl_FragColor = vec4(c.rgb * uLight * (0.35 + d) + uLight * glint * 0.6, 1.0);
+        #include <fog_fragment>
+      }`,
+  });
+  const card = new THREE.Mesh(meatGeo, mat), blob = new THREE.Mesh(blobGeo, blobMat);
+  card.position.set(x, floorAt(x, z) + 0.005, z);
+  card.scale.set(MEAT_W * size, MEAT_H * size, 1);
+  blob.position.set(x, card.position.y + 0.01, z);
+  blob.scale.set(MEAT_W * size * 0.75, 1, MEAT_W * size * 0.75); // (a contact shadow under it: round, as the pile turns)
+  scene.add(card, blob);
+  meatPiles.push(card);
+}
+const _meatE = new THREE.Euler(0, 0, 0, 'YXZ'), _meatL = [0, 0, 0], _meatD = [0, 0, 0], _meatQ = new THREE.Quaternion();
+function updateMeat() { // each card turned to you and leant back towards you, and lit where it lies
+  for (const card of meatPiles) {
+    const p = card.position, dx = camera.position.x - p.x, dz = camera.position.z - p.z;
+    const up = camera.position.y - (p.y + card.scale.y / 2);
+    card.quaternion.setFromEuler(_meatE.set(-THREE.MathUtils.clamp(Math.atan2(up, Math.hypot(dx, dz)), 0, MEAT_LEAN), Math.atan2(dx, dz), 0));
+    bloodLight(p.x, p.y + card.scale.y * 0.5, p.z, _meatL, 0, _meatD);
+    const u = card.material.uniforms;
+    u.uLight.value.set(Math.min(_meatL[0], MEAT_LIGHT_MAX), Math.min(_meatL[1], MEAT_LIGHT_MAX), Math.min(_meatL[2], MEAT_LIGHT_MAX));
+    u.uLightDir.value.set(_meatD[0], _meatD[1], _meatD[2]).applyQuaternion(_meatQ.copy(card.quaternion).invert());
+  }
+}
+// Gibs: bodies shot to pieces. Every bullet or pellet that hits a body adds to its trauma, which leaks away (to 1/e in
+// GIB_TAU s); a hit's traumatic when that reaches GIB_TRAUMA (two-thirds of the M4's magazine in one spray, or a
+// shotgun blast up close: most of one blast's 16 pellets).
+// - Shredded as it dies (it died with at least GIB_KILL_MIN on it, and its trauma, carried on into its corpse, gets
+//   there within GIB_KILL_WINDOW s): a zombie or an officer loses its top half (from the waist up: what its spine, arms
+//   and head move, see markTopHalf), its legs left a carcass, open at the waist, the stump gushing (GIB_GUSH spurts). A
+//   demon doesn't: too big (it would take something explosive).
+// - A carcass (a whole corpse, or its legs, down: done falling) whose own trauma (counted from then) gets there
+//   bursts, all of it: its sprite and mesh go.
+// Either way, from what bursts: blood (GIB_BURSTS full bursts, as hard as GIB_BLOOD_SPEED, as wide as
+// GIB_BLOOD_SPLAT; GIB_STAINS more thrown over the floor; a splash on your lens up close), a heap of meat left
+// (see addMeatPile), and GIB_BITS bits (textures/meat_bits.png: see tools/meat_textures.py) flying out of its bones,
+// away from you, tumbling (the sheet's frames: a full turn), each splatting where it lands (GIB_BIT_STAIN m), lying
+// there for good (the oldest reused past GIB_MAX). Each bit's a quad facing you, lit like the piles (the light where
+// it is, from its main direction on the sheet's normals, a wet glint), fogged like the casings.
+const GIB_TRAUMA = 12, GIB_TAU = 1.2, GIB_BITS = 30, GIB_MAX = 400; // hits; s; bits a burst; bits at once (14 of 16
+// pellets: a blast up close often had only 13 land; the pistol, as fast as it fires, tops out at 10.5)
+const GIB_KILL_MIN = 5, GIB_KILL_WINDOW = 1.5; // hits; s (see above: shredded as it dies)
+const GIB_SCALE = [1.1, 1.8]; // × a bit's frame (a body's pieces: big)
+const GIB_BURSTS = 1, GIB_BLOOD_SPEED = 1.3, GIB_BLOOD_SPLAT = 1.2, GIB_STAINS = 60, GIB_GUSH = 40; // ; × a hit's; × the
+// weapon's splats; gobs; spurts (about 3 s): the burst a big splash (three, harder, was too much), the stump's gush the show
+const GIB_BIT_STAIN = [0.1, 0.25]; // m: a landing bit's splat
+const GIB_KINDS = 6, GIB_FRAMES = 8, GIB_SIZE = 16 * 0.015; // the sheet's rows (chunk, fatty, bone, gut, flap, clot) and
+// frames; m a frame (its BIT px at PX)
+const GIB_PICK = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5]; // which kinds fly out, by share: chunks most
+const TOP_HALF = /spine|chest|neck|head|shoulder|arm|hand|gun/i; // a body's top half: its bones' names, Mixamo's or the
+// demon's (its gun arm too; the hips and legs not)
+// Each vertex's share of the top half (aUpper: how much of it the top half's bones move), on the enemy's own geometry
+// (its clones share it); a cut body draws (and is hit) only where that's under a half
+function markTopHalf(root) {
+  root.traverse((o) => {
+    if (!o.isSkinnedMesh) return;
+    const top = o.skeleton.bones.map((b) => (TOP_HALF.test(b.name) ? 1 : 0));
+    const si = o.geometry.attributes.skinIndex, sw = o.geometry.attributes.skinWeight, up = new Float32Array(si.count);
+    for (let v = 0; v < si.count; v++) for (let k = 0; k < 4; k++) up[v] += top[si.getComponent(v, k)] * sw.getComponent(v, k);
+    o.geometry.setAttribute('aUpper', new THREE.BufferAttribute(up, 1));
+  });
+}
+// A hit on a body: its trauma (and a corpse's carcass trauma: since it died, or was cut), leaked away since its last
+// hit, and these hits on top
+function traumatize(body, hits, now) {
+  const leak = Math.exp(-(now - (body.hurtAt ?? now)) / GIB_TAU);
+  body.trauma = (body.trauma ?? 0) * leak + hits;
+  if (body.dead) body.carcass = (body.carcass ?? 0) * leak + hits;
+  body.hurtAt = now;
+}
+const gibPos = new Float32Array(GIB_MAX * 3), gibVel = new Float32Array(GIB_MAX * 3), gibAngle = new Float32Array(GIB_MAX);
+const gibSpin = new Float32Array(GIB_MAX), gibKind = new Float32Array(GIB_MAX), gibMirror = new Float32Array(GIB_MAX);
+const gibSize = new Float32Array(GIB_MAX), gibLive = new Uint8Array(GIB_MAX), gibLanded = new Uint8Array(GIB_MAX);
+let gibNext = 0;
+// Each frame's foot: how far below its middle its lowest pixel is (px), so a bit lies on it (at its middle, the floor cut
+// its bottom off); measured off the sheet when it's loaded
+const gibFoot = new Float32Array(GIB_KINDS * GIB_FRAMES).fill(3);
+function measureGibFeet(t) {
+  const N = t.image.height / GIB_KINDS, ctx = Object.assign(document.createElement('canvas'), { width: t.image.width, height: t.image.height }).getContext('2d');
+  ctx.drawImage(t.image, 0, 0);
+  const a = ctx.getImageData(0, 0, t.image.width, t.image.height).data;
+  for (let r = 0; r < GIB_KINDS; r++) for (let f = 0; f < GIB_FRAMES; f++) {
+    let low = N / 2; // (its lowest opaque row, from the frame's top)
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) if (a[((r * N + y) * t.image.width + f * N + x) * 4 + 3] >= 128) low = Math.max(low, y + 1);
+    gibFoot[r * GIB_FRAMES + f] = low - N / 2;
+  }
+}
+const gibGeo = new THREE.InstancedBufferGeometry();
+{
+  const quad = new THREE.PlaneGeometry(1, 1);
+  gibGeo.index = quad.index;
+  gibGeo.setAttribute('position', quad.attributes.position);
+}
+const gibAttr = (name, n) => {
+  const a = new THREE.InstancedBufferAttribute(new Float32Array(GIB_MAX * n), n).setUsage(THREE.DynamicDrawUsage);
+  gibGeo.setAttribute(name, a);
+  return a;
+};
+const gibAttrPos = gibAttr('aPos', 3), gibAttrLight = gibAttr('aLight', 3), gibAttrDir = gibAttr('aLightDir', 3);
+const gibAttrFrame = gibAttr('aFrame', 1), gibAttrKind = gibAttr('aKind', 1), gibAttrMirror = gibAttr('aMirror', 1), gibAttrSize = gibAttr('aSize', 1);
+gibGeo.instanceCount = 0;
+const gibs = new THREE.Mesh(gibGeo, new THREE.ShaderMaterial({
+  uniforms: { uColor: { value: meatMap('meat_bits', true, measureGibFeet) }, uNormal: { value: meatMap('meat_bits_n', false) },
+    uFogColor: { value: new THREE.Color() }, uFogDensity: { value: 0 } },
+  vertexShader: `
+    attribute vec3 aPos, aLight, aLightDir;
+    attribute float aFrame, aKind, aMirror, aSize;
+    varying vec2 vUv;
+    varying vec3 vLight, vL;
+    varying float vZ, vMirror;
+    void main() {
+      vec4 c = viewMatrix * vec4(aPos, 1.0);
+      c.xy += position.xy * ${GIB_SIZE.toFixed(3)} * aSize; // facing you
+      float u = aMirror > 0.5 ? -position.x : position.x;
+      vUv = vec2((u + 0.5 + aFrame) / ${GIB_FRAMES}.0, 1.0 - (aKind + 0.5 - position.y) / ${GIB_KINDS}.0); // (row 0: the sheet's top)
+      vLight = min(aLight, vec3(${MEAT_LIGHT_MAX.toFixed(1)}));
+      vL = normalize((viewMatrix * vec4(aLightDir, 0.0)).xyz); // (the sheet's normals are as you see them: in your view's axes)
+      vZ = -c.z; vMirror = aMirror;
+      gl_Position = projectionMatrix * c;
+    }`,
+  fragmentShader: `
+    uniform sampler2D uColor, uNormal;
+    uniform vec3 uFogColor;
+    uniform float uFogDensity;
+    varying vec2 vUv;
+    varying vec3 vLight, vL;
+    varying float vZ, vMirror;
+    void main() {
+      vec4 col = texture2D(uColor, vUv);
+      if (col.a < 0.5) discard;
+      vec4 t = texture2D(uNormal, vUv);
+      vec3 n = normalize(t.xyz * 2.0 - 1.0);
+      if (vMirror > 0.5) n.x = -n.x;
+      float d = max(dot(n, vL), 0.0), glint = pow(max(dot(n, normalize(vL + vec3(0.0, 0.0, 1.0))), 0.0), 40.0) * t.a;
+      vec3 c = col.rgb * vLight * (0.35 + d) + vLight * glint * 0.6;
+      gl_FragColor = vec4(mix(c, uFogColor, 1.0 - exp(-uFogDensity * uFogDensity * vZ * vZ)), 1.0);
+    }`,
+}));
+gibs.frustumCulled = false;
+scene.add(gibs);
+function spawnGib(p, v) { // a bit of a body at p (world), flying at v (m/s), of a kind at random (see GIB_PICK)
+  const i = gibNext++ % GIB_MAX, k = i * 3;
+  gibPos.set([p.x, p.y, p.z], k);
+  gibVel.set([v.x, v.y, v.z], k);
+  gibKind[i] = GIB_PICK[(Math.random() * GIB_PICK.length) | 0];
+  gibAngle[i] = Math.random() * 2 * Math.PI;
+  gibSpin[i] = (Math.random() < 0.5 ? -1 : 1) * (8 + Math.random() * 10);
+  gibMirror[i] = Math.random() < 0.5 ? 1 : 0;
+  gibSize[i] = GIB_SCALE[0] + Math.random() * (GIB_SCALE[1] - GIB_SCALE[0]);
+  gibLive[i] = 1; gibLanded[i] = 0;
+}
+const _gibP = new THREE.Vector3(), _gibV = new THREE.Vector3(), _gibC = new THREE.Vector3();
+const _gibS = new THREE.Vector3(), _gibW = new THREE.Vector3();
+// Out of a body (c), by hit (its entry and dir), from these bones (where they are now: standing, falling or lying):
+// blood, its bursts (each from somewhere else in it) and more thrown over the floor, a splash on your lens up close;
+// its bits, out of them every way, up, and away from you; the sound. → the bones' middle
+function burstFrom(c, hit, bones) {
+  c.imp.model.updateMatrixWorld(true);
+  const mid = new THREE.Vector3(), now = clock.elapsedTime;
+  for (const b of bones) mid.add(b.getWorldPosition(_gibP));
+  mid.divideScalar(bones.length);
+  for (let k = 0; k < GIB_BURSTS; k++) {
+    burstBlood({ entry: bones[(Math.random() * bones.length) | 0].getWorldPosition(_gibP).clone(), dir: hit.dir }, BURST_GOBS_MAX, GIB_BLOOD_SPEED, SPLAT_SCALE * GIB_BLOOD_SPLAT);
+  }
+  throwUnflown({ entry: mid, dir: hit.dir }, GIB_STAINS, now);
+  splashLens(mid);
+  for (let k = 0; k < GIB_BITS; k++) {
+    const from = bones[(Math.random() * bones.length) | 0].getWorldPosition(_gibP);
+    const a = Math.random() * 2 * Math.PI, out = 1.2 + Math.random() * 2.8;
+    _gibV.set(Math.cos(a) * out, 1.5 + Math.random() * 3, Math.sin(a) * out).addScaledVector(hit.dir, 1 + Math.random() * 2.5);
+    spawnGib(from, _gibV);
+  }
+  const fall = 1 + mid.distanceTo(camera.position) * 0.12; // (quieter the further off, as a demon's voice)
+  playSquelch(1.2 / fall, 0.55);
+  playSound('punch', 0.8 / fall, 0.1);
+  return mid;
+}
+const NOT_FINGERS = (b) => !/index|thumb|middle|ring|pinky|_end/i.test(b.name);
+// A zombie's or an officer's corpse, shredded as it died (see Gibs): its top half shot to pieces, its legs left
+function cutBody(c, hit) {
+  c.cut = true;
+  c.carcass = 0; // (its legs: a carcass of their own now)
+  const mat = c.mesh.material, now = clock.elapsedTime;
+  mat.userData.cut.value = 1; // (its inside shows, where it's open: see bloodOnBeforeCompile)
+  c.imp.model.traverse((o) => { if (o.isMesh && o !== c.mesh) o.visible = false; }); // (an officer's rifle goes with its hands)
+  c.imp.ownShadow = true; c.imp.lastKey = c.imp.shadowKey = undefined; // (redrawn, its sprite and shadow, if it had settled)
+  burstFrom(c, hit, c.imp.bones.filter((b) => TOP_HALF.test(b.name) && NOT_FINGERS(b)));
+  // the stump gushes (from its waist, following it as its legs fall), and what's left of the top half lands in a heap
+  // by it, away from you
+  const spine = c.imp.bones.find((b) => /spine/i.test(b.name)), hips = c.imp.bones.find((b) => /hips/i.test(b.name)); // (the lowest)
+  const waist = (spine ?? hips).getWorldPosition(new THREE.Vector3());
+  startBleed({ npc: c, entry: waist, dir: _gibV.set(0, -1, 0) }, now, GIB_GUSH);
+  if (spine && hips) Object.assign(bleeds.at(-1), { bone: spine, root: hips });
+  addMeatPile(waist.x + hit.dir.x * 0.4, waist.z + hit.dir.z * 0.4, (Math.random() * MEAT_KINDS.length) | 0, 0.6 + Math.random() * 0.15, Math.random() < 0.5);
+}
+// A carcass (see corpses: a whole body, or a cut one's legs) shot to pieces: all that's left of it
+function gibBody(c, hit) {
+  c.gone = true;
+  corpses.splice(corpses.indexOf(c), 1);
+  for (let k = bleeds.length - 1; k >= 0; k--) if ((bleeds[k].npc.corpse ?? bleeds[k].npc) === c) bleeds.splice(k, 1);
+  const mid = burstFrom(c, hit, c.imp.bones.filter((b) => NOT_FINGERS(b) && !(c.cut && TOP_HALF.test(b.name)))); // (its legs, if that's all)
+  addMeatPile(mid.x, mid.z, (Math.random() * MEAT_KINDS.length) | 0, (c.cut ? 0.6 : 0.8) + Math.random() * 0.15, Math.random() < 0.5);
+  c.imp.dispose(); c.bloodRT.dispose(); c.mesh.material.dispose();
+}
+const _gibL = [0, 0, 0], _gibD = [0, 0, 0];
+function updateGibs(dt) {
+  let n = 0;
+  const P = gibAttrPos.array, L = gibAttrLight.array, D = gibAttrDir.array, F = gibAttrFrame.array, K = gibAttrKind.array;
+  const Mi = gibAttrMirror.array, S = gibAttrSize.array;
+  for (let i = 0; i < GIB_MAX; i++) {
+    if (!gibLive[i]) continue;
+    const k = i * 3;
+    if (gibVel[k] || gibVel[k + 1] || gibVel[k + 2]) { // flying, or sliding to a stop
+      const x0 = gibPos[k], y0 = gibPos[k + 1], z0 = gibPos[k + 2]; // (where it was)
+      gibVel[k + 1] -= 9.8 * dt;
+      for (let c = 0; c < 3; c++) gibPos[k + c] += gibVel[k + c] * dt;
+      gibAngle[i] += gibSpin[i] * dt;
+      for (const c of [0, 2]) if (Math.abs(gibPos[k + c]) > ARENA - 0.05) { // the walls
+        gibPos[k + c] = Math.sign(gibPos[k + c]) * (ARENA - 0.05); gibVel[k + c] *= -0.3;
+      }
+      for (const c of COLUMNS) { // the columns, at their own faces (not a demon's body out: bits stopped short of them),
+        // bouncing off them; the towers are open steelwork (bits fly through)
+        const r = COLUMN_APOTHEM / Math.cos(Math.PI / 8) + 0.05, dx = gibPos[k] - c.x, dz = gibPos[k + 2] - c.y, d = Math.hypot(dx, dz);
+        if (d >= r || d < 1e-6) continue;
+        const nx = dx / d, nz = dz / d, vn = gibVel[k] * nx + gibVel[k + 2] * nz;
+        gibPos[k] = c.x + nx * r; gibPos[k + 2] = c.y + nz * r;
+        if (vn < 0) { gibVel[k] -= 1.3 * vn * nx; gibVel[k + 2] -= 1.3 * vn * nz; }
+      }
+      if (floorAt(gibPos[k], gibPos[k + 2]) > y0) { // the platform's or a step's side (it was below its top): a wall to it,
+        gibPos[k] = x0; gibPos[k + 2] = z0; gibVel[k] *= -0.3; gibVel[k + 2] *= -0.3; // not a floor to jump up onto
+      }
+      const f = Math.round((((gibAngle[i] / (2 * Math.PI)) % 1 + 1) % 1) * GIB_FRAMES) % GIB_FRAMES;
+      const ground = floorAt(gibPos[k], gibPos[k + 2]) + gibFoot[gibKind[i] * GIB_FRAMES + f] * 0.015 * gibSize[i]; // lying on its foot
+      if (gibPos[k + 1] < ground) {
+        gibPos[k + 1] = ground;
+        if (!gibLanded[i]) { // its first landing: a splat, and a wet slap now and then (24 at once was a roar)
+          gibLanded[i] = 1;
+          const under = floorAt(gibPos[k], gibPos[k + 2]); // (its stain on the floor under it: at its own height, it hung there)
+          spawnDecal(_gibS.set(gibPos[k], under, gibPos[k + 2]), null, _gibW.set(gibVel[k], gibVel[k + 1], gibVel[k + 2]), 0,
+            GIB_BIT_STAIN[0] + Math.random() * (GIB_BIT_STAIN[1] - GIB_BIT_STAIN[0]));
+          const d = Math.hypot(gibPos[k] - camera.position.x, gibPos[k + 2] - camera.position.z);
+          if (Math.random() < 0.3) playSquelch(0.35 / (1 + d * 0.25), 1.4);
+        }
+        if (gibVel[k + 1] < -1.2) { // a bounce: up a little, slowed, turning less
+          gibVel[k + 1] *= -0.25; gibVel[k] *= 0.5; gibVel[k + 2] *= 0.5; gibSpin[i] *= 0.4;
+        } else { // down: it slides to a stop (wet meat doesn't roll)
+          gibVel[k + 1] = 0; gibVel[k] *= 0.8; gibVel[k + 2] *= 0.8; gibSpin[i] = 0;
+          if (Math.hypot(gibVel[k], gibVel[k + 2]) < 0.05) gibVel[k] = gibVel[k + 2] = 0; // (still: no more moving it)
+        }
+      }
+    }
+    P.set(gibPos.subarray(k, k + 3), n * 3);
+    bloodLight(gibPos[k], gibPos[k + 1], gibPos[k + 2], L, n * 3, D);
+    F[n] = Math.round((((gibAngle[i] / (2 * Math.PI)) % 1 + 1) % 1) * GIB_FRAMES) % GIB_FRAMES;
+    K[n] = gibKind[i]; Mi[n] = gibMirror[i]; S[n++] = gibSize[i];
+  }
+  gibGeo.instanceCount = n;
+  for (const a of [gibAttrPos, gibAttrLight, gibAttrDir, gibAttrFrame, gibAttrKind, gibAttrMirror, gibAttrSize]) a.needsUpdate = true;
+  gibs.material.uniforms.uFogColor.value.copy(scene.fog.color);
+  gibs.material.uniforms.uFogDensity.value = scene.fog.density;
 }
 function pushApart(npc) { // two living demons never overlap: each moves half the overlap
   const p = npc.imp.model.position;
   for (const o of npcs) {
-    if (o === npc || o.dead) continue;
+    if (o === npc) continue;
     const q = o.imp.model.position, dx = p.x - q.x, dz = p.z - q.z, d = Math.hypot(dx, dz);
     if (d >= AI_BODY || d < 1e-4) continue;
     const k = (AI_BODY - d) / d / 2;
@@ -6112,7 +6476,6 @@ renderer.setAnimationLoop((time) => {
     }
   }
   for (const n of npcs) { // and the living: you can't walk into one (or be shoved into one)
-    if (n.dead) continue;
     const q = n.imp.model.position, dx = camera.position.x - q.x, dz = camera.position.z - q.z, d = Math.hypot(dx, dz);
     if (d < NPC_REACH && d > 1e-6) { camera.position.x = q.x + dx / d * NPC_REACH; camera.position.z = q.z + dz / d * NPC_REACH; }
   }
@@ -6141,7 +6504,6 @@ renderer.setAnimationLoop((time) => {
   updateBleeds(now);
 
   for (const npc of npcs) {
-    if (npc.dead) continue; // lies where it fell
     if (npc.stagger > 0) updateStagger(npc, dt); // knocked back, but still free to turn (and a demon to shoot)
     if (ZOMBIE) { // waiting below you (you're up where it can't follow), swinging at you, or running at you
       const m = npc.imp.model, p = m.position, dist = Math.hypot(camera.position.x - p.x, camera.position.z - p.z);
@@ -6229,7 +6591,7 @@ renderer.setAnimationLoop((time) => {
     pushApart(npc);
   }
   for (const npc of npcs) { // hard collision, for every living one once they've all moved (a crowd shoves the ones standing,
-    if (npc.dead) continue; // swinging or waiting too: into a column or the platform, where they stayed)
+    // swinging or waiting too: into a column or the platform, where they stayed)
     const p = npc.imp.model.position;
     pushOutOfPlatform(p, 0.5); // round the platform, its stairs and the columns, inside the walls
     pushOutOfStairs(p, 0.5);
@@ -6239,6 +6601,7 @@ renderer.setAnimationLoop((time) => {
 
   skullTime.value = now; // (their fire)
   for (const s of skulls) updateSkull(s, dt, now);
+  updateCorpses(dt);
 
   sun.position.copy(camera.position).add(sunOffset); // shadows follow you
   sun.target.position.copy(camera.position);
@@ -6250,9 +6613,12 @@ renderer.setAnimationLoop((time) => {
 
   for (const npc of npcs) sprites += npc.imp.update(renderer, camera, dt);
   for (const s of skulls) sprites += s.imp.update(renderer, camera, dt);
+  for (const c of corpses) sprites += c.imp.update(renderer, camera, dt);
   sprites += updateGun(dt, now);
   updateBlood(dt);
   updateCasings(dt);
+  updateMeat();
+  updateGibs(dt);
   updateMuzzleFx(dt, now);
 
   const shaken = shakeCamera(dt, now);
