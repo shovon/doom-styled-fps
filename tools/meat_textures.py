@@ -1,48 +1,39 @@
-"""Authors pixel-art meat mounds: gore piles lying on the floor, drawn by the game as billboards (cards that turn to face
-you), the one true billboard in it. Each pile is built in 3D, then rendered from the side, once:
-  heap       a heap of raw chunks: muscle and fat, settled on each other
-  heap_bone  a smaller heap with a snapped long bone, half buried, sticking out of it
-  guts       a few chunks with a coil of gut slumped over and round them
-  mound      the widest, lowest: a spread of smaller chunks, clots of blood all over it (a ribcage here was too bony)
+"""Authors pixel-art meat: small bits flung off bodies shot to pieces, tumbling, drawn by the game as quads that face
+you (see the gibs in index.html). Each kind BIT_FRAMES views a full turn end over end (about an axis of its own, so its
+grain turns with it), BIT px a frame:
+  chunk  a lump of muscle            fatty  muscle with a rind of fat     bone  a lump of meat, a bloody stub of bone out of it
+  gut    a curl of gut               flap   a torn flap of flesh         clot  a dark, wet clot of blood
+(all of them chunky and red: a bare splinter, a thin flap seen edge on, they lay on the floor like litter; and nothing
+bigger: a heap of them left lying read as dung)
 
-The pile: chunks are ellipsoids (each turned its own way, most torn open: a cap cut off), dropped one at a time, biggest first, onto the floor or the
-chunks already there (sinking in a little: meat is soft); bones are chains of spheres, a knuckle at one end, snapped
-off at the other; gut is a tube (a chain of spheres) along a slumping coil. Rendered orthographically along −Z
-(you're on +Z), SS× supersampled: each ray's nearest hit, its normal (the shape's, plus a bump from the material's
-grain: muscle fibre along the chunk, fat's dimpling) and what it hit. Then, per hit:
+A bit: lumps are ellipsoids (each turned its own way, most torn open: a cap cut off); bone and gut are chains of
+spheres. Rendered orthographically along −Z (you're on +Z), SS× supersampled: each ray's nearest hit, its normal (the
+shape's, plus a bump from the material's grain: muscle fibre along the chunk, fat's dimpling) and what it hit. Then, per
+hit:
 - colour: the material's (muscle a deep red with fibre streaks, marbled with fat, brighter where it's torn open; fat a
   dull yellow smeared with blood; bone ivory under blood stains, the meat still on its root, dark marrow where it's
-  snapped; gut a dusky red with darker veins), blood pooled into the crevices and over the bottom of the pile
-- occlusion (crevices): how much of the pile stands in front of it close round it (screen-space, from the hits'
-  depths), and darker near the floor; baked into the colour (a billboard has no shape for the lights to find)
+  snapped; gut a dusky red with darker veins), blood pooled into the crevices
+- occlusion (crevices): how much of the bit stands in front of it close round it (screen-space, from the hits' depths),
+  baked into the colour (a quad has no shape for the lights to find)
 - wetness: how glossy (clots and pooled blood most, torn faces next, gut middling, clean bone least)
 Downsampled to the pixel size: hard-edged (a subsample's coverage over half: a pixel), colour and normal averaged.
 
-No light direction is baked: the game lights each pixel by its normal, from the lights around the pile (see MEAT_* in
+No light direction is baked: the game lights each pixel by its normal, from the lights around the bit (see MEAT_* in
 index.html), with a wet glint where it's wet.
 
-Flying meat: small bits flung off things shot to pieces, tumbling, each kind BIT_FRAMES views a full turn end over end
-(about an axis of its own, so its grain turns with it), BIT px a frame:
-  chunk  a lump of muscle            fatty  muscle with a rind of fat     bone  a lump of meat, a bloody stub of bone out of it
-  gut    a curl of gut               flap   a torn flap of flesh         clot  a dark, wet clot of blood
-(all of them chunky and red: a bare splinter, a thin flap seen edge on, they lay on the floor like litter)
-lit and shaded the same way (no floor under them: no pooling at a foot).
+Scale: PX m a pixel (as the sprites near you, ~the enemies' 128 px over 2.2 m); a bit's frame BIT px, its middle the
+bit's.
 
-Scale: PX m a pixel (as the sprites near you, ~the enemies' 128 px over 2.2 m), W×H px a pile, its foot at the
-bottom row's middle; a bit's frame BIT px, its middle the bit's.
-
-Each <name> writes:
-  textures/meat_<name>.png     colour (sRGB), occlusion and pooled blood baked in; alpha: the pile (0 or 255)
-  textures/meat_<name>_n.png   RGB: normal (x right, y up, z towards you; 0.5 + 0.5·n), A: wetness
-and the bits, one sheet (a row a kind, in BITS' order; its frames across, the turn's steps in order):
-  textures/meat_bits.png, textures/meat_bits_n.png   as above
+Writes one sheet (a row a kind, in BITS' order; its frames across, the turn's steps in order):
+  textures/meat_bits.png     colour (sRGB), occlusion and pooled blood baked in; alpha: the bit (0 or 255)
+  textures/meat_bits_n.png   RGB: normal (x right, y up, z towards you; 0.5 + 0.5·n), A: wetness
 Run: python3 tools/meat_textures.py [preview dir]   (stdlib only; seeded, so output is reproducible; a preview dir gets
-each pile lit from above-left and blown up, to look at)"""
+the sheet lit from above-left and blown up, to look at)"""
 import math, random, struct, sys, zlib
 from pathlib import Path
 
-W, H, SS = 72, 32, 4          # px, px, subsamples a side
-PX = 0.015                     # m a pixel: W × PX = 1.08 m across, H × PX = 0.48 m up (the piles: under TOP)
+SS = 4                         # subsamples a side
+PX = 0.015                     # m a pixel
 TILE = 8                       # px: the screen tiles that sort the shapes (only those over a tile are tested in it)
 
 # ---------------------------------------------------------------------------------------------------------- noise ---
@@ -80,16 +71,6 @@ class Shape:  # an ellipsoid: centre c, radii r (along its own axes R's rows), a
     def __init__(self, c, r, R, mat, seed, part=0.0, cut=None):
         self.c, self.r, self.R, self.mat, self.seed, self.part, self.cut = c, r, R, mat, seed, part, cut  # part: 0..1 along a chain
         self.reach = max(r)
-    def top(self, x, z):  # the height of its top surface at (x, z), or None (for settling the next one on it)
-        R, (rx, ry, rz) = self.R, self.r
-        o = [x - self.c[0], 100 - self.c[1], z - self.c[2]]
-        lo = [sum(R[i][k] * o[k] for k in range(3)) / self.r[i] for i in range(3)]
-        ld = [R[i][1] * -1 / self.r[i] for i in range(3)]
-        a = sum(v * v for v in ld); b = 2 * sum(lo[i] * ld[i] for i in range(3)); cc = sum(v * v for v in lo) - 1
-        disc = b * b - 4 * a * cc
-        if disc < 0: return None
-        got = self.clip(lo, ld, (-b - math.sqrt(disc)) / (2 * a), (-b + math.sqrt(disc)) / (2 * a))
-        return None if got is None else 100 - got[0]  # (where it's cut away, nothing to rest on: it floated)
     def clip(self, lo, ld, t, t1):  # a ray (lo + t·ld, on its unit sphere) in it from t to t1, cut to its side of the
         # cut: → (where it enters, through the cut face?) or None
         if not self.cut: return t, False
@@ -116,57 +97,12 @@ class Shape:  # an ellipsoid: centre c, radii r (along its own axes R's rows), a
         t, face = got
         return 10.0 - t, [lo[i] + t * ld[i] for i in range(3)], face
 
-def settle(shapes, x, z, r, R, sink):  # its centre's height, resting on the floor or what's under it: what's under its
-    # middle and half way out to its sides, on average (only under its middle, a pile's edge stood out over the floor)
-    def under(px, pz):
-        top = 0.0
-        for s in shapes:
-            if (s.c[0] - px) ** 2 + (s.c[2] - pz) ** 2 < (s.reach + max(r)) ** 2 * 0.6:
-                h = s.top(px, pz)
-                if h is not None: top = max(top, h)
-        return top
-    q = min(r[0], r[2]) / 2
-    floor = sum(under(x + dx, z + dz) for dx, dz in ((0, 0), (q, 0), (-q, 0), (0, q), (0, -q))) / 5
-    down = max(abs(R[i][1]) * r[i] for i in range(3))  # how far its own bottom is below its centre (about)
-    return floor + down * (1 - sink)
-
 def tear(rng, r, odds):  # a chunk's torn face (or None): a random way through it, a cap of it cut off (in its own axes, m)
     if rng.random() >= odds: return None
     m = [rng.gauss(0, 1) for _ in range(3)]; ml = math.hypot(*m); m = [v / ml for v in m]
     return m, math.sqrt(sum((m[i] * r[i]) ** 2 for i in range(3))) * rng.uniform(0.15, 0.55)  # (its reach that way: the support)
 def torn(t, rb, off):  # that face, for one of the chunk's lumps (radii rb, off its middle by off), on its unit sphere
     return ([t[0][i] * rb[i] for i in range(3)], t[1] - sum(t[0][i] * off[i] for i in range(3))) if t else None
-
-TOP = 0.42  # m: no higher than this (meat slumps; stacked, it stood up like a tower of beans)
-def heap(rng, shapes, n, spread, size, fat=0.12):  # a low mound: big chunks in the middle, smaller out to its edges
-    sizes = sorted((rng.uniform(*size) for _ in range(n)), reverse=True)
-    for k, s in enumerate(sizes):
-        for tries in range(8):  # (somewhere it stays under TOP)
-            a, d = rng.uniform(0, 2 * math.pi), spread * (0.15 + 0.85 * (k / n) ** 0.7) * rng.uniform(0.7, 1.0) * (1 + 0.15 * tries)
-            x, z = math.cos(a) * d * 1.35, math.sin(a) * d * 0.75
-            R = rot(rng.uniform(0, math.pi), rng.uniform(-0.6, 0.6), rng.uniform(-0.6, 0.6))  # (drooped, any way)
-            r = [s * rng.uniform(1.0, 1.4), s * rng.uniform(0.5, 0.7), s * rng.uniform(0.8, 1.1)]  # (a chunk: as thin flaps,
-            # it read as a stack of red petals)
-            y = settle(shapes, x, z, r, R, 0.45)
-            if y + r[1] < TOP: break
-        mat, seed = 'meat', rng.randrange(1 << 16)
-        cap = rng.uniform(0.5, 0.75) if rng.random() < fat else 2.0  # (a rind of fat: from this far across it)
-        t = tear(rng, r, 0.75)  # (most torn open: whole, smooth, they read as beans)
-        # a lump: a few overlapping ellipsoids round it (one smooth ellipsoid read as a bean)
-        for b in range(5):
-            off = [rng.uniform(-0.6, 0.6) * r[0], rng.uniform(-0.3, 0.3) * r[1], rng.uniform(-0.5, 0.5) * r[2]] if b else [0, 0, 0]
-            wo = [sum(R[i][a2] * off[i] for i in range(3)) for a2 in range(3)]
-            sc = 1.0 if b == 0 else rng.uniform(0.4, 0.8)
-            rb = [v * sc for v in r]
-            shapes.append(Shape([x + wo[0], y + wo[1] * 0.6, z + wo[2]], rb, R, mat, seed, cap,
-                                torn(t, rb, [off[i] - 0.4 * wo[1] * R[i][1] for i in range(3)])))  # (its offset as placed: squashed)
-
-def clots(rng, shapes, n, spread):  # dark wet clots of blood, settled over the heap and round its foot
-    for _ in range(n):
-        a, d = rng.uniform(0, 2 * math.pi), spread * rng.uniform(0.2, 1.15)
-        x, z = math.cos(a) * d * 1.35, math.sin(a) * d * 0.75
-        q = rng.uniform(0.03, 0.05); r = [q * 1.4, q * 0.6, q]; R = rot(rng.uniform(0, math.pi), 0, 0)
-        shapes.append(Shape([x, settle(shapes, x, z, r, R, 0.5), z], r, R, 'clot', rng.randrange(1 << 16)))
 
 def chain(shapes, pts, radius, mat, seed):  # spheres along a polyline, close enough to read as a tube
     seg = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
@@ -179,34 +115,6 @@ def chain(shapes, pts, radius, mat, seed):  # spheres along a polyline, close en
             shapes.append(Shape(p, [rr] * 3, rot(0, 0, 0), mat, seed, f))
         done += L
     shapes.append(Shape(pts[-1], [radius(1.0)] * 3, rot(0, 0, 0), mat, seed, 1.0))  # the end itself (a snapped bone's marrow)
-
-def bone(rng, shapes, base, direction, length, thick):  # a snapped long bone: the knuckle at its base, broken at the tip
-    d = [v / math.hypot(*direction) for v in direction]
-    tip = [base[k] + d[k] * length for k in range(3)]
-    chain(shapes, [base, tip], lambda f: thick * (1.9 if f < 0.08 else 1.25 if f < 0.16 else 1.0 - 0.15 * f), 'bone', rng.randrange(1 << 16))
-
-def gut(rng, shapes, centre, turns, radius_m, thick):  # a coil of gut heaped on the chunks, a loop slumped over the front
-    pts, n = [], int(turns * 24)
-    for i in range(n + 1):
-        f = i / n; a = f * turns * 2 * math.pi + rng.uniform(-0.2, 0.2)
-        rr = radius_m * (1 - 0.6 * f) * (1 + 0.2 * math.sin(f * 13))  # in towards the top as it coils up
-        pts.append([centre[0] + math.cos(a) * rr * 1.25, 0, centre[2] + math.sin(a) * rr * 0.75])
-    hs = [settle(shapes, p[0], p[2], [thick] * 3, rot(0, 0, 0), 0.25) for p in pts]  # on what's there, smoothed (off
-    for i, p in enumerate(pts): p[1] = sum(hs[max(i - 3, 0):i + 4]) / len(hs[max(i - 3, 0):i + 4])  # each chunk's edge
-    # it dropped straight down: a frame of pipes)
-    # the loop: off the coil's start, over the front edge and down to the floor
-    s0 = pts[0]
-    front = [[s0[0] + 0.04, s0[1] * 0.7, s0[2] + 0.12], [s0[0] + 0.1, 0.1, s0[2] + 0.2], [s0[0] + 0.18, thick, s0[2] + 0.2],
-             [s0[0] + 0.22, thick, s0[2] + 0.08]]
-    chain(shapes, list(reversed(front)) + pts, lambda f: thick * (0.9 + 0.2 * math.sin(f * 50)), 'gut', rng.randrange(1 << 16))
-
-PILES = {
-    'heap': lambda rng, s: (heap(rng, s, 18, 0.3, (0.07, 0.14)), clots(rng, s, 4, 0.3)),
-    'heap_bone': lambda rng, s: (heap(rng, s, 15, 0.26, (0.06, 0.12)),
-                                 bone(rng, s, [-0.1, 0.08, 0.04], [-0.85, 0.45, 0.3], 0.22, 0.03)),  # (one, half buried)
-    'guts': lambda rng, s: (heap(rng, s, 10, 0.2, (0.06, 0.11)), gut(rng, s, [-0.06, 0, 0.0], 2.6, 0.2, 0.038), clots(rng, s, 3, 0.25)),
-    'mound': lambda rng, s: (heap(rng, s, 24, 0.36, (0.05, 0.1)), clots(rng, s, 8, 0.36)),
-}
 
 # ----------------------------------------------------------------------------------------------------- materials ---
 def srgb_to_lin(c): return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
@@ -227,7 +135,7 @@ def fat(x, y, z, seed):  # fat: a dull yellow, dimpled, smeared with blood (clea
 
 def material(s, lp, at, face=False):  # → (colour, wetness, bump normal offset (local), in the shape's grain); face: on its cut
     u, v, w = lp  # on its unit sphere, in its own axes
-    x, y, z = at  # where it is, in the pile's (or the tumbling bit's) own axes
+    x, y, z = at  # where it is, in the tumbling bit's own axes
     if s.mat == 'meat' and face:  # torn open: fresh muscle, bright and wet, its fibres' ends a coarse grain across it (a
         # flat face, smooth, caught the light whole: a pale disc, an egg), even through its rind (only skin deep: torn
         # through it, its face was all fat, another egg)
@@ -270,11 +178,9 @@ def material(s, lp, at, face=False):  # → (colour, wetness, bump normal offset
     return col, 0.65, ((vn - 0.5) * 0.3, (fbm(x * 25 + 3, y * 25, z * 25, s.seed, 3) - 0.5) * 0.3, 0)
 
 # -------------------------------------------------------------------------------------------------------- render ---
-IDENTITY = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-def render(shapes, w, h, x0, y0, floor=True, body=IDENTITY, ao=(3, 7)):
-    # shapes into w×h px (its bottom-left corner at (x0, y0), m); floor: it lies on one at y0 (blood pooled at its foot,
-    # darker down there); body: world → its own axes (a tumbling bit's: so its grain turns with it); ao: occlusion's
-    # tap radii, px. → (colour rows, normal rows), top row first
+def render(shapes, w, h, x0, y0, body, ao):
+    # shapes into w×h px (its bottom-left corner at (x0, y0), m); body: world → its own axes (a tumbling bit's: so its
+    # grain turns with it); ao: occlusion's tap radii, px. → (colour rows, normal rows), top row first
     N, M = w * SS, h * SS
     step = PX / SS
     # sort the shapes into screen tiles by their reach (conservative)
@@ -296,7 +202,7 @@ def render(shapes, w, h, x0, y0, floor=True, body=IDENTITY, ao=(3, 7)):
                 got = s.hit(x, y)
                 if got and (best is None or got[0] > best[0]): best = (got[0], got[1], s, got[2])
             if best: Z[j][i], hits[j][i] = best[0], best
-    # occlusion: how much of the pile is in front close round each hit (12 taps at 2 radii), and the floor's
+    # occlusion: how much of the bit is in front close round each hit (12 taps at 2 radii)
     taps = [(math.cos(a) * r, math.sin(a) * r) for r in (ao[0] * SS, ao[1] * SS) for a in [k * math.pi / 3 + r for k in range(6)]]
     out_col, out_n, cover = [[None] * N for _ in range(M)], [[None] * N for _ in range(M)], [[0] * N for _ in range(M)]
     for j in range(M):
@@ -322,14 +228,13 @@ def render(shapes, w, h, x0, y0, floor=True, body=IDENTITY, ao=(3, 7)):
             nw = [sum(R[k][a] * nl[k] for k in range(3)) for a in range(3)]
             nlen = math.hypot(*nw); nw = [v / nlen for v in nw]
             if nw[2] < 0.05: nw[2] = 0.05  # (facing you, as anything you see must)
-            # blood: pooled in the crevices (and over the bottom of a pile), glossy
-            up = y - y0 if floor else 1.0
-            pool = max(occ * 1.2 - 0.25, 0) + max(0.0, 1 - up / 0.06) * 0.8
+            # blood: pooled in the crevices, glossy
+            pool = max(occ * 1.2 - 0.25, 0)
             pool = min(pool * (0.7 + 0.6 * fbm(world[0] * 20, y * 20, z * 20, 99, 2)), 1.0)
             col = mix(col, BLOOD, pool * 0.85)
             wet = max(wet, pool)
-            shade = (1 - occ * 0.85) * (0.5 + 0.5 * min(up / 0.1, 1.0)) * (0.6 + 0.4 * nw[2])  # occlusion, the floor's, a
-            # dark wet rim round each piece (where it turns away from you)
+            shade = (1 - occ * 0.85) * (0.6 + 0.4 * nw[2])  # occlusion, and a dark wet rim round each piece (where it
+            # turns away from you)
             out_col[j][i] = tuple(srgb_to_lin(c) * shade for c in col)
             out_n[j][i] = (nw, wet)
             cover[j][i] = 1
@@ -394,13 +299,8 @@ def bit(name):  # its frames: the bit turned a step further about its axis each 
                         [[sum(Q[a2][k] * sh.R[i][k] for k in range(3)) for a2 in range(3)] for i in range(3)], sh.mat, sh.seed, sh.part, sh.cut)
                   for sh in shapes]
         QT = [[Q[k][a2] for k in range(3)] for a2 in range(3)]  # (world → the bit's own axes)
-        frames.append(render(turned, BIT, BIT, -BIT * PX / 2, -BIT * PX / 2, floor=False, body=QT, ao=(1, 2)))
+        frames.append(render(turned, BIT, BIT, -BIT * PX / 2, -BIT * PX / 2, body=QT, ao=(1, 2)))
     return frames
-
-def pile(name):
-    shapes = []
-    PILES[name](random.Random(f'meat {name} 1'), shapes)
-    return render(shapes, W, H, -W * PX / 2, 0.0), len(shapes)
 
 def png(path, rows):
     chunk = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
@@ -426,15 +326,9 @@ def preview(rgba, nrm, light=(-0.5, 0.7, 0.5), scale=6):  # lit from above-left 
 if __name__ == '__main__':
     out = Path(__file__).resolve().parent.parent / 'textures'
     pv = Path(sys.argv[1]) if len(sys.argv) > 1 else None
-    for name in PILES:
-        (rgba, nrm), n = pile(name)
-        png(out / f'meat_{name}.png', rgba)
-        png(out / f'meat_{name}_n.png', nrm)
-        print(f'  {name}: {n} shapes, {sum(1 for r in rgba for p in r if p[3]) / (W * H):.0%} of its card')
-        if pv: pv.mkdir(parents=True, exist_ok=True); png(pv / f'meat_{name}_lit.png', preview(rgba, nrm))
     rows = [bit(name) for name in BITS]  # a row a kind, its frames across
     sheet = lambda k: [sum((fr[k][y] for fr in row), []) for row in rows for y in range(BIT)]
     png(out / 'meat_bits.png', sheet(0))
     png(out / 'meat_bits_n.png', sheet(1))
     print(f'  bits: {len(BITS)} kinds × {BIT_FRAMES} frames, {BIT} px')
-    if pv: png(pv / 'meat_bits_lit.png', preview(sheet(0), sheet(1), scale=8))
+    if pv: pv.mkdir(parents=True, exist_ok=True); png(pv / 'meat_bits_lit.png', preview(sheet(0), sheet(1), scale=8))
