@@ -13,15 +13,24 @@
   slits_strapped  slits with two raised reinforcing straps across the slots
   cover_hatch  cover plate with a recessed lifting slot in the middle (an access panel)
   treadplate  anti-slip pine-green rubber sheet: raised lozenges in a staggered grid, alternating ±45° (diamond plate)
+  wallpanel  the walls' 4 m panel (128 px, 2 × 2 tiles): a corrugated sheet (rounded waves along it, dirt in the
+         troughs) in a frame, braced across by an X, frame and X flush with the waves' crests: one flat face; a
+         pill-shaped recess on each arm of the X, two on each side of the frame; the frame in front of the X (the
+         X's arms run on under it); square plates fastening it on its corners and its middle, riveted; a cell of its own, a
+         bevelled bezel round its edge; drawn at 128 px, written at 64 (16 px/m: chunkier pixels than the tiles')
+  wallpanel_yellow, wallpanel_striped  the same, for the bottom row of the walls: the lower half of its sheet painted,
+         the hazard stripes' yellow / white, a few diagonal stripes of that yellow on it; its frame, X and
+         plates bare steel. One pair of opposite walls each
   slits_cut  slits' see-through mask (the stair treads)
   glass_slits, glass_panels  a framed glass window onto the void under the floor: pipes over the slits / cover plate, on and on
   weld_end, weld_corner, weld_tee, weld_cross  plain_welded's other pieces: the bead from the centre to the W / W+N / W+E+N / every edge
   walllight  plate with a deep recessed fixture: a glowing semi-cylindrical tube with metal end caps in a dark
          housing, under a clear cover embossed with ridges along the slot (built for parallax mapping)
 Tiles are self-contained (holes never cross the edge, a recessed seam runs round it) so any two can
-sit side by side.
+sit side by side; the seamless ones (tread plate, wall panel) have none: each is one long sheet, its tiles run on.
 
-Scale: one tile is 2 m (texture X and Y), 64 px, so ~31 mm per pixel. Brush direction: texture X.
+Scale: one tile is 2 m (texture X and Y), 64 px, so ~31 mm per pixel (a bigger set, its .size px: as many tiles' worth
+of brushing). Brush direction: texture X.
 The brushing is simulated, not painted: thousands of discrete abrasive scratches on a 4×-supersampled
 height field (rounded grooves with small raised edges, mostly shallow with a few deep, tapered ends), three
 belt passes a fraction of a degree apart, slow banding from uneven belt contact, sparse pits and faint
@@ -215,10 +224,145 @@ def treadplate(x, y):
         return TREAD_SRGB, 1 + TREAD_H * math.sqrt(1 - (d / TREAD_R) ** 2), 1.0, 0.28, 0.0, 1.0
     if d < TREAD_R + 0.8: return TREAD_SRGB, 1.0, 0.8, 0.42, 0.0, 1.0  # the sheet right at its foot: shaded a little
     return TREAD_SRGB, 1.0, 1.0, 0.36, 0.0, 1.0  # the sheet
+treadplate.seamless = True
 
 
 srgb = lambda l: round(255 * (12.92 * l if l <= 0.0031308 else 1.055 * l ** (1 / 2.4) - 0.055))
 STEEL_SRGB = tuple(srgb(c) for c in STEEL)
+
+CORR_P, CORR_A = 8, 0.55  # px: the wall's corrugation's pitch (25 cm: 16 waves a panel, so it tiles); its depth, crest to
+# trough (feature units, × BUMP px: about 5 cm)
+WALL_N, WALL_BAND, WALL_BRACE, WALL_RIM = 128, 14, 7, 0.4  # px: the panel (4 m); its frame's band in from each edge
+# (its own: each panel a cell of its own, two frames side by side where they meet); the X's half-width (as wide as a
+# frame); how far the frame's rim drops into the sheet (feature units: its outermost pixel, bevelled: a solid border)
+WALL_BEZEL = 1.0  # feature units: how far the frame drops at the panel's edge, over its 2 outermost px (a bevelled
+# groove between cells)
+WALL_X_RIM, WALL_X_SHADOW = 0.8, 0.7  # the X, a piece of its own behind the frame, on the sheet (as one with the frame,
+# it looked part of it; laid over it, bigger than it): how far its rim drops (feature units, its outermost pixel);
+# the shadows, 1 px: the X's on the sheet, the frame's on the X where it goes under it
+WALL_BOXES = [(c, d, 9) for c in (11, WALL_N - 11) for d in (11, WALL_N - 11)] + [(WALL_N / 2, WALL_N / 2, 11)]  # px:
+# the square plates fastening it (centre x, y, half its side), in front of everything, bigger than the frame and the X
+# they hold: on each corner (just clear of the bezel) and over the X's crossing
+WALL_BOX_RIM = 0.8  # feature units: how far a plate's rim drops (its outermost pixel, bevelled); its shadow: WALL_X_SHADOW
+WALL_RIVET_IN, WALL_RIVET_R, WALL_RIVET_H = 3, 1.8, 0.5  # px in from each corner of a plate, along both its sides: a
+# rivet holding it (on pixel corners: all four rasterise alike); its round head's radius, px; how high it's domed
+WALL_RIVETS = [(cx + sx * (h - WALL_RIVET_IN), cy + sy * (h - WALL_RIVET_IN)) for cx, cy, h in WALL_BOXES
+               for sx in (-1, 1) for sy in (-1, 1)]
+WALL_PILL_SRGB, WALL_PILL_ARC = (96, 98, 102), math.radians(60)  # a pill's trough at its deepest (shaded, dirty); how
+# much of a cylinder's round it is (90°: a half cylinder, its edge a sharp lip)
+WALL_PILL_L, WALL_PILL_R, WALL_PILL_D = 12, 4, 0.8  # px: the pill-shaped recesses on the X's arms and the frame's sides:
+# half their length (between their round ends' middles), their radius; how deep (feature units) (narrower and
+# shallower, they were lost at a distance)
+WALL_FRAME_PILL_L = 10  # px: the frame's pills' half length (shorter: between the corner plates and the lamp's lens)
+
+
+def wallpanel_parts(x, y):  # px: in from the panel's edge; how far onto the frame (> 0: on it), onto the X, onto a plate
+    px, py, n = x + 0.5, y + 0.5, WALL_N
+    e = min(px, n - px, py, n - py)
+    box = max(h - max(abs(px - cx), abs(py - cy)) for cx, cy, h in WALL_BOXES)
+    return e, WALL_BAND - e, WALL_BRACE - min(abs(px - py), abs(px + py - n)) / math.sqrt(2), box
+
+
+def wallpanel_region(x, y):  # 'box' (a plate, in front of everything), 'frame', 'x' (behind it: its arms run on under
+    # it) or 'sheet' (at the back)
+    e, frame, x_, box = wallpanel_parts(x, y)
+    return 'box' if box > 0 else 'frame' if frame > 0 else 'x' if x_ > 0 else 'sheet'
+
+
+def wallpanel_pills():  # its pill-shaped recesses, the X's and the frame's: (centre x, y, along x, y, half-length, radius), px
+    n, q, a = WALL_N, WALL_N / 4, math.sqrt(0.5)
+    L, R = WALL_PILL_L, WALL_PILL_R
+    x = [(cx, cy, a, a if (cx < 2 * q) == (cy < 2 * q) else -a, L, R)  # one half way along each arm of the X (a little
+         for cx, cy in ((q + 2, q + 2), (3 * q - 2, q + 2), (q + 2, 3 * q - 2), (3 * q - 2, 3 * q - 2))]  # in: clear of
+    # the corner plates)
+    m, at, Lf = WALL_BAND / 2, (n / 2 - 26, n / 2 + 26), WALL_FRAME_PILL_L  # (the frame's middle line, in from the edge;
+    # where along a side, clear of the corner plates; a little shorter, the lamp's lens between the two)
+    frame = [(m_, c, 0, 1, Lf, R) for m_ in (m, n - m) for c in at] + [(c, m_, 1, 0, Lf, R) for m_ in (m, n - m) for c in at]
+    return {'x': x, 'frame': frame}  # (two up each side of the frame, two along its top and its bottom)
+WALL_PILLS = wallpanel_pills()
+
+
+def wallpanel_pill(part, x, y):  # how deep in the nearest of that part's pill recesses, 0..1 (1: the bottom of its
+    # trough): each rounded, a cylinder's arc across it (WALL_PILL_ARC), deepest down its middle, its ends rounded the same
+    # way (flat bottomed, a bevel round it, it looked cratered)
+    px, py, deep = x + 0.5, y + 0.5, 0.0
+    s, c = math.sin(WALL_PILL_ARC), math.cos(WALL_PILL_ARC)
+    for cx, cy, ux, uy, L, R in WALL_PILLS[part]:
+        t = max(-L, min(L, (px - cx) * ux + (py - cy) * uy))
+        r = math.hypot(px - cx - t * ux, py - cy - t * uy) / R  # (0 down its middle, 1 at its edge)
+        if r < 1: deep = max(deep, (math.sqrt(1 - (r * s) ** 2) - c) / (1 - c))
+    return deep
+
+
+def wallpanel_rivet(x, y):  # how high on the nearest of the plates' rivets, 0..1 (1: its head's top; 0: off it)
+    px, py = x + 0.5, y + 0.5
+    r = min(math.hypot(px - cx, py - cy) for cx, cy in WALL_RIVETS) / WALL_RIVET_R
+    return math.sqrt(1 - r * r) if r < 1 else 0.0
+
+
+def wallpanel_height(region, x, y):  # that part's own surface at (x, y), carried on past its edge
+    if region == 'sheet': return 1 + CORR_A * (0.5 + 0.5 * math.cos(2 * math.pi * (y + 0.5) / CORR_P))
+    e, frame, x_, box = wallpanel_parts(x, y)
+    top = 1 + CORR_A
+    if region == 'box': return top - WALL_BOX_RIM * max(0.0, 1 - box) + WALL_RIVET_H * wallpanel_rivet(x, y)  # (flat,
+    # its rim bevelled, its rivets domed)
+    if region == 'x': return top - WALL_X_RIM * max(0.0, 1 - x_) - WALL_PILL_D * wallpanel_pill('x', x, y)  # (its rim)
+    return (top - WALL_RIM * max(0.0, 1 - frame) - WALL_BEZEL * max(0.0, 1 - e / 2) - WALL_PILL_D * wallpanel_pill('frame', x, y))
+    # (flat, bevelled down round its edge into the sheet (its rim) and at the panel's edge (the bezel))
+
+
+def wallpanel(x, y):
+    """The walls' panel: a corrugated sheet (rounded waves, a cosine, running along it, CORR_P px apart, brushed along
+    them, a little shaded in the bottom of each trough so dirt packs there) in a frame, braced corner to corner by an X.
+    Futuristic: frame and X lie flat, level with the sheet's crests (no beams standing out), each a piece of its own
+    with a solid bevelled rim: the frame in front, the X behind it on the sheet (its arms run on under the frame, the
+    frame's rim across them, its shadow on them; the X's shadow on the sheet); a pill-shaped recess half way along each
+    arm of the X, two along each side of the frame; square plates fastening it on, on its corners and over the X's
+    crossing, in front of everything, a domed rivet in each of their corners. The waves run on unchanged right up to them: each part's
+    normals come from its own surface (wallpanel.region/height: from the heights across the edge, the waves flattened
+    into the band). A cell of its own: its frame all round it, a bevelled bezel at its edge, a groove where it meets the
+    next (sharing a frame, it ran into it)."""
+    region = wallpanel_region(x, y)
+    h = wallpanel_height(region, x, y)
+    e, frame, x_, box = wallpanel_parts(x, y)
+    shade = WALL_X_SHADOW if (region == 'sheet' and x_ > -1) or (region == 'x' and frame > -1) or (region != 'box' and box > -1) else 1.0
+    # (the shadows: the X's on the sheet round it, the frame's on the X where it goes under it, a plate's round it)
+    dim = lambda c: tuple(round(v * shade) for v in c)
+    if region == 'box':  # (a rivet's head forged: smooth, no brush grain)
+        return dim(STEEL_SRGB), h, 1.0, (0.3 if wallpanel_rivet(x, y) > 0 else None), 1.0, 1.0
+    if region != 'sheet':  # (a pill darker the deeper: shaded, dirty; its occlusion alone only dims the room's light, and
+        # the lamps' light is direct: it didn't show)
+        deep = wallpanel_pill(region, x, y)
+        return dim(tuple(a + (p - a) * deep for a, p in zip(STEEL_SRGB, WALL_PILL_SRGB))), h, 1 - 0.4 * deep, None, 1.0, 1.0
+    c = math.cos(2 * math.pi * (y + 0.5) / CORR_P)
+    return dim(STEEL_SRGB), h, 0.85 if c < -0.9 else 1.0, None, 1.0, 1.0
+wallpanel.seamless, wallpanel.size, wallpanel.half = True, WALL_N, True  # (half: written at 64 px, 16 px/m: its pixels
+# twice the tiles', chunkier; its px figures above are in the 128 px it's drawn at)
+wallpanel.region, wallpanel.height = wallpanel_region, wallpanel_height
+
+HAZARD_SRGB = (226, 176, 18)  # the hazard stripes' yellow (the game's hazard band, round the platform's top: index.html)
+PAINT_WHITE_SRGB = (236, 236, 230)  # a white paint, a little warm
+WALL_STRIPE, WALL_STRIPE_W = 32, 8  # px (at 128 px a panel, 32 px/m): its yellow stripes' period, and their width (the
+# hazard band's: 0.25 m; spaced 1 m, a few on the white); the panel's width a whole number of them, so they run on
+# from one panel into the next
+
+
+def wallpanel_painted(name, paint):
+    """The walls' panel for their bottom row: the lower half of its corrugated sheet painted paint(x, y) (sRGB; paint:
+    not metal, not brushed, a little glossy), its waves and their dirty troughs and the shadows on it as wallpanel's;
+    the frame, the X and the plates bare steel, as above."""
+    def shape(x, y):
+        t = wallpanel(x, y)
+        if y < WALL_N / 2 or wallpanel_region(x, y) != 'sheet': return t
+        shade = t[0][0] / STEEL_SRGB[0]  # (the X's and the plates' shadows on it: see wallpanel)
+        return tuple(round(c * shade) for c in paint(x, y)), t[1], t[2], 0.6, 0.0, 1.0
+    shape.__name__, shape.seamless, shape.size, shape.half = name, True, WALL_N, True
+    shape.region, shape.height = wallpanel_region, wallpanel_height
+    return shape
+
+
+wallpanel_yellow = wallpanel_painted('wallpanel_yellow', lambda x, y: HAZARD_SRGB)
+wallpanel_striped = wallpanel_painted('wallpanel_striped', lambda x, y: HAZARD_SRGB if (x + y) % WALL_STRIPE < WALL_STRIPE_W else PAINT_WHITE_SRGB)
 
 
 PARALLAX_RANGE = 6.0  # px: the depth map's full scale (match WALL_LIGHT_DEPTH in the game: PARALLAX_RANGE / N)
@@ -609,10 +753,11 @@ def brushed(seed):
     S = N * SS
     H = [0.0] * (S * S)
     p1, p2 = rng.random() * 6.28, rng.random() * 6.28
-    band = [1 + 0.35 * math.sin(4 * math.pi * y / S + p1) + 0.2 * math.sin(14 * math.pi * y / S + p2) for y in range(S)]
+    tile = 64 * SS  # (a tile's samples: the banding a tile's, however big the set)
+    band = [1 + 0.35 * math.sin(4 * math.pi * y / tile + p1) + 0.2 * math.sin(14 * math.pi * y / tile + p2) for y in range(S)]
     for deg in PASSES:
         tan_a = math.tan(math.radians(deg))
-        for _ in range(SCRATCHES):
+        for _ in range(SCRATCHES * (N // 64) ** 2):  # (as dense on a bigger set)
             x0, y0 = rng.randrange(S), rng.random() * S
             L = rng.randint(40, 320)                              # finite length, in samples
             w = 0.5 + rng.expovariate(2.0)                        # half-width: mostly narrow
@@ -625,7 +770,7 @@ def brushed(seed):
                     t = abs(yy + 0.5 - yc) / w
                     if t < 1: H[(yy % S) * S + col] -= k * (1 - t * t)                      # rounded groove
                     elif t < 1.6: H[(yy % S) * S + col] += k * 0.3 * math.sin(math.pi * (t - 1) / 0.6)  # raised edge
-    for _ in range(PITS):
+    for _ in range(PITS * (N // 64) ** 2):
         cx, cy, r = rng.random() * S, rng.random() * S, 0.8 + rng.random() * 0.8
         for yy in range(math.floor(cy - r), math.ceil(cy + r) + 1):
             for xx in range(math.floor(cx - r), math.ceil(cx + r) + 1):
@@ -688,13 +833,13 @@ png(out / 'muzzle_flash.png', [sum((f[y] for f in row), []) for row in frames fo
 D = drip_grime()
 png(out / 'grime_drip.png', [[(b(v),) * 3 for v in row] for row in D])
 print(f'  drip grime: streaks cover {sum(map(sum, D)) / DRIP_W / DRIP_H:.0%} of the walls on average')
-for shape in (vent, vent_patch, slits, slits_strapped, plain, plain_bolted, plain_welded, light, slitlight, sidelight, sidelight_left, cover, cover_hatch, walllight, treadplate, weld_end, weld_corner, weld_tee, weld_cross, glass_slits, glass_panels):
-    name = shape.__name__
+for shape in (vent, vent_patch, slits, slits_strapped, plain, plain_bolted, plain_welded, light, slitlight, sidelight, sidelight_left, cover, cover_hatch, walllight, treadplate, weld_end, weld_corner, weld_tee, weld_cross, glass_slits, glass_panels, wallpanel, wallpanel_yellow, wallpanel_striped):
+    name, N = shape.__name__, getattr(shape, 'size', 64)  # (N: read by everything below, brushed() and grime_mask() too)
     _, var_x, var_y = downsample(*brushed(name))  # scratch heights stay out of the normal map (see top)
     alpha = lambda var: [[math.sqrt(BASE_ALPHA ** 2 + 2 * v) for v in row] for row in var]  # LEAN/Toksvig
     alpha_x, alpha_y = alpha(var_x), alpha(var_y)
     # A shape gives (distance to a hole, its radius), or a finished texel for features that aren't holes
-    edge = (lambda x, y, t: t) if shape is treadplate else seam  # tread plate is one sheet: no tile seams
+    edge = (lambda x, y, t: t) if getattr(shape, 'seamless', False) else seam  # one sheet: no tile seams
     T = [[edge(x, y, s if len(s) > 2 else texel(*s)) for x in range(N) for s in [shape(x, y)]] for y in range(N)]
     brush = [[T[y][x][3] is None for x in range(N)] for y in range(N)]
     H = [[BUMP * T[y][x][1] for x in range(N)] for y in range(N)]  # height in pixel units: the pressed features
@@ -705,9 +850,11 @@ for shape in (vent, vent_patch, slits, slits_strapped, plain, plain_bolted, plai
         g = G[y][x]
         return tuple(srgb(lin(c) * (1 - g) + gc * g) for c, gc in zip(T[y][x][0], GRIME))
 
+    region = getattr(shape, 'region', None)  # (a shape of separate surfaces: each pixel's normal from its own's heights)
     def normal(x, y):
         # Image rows run down but texture v runs up (flipY), hence the sign on ny
-        nx, ny = -(h(x + 1, y) - h(x - 1, y)) / 2, (h(x, y + 1) - h(x, y - 1)) / 2
+        hh = (lambda x_, y_: BUMP * shape.height(r, x_ % N, y_ % N)) if region and (r := region(x, y)) else h
+        nx, ny = -(hh(x + 1, y) - hh(x - 1, y)) / 2, (hh(x, y + 1) - hh(x, y - 1)) / 2
         l = math.sqrt(nx * nx + ny * ny + 1)
         return tuple(b(c / l * 0.5 + 0.5) for c in (nx, ny, 1))
 
@@ -724,11 +871,24 @@ for shape in (vent, vent_patch, slits, slits_strapped, plain, plain_bolted, plai
         return 128, 255, b(math.sqrt(max(ay_ - ax_, 0) / (1 - ax_)) * (1 - G[y][x]))  # grime hides the lines
 
     lo, hi = min(map(min, H)), max(map(max, H))
-    png(out / f'{name}.png', [[colour(x, y) for x in range(N)] for y in range(N)])
-    png(out / f'{name}_h.png', [[round((v - lo) / (hi - lo) * 65535) for v in row] for row in H], bits=16)
-    png(out / f'{name}_n.png', [[normal(x, y) for x in range(N)] for y in range(N)])
-    png(out / f'{name}_orm.png', [[orm(x, y) for x in range(N)] for y in range(N)])
-    png(out / f'{name}_a.png', [[aniso(x, y) for x in range(N)] for y in range(N)])
+    if getattr(shape, 'half', False):  # drawn at N px, written at half that: each 2 × 2 averaged (colour as light,
+        # normals renormalised): chunkier pixels than it was drawn with
+        half = lambda f: [[f([(x * 2 + i, y * 2 + j) for j in (0, 1) for i in (0, 1)]) for x in range(N // 2)] for y in range(N // 2)]
+        mean = lambda g, n_: lambda ps: tuple(sum(g(*p)[k] for p in ps) / 4 for k in range(n_))
+        def nhalf(ps):
+            v = mean(lambda x, y: [c / 255 * 2 - 1 for c in normal(x, y)], 3)(ps); l = math.sqrt(sum(c * c for c in v))
+            return tuple(b(c / l * 0.5 + 0.5) for c in v)
+        png(out / f'{name}.png', half(lambda ps: tuple(srgb(v) for v in mean(lambda x, y: [lin(c) for c in colour(x, y)], 3)(ps))))
+        png(out / f'{name}_h.png', half(lambda ps: round(sum((H[y][x] - lo) / (hi - lo) for x, y in ps) / 4 * 65535)), bits=16)
+        png(out / f'{name}_n.png', half(nhalf))
+        png(out / f'{name}_orm.png', half(lambda ps: tuple(round(v) for v in mean(orm, 4)(ps))))
+        png(out / f'{name}_a.png', half(lambda ps: tuple(round(v) for v in mean(aniso, 3)(ps))))
+    else:
+        png(out / f'{name}.png', [[colour(x, y) for x in range(N)] for y in range(N)])
+        png(out / f'{name}_h.png', [[round((v - lo) / (hi - lo) * 65535) for v in row] for row in H], bits=16)
+        png(out / f'{name}_n.png', [[normal(x, y) for x in range(N)] for y in range(N)])
+        png(out / f'{name}_orm.png', [[orm(x, y) for x in range(N)] for y in range(N)])
+        png(out / f'{name}_a.png', [[aniso(x, y) for x in range(N)] for y in range(N)])
     if shape is slits:  # the stair treads' grating: the slots cut right through (white = metal, black = open)
         png(out / 'slits_cut.png', [[(255 if T[y][x][1] >= 0.5 else 0,) * 3 for x in range(N)] for y in range(N)])
     if any(len(t) > 6 for row in T for t in row):

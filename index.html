@@ -95,7 +95,8 @@ class SpriteImpostor extends THREE.Group {
     this.below = false;         // seen from below too (a flyer): else never from lower than level
     this.still = false;         // a settled corpse: no more poses (it was redrawn 12 times a second, the same picture);
                                 // redrawn when the view or the flashes on it change, it's wounded, or (at most every
-                                // STILL_RELIGHT s) you've moved: the light pools and ceiling lights follow you
+                                // STILL_RELIGHT s) you've moved (the light pools and ceiling lights follow you) or a
+                                // portal's light is on it (it brightens)
     this.litFrom = new THREE.Vector3(Infinity, 0, 0); // (where you were when it was last drawn)
 
     // Render box from the bind pose (bone matrices start as zeros, so update them first)
@@ -130,13 +131,19 @@ class SpriteImpostor extends THREE.Group {
     this.depthU = {
       uSpriteDepth: { value: this.rt.depthTexture }, uProj: { value: new THREE.Matrix4() },
       uDepthRef: { value: new THREE.Vector2() }, // the centre's depth: in your view, from the RT camera
+      uBuild: { value: 1 }, // how much of it's there yet, coming through a portal (see Portals: 1, all of it)
     };
     const cardMat = new THREE.MeshBasicMaterial({
       map: this.rt.texture, transparent: true, premultipliedAlpha: true, side: THREE.DoubleSide,
     });
     cardMat.onBeforeCompile = (sh) => {
       Object.assign(sh.uniforms, this.depthU);
-      sh.fragmentShader = 'uniform sampler2D uSpriteDepth;\nuniform mat4 uProj;\nuniform vec2 uDepthRef;\n' +
+      sh.fragmentShader = 'uniform sampler2D uSpriteDepth;\nuniform mat4 uProj;\nuniform vec2 uDepthRef;\nuniform float uBuild;\n' + `
+        float buildHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+        float buildNoise(vec2 p) {
+          vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(buildHash(i), buildHash(i + vec2(1, 0)), f.x), mix(buildHash(i + vec2(0, 1)), buildHash(i + vec2(1, 1)), f.x), f.y);
+        }\n` +
         sh.fragmentShader.replace('#include <dithering_fragment>', `#include <dithering_fragment>
         float sd = texture2D(uSpriteDepth, vMapUv).r;
         vec4 texel = texture2D(map, vMapUv);
@@ -147,6 +154,17 @@ class SpriteImpostor extends THREE.Group {
           texel.rgb *= 1.0 - fogFactor;
         #endif
         gl_FragColor.rgb += texel.rgb * (1.0 - texel.a);
+        if (uBuild < 1.0) { // coming through a portal: built up from embers, as paper burns, backwards. Two fronts out
+          // of its middle, one down to its foot and one up to its top, each ragged and grainy (noise on the sprite, so it
+          // goes with it; the grain a speck a pixel of it, so its edge breaks up into specks): past them, not there yet;
+          // at one, glowing as an ember; just behind it, charred a moment; then itself
+          float grain = buildHash(floor(vMapUv * vec2(textureSize(map, 0))));
+          float n = 0.75 * abs(vMapUv.y * 2.0 - 1.0) + 0.1 * (0.7 * buildNoise(vMapUv * 7.0) + 0.3 * buildNoise(vMapUv * 23.0)) + 0.15 * grain;
+          float front = uBuild * ${(1 + 2 * PORTAL_BUILD_LEAD).toFixed(3)} - ${PORTAL_BUILD_LEAD.toFixed(3)}; // (nothing at first: see PORTAL_BUILD_LEAD)
+          if (n > front) discard;
+          float glow = smoothstep(front - 0.06, front, n), charred = smoothstep(front - 0.18, front - 0.06, n) * (1.0 - glow);
+          gl_FragColor.rgb = gl_FragColor.rgb * (1.0 - 0.7 * charred) + mix(vec3(1.4, 0.2, 0.03), vec3(2.4, 1.5, 0.5), glow) * glow * 5.0; // (a red ember, a yellow-hot edge: the portals' fire)
+        }
         float zs = sd >= 1.0 ? uDepthRef.y : ${SPRITE_NEAR.toFixed(2)} * ${SPRITE_FAR.toFixed(1)} / (${SPRITE_FAR.toFixed(1)} - sd * ${(SPRITE_FAR - SPRITE_NEAR).toFixed(2)});
         // (never nearer than your near plane: a demon right up against you puts its front, arm and gun, nearer than
         // its middle is far, which went behind the camera, where the depth wraps round to the far end: it vanished)
@@ -241,10 +259,12 @@ class SpriteImpostor extends THREE.Group {
     this.animAcc += dt;
     const posed = !this.still && (!o.stepped || this.animAcc >= 1 / o.animFps);
     if (posed) { this.mixer.update(this.animAcc); this.animAcc = 0; this.refit(); }
-    if (this.still && this.animAcc >= STILL_RELIGHT && !camera.position.equals(this.litFrom)) { this.animAcc = 0; this.lastKey = undefined; }
+    if (this.still && this.animAcc >= STILL_RELIGHT && (!camera.position.equals(this.litFrom)
+      || this.lastLights >>> (this.opts.flashLights.length - PORTAL_LIGHTS))) { this.animAcc = 0; this.lastKey = undefined; } // (a
+      // portal's light on it: the last of the flash lights, brightening as it opens)
 
     const at = this.frozenAt ?? m.position;
-    this.blob.position.set(at.x, (this.below ? floorAt(at.x, at.z) : at.y) + 0.02, at.z); // (under its feet; a flyer's, on the floor)
+    this.blob.position.set(at.x, (this.below ? floorAt(at.x, at.z, at.y) : at.y) + 0.02, at.z); // (under its feet; a flyer's, on the floor)
     this.bounds.visible = o.bounds;
 
     if (o.real) { // plain 3D model in the main scene, for comparison (blob shadow)
@@ -494,6 +514,19 @@ const flashes = Array.from({ length: 4 }, () => {
   return { world, sprite, ttl: 0 };
 });
 // ponytail: pool of 4; shots beyond 4 simultaneous flashes don't light anything. Raise it if that shows.
+// The portals' light (see Portals): a pool like the flashes', given to the portals lighting you most (see updatePortals)
+const PORTAL_LIGHT_COLOR = 0xff4a14, PORTAL_LIGHTS = 2, PORTAL_RANGE = 8, PORTAL_INTENSITY = 30;
+// m: its light on you (and all round you) never more than from this near (by 1/d², it went up without end as you neared
+// one: a flash, as from behind you, of one you'd backed up to); and its sparks, its point and its streak fade out in
+// front of you over this, nearer (one passing your eye was a bar of light across the screen)
+const PORTAL_NEAR = 3, PORTAL_NEAR_FADE = [0.4, 1.4];
+const portalLights = Array.from({ length: PORTAL_LIGHTS }, () => {
+  const world = new THREE.PointLight(PORTAL_LIGHT_COLOR, 0, PORTAL_RANGE, 2);
+  const sprite = world.clone();
+  scene.add(world);
+  stage.add(sprite);
+  return { world, sprite };
+});
 function muzzleFlash(position) {
   const f = flashes.find((f) => f.ttl <= 0);
   if (!f) return;
@@ -512,21 +545,20 @@ const FLOOR_TILES = {
   plain: 0.18, plain_bolted: 0.06, cover: 0.1, cover_hatch: 0.05,
   vent: 0.19, vent_patch: 0.06, slits: 0.19, slits_strapped: 0.06, sidelight_left: 0, // the lamp: not at random (below)
   plain_welded: 0, weld_end: 0, weld_corner: 0, weld_tee: 0, weld_cross: 0, // the weld seams: laid out as a maze (below)
-  glass_slits: 0, // glass panels onto the void under the floor (parallax mapped): not at random, one row (below)
 }, TILE = 2, TILES = 200;
-// The floor lights run in rows (east–west), every FLOOR_LIGHT_EVERY rows, like the wall's side-slit row: along the
+// The floor lights run in rows (east–west), every FLOOR_LIGHT_EVERY rows: along the
 // row, a FLOOR_LAMP panel (one thin light slit down a side) with its slit on the right, one with it on the left, so
 // the two slits pair up at their shared edge, then a plain tile; and again
 const FLOOR_LIGHT_EVERY = 3, FLOOR_LAMP = 'sidelight_left';
 // Tiles that glow, and how hard: emissiveIntensity > 1 is brighter than white in the HDR buffer, before ACES
 // tone mapping. It glows in the dark and under a flash, but lights nothing else (that needs real lights).
 // 5 puts the lens centre at ~3× white (luminance): over BLOOM_THRESHOLD, still LED-blue rather than blown out.
-// Wall fixture: its frosted, diffusing cover dims and spreads the tube (measured peak ≈ 0.33 × glow), so it needs ~2×
+// The wall fixture (the columns' lamps): its frosted, diffusing cover dims and spreads the tube (measured peak ≈ 0.33 × glow), so it needs ~2×
 // the others' glow to clear the bloom threshold: 10 puts the cover's peak at ~3.3, like the other strips' lens centres.
-const TILE_GLOW = { light: 5, slitlight: 5, sidelight: 5, sidelight_left: 5, walllight: 10, glass_slits: 3 };
+const TILE_GLOW = { light: 5, slitlight: 5, sidelight: 5, sidelight_left: 5, walllight: 10 };
 // Fixture lighting. true: every static fixture baked into a light volume, read as one light per pixel (~3 ms/frame at
 // 1600×1000). false: real lights, pooled over the nearest, in the world as well as for the demon sprites and the
-// gun: points for the floor/wall strips and column slits, rect area lights for the ceiling strips.
+// gun: points for the floor strips, the columns' lamps and slits, rect area lights for the ceiling strips.
 const BAKE_FIXTURES = false;
 const texLoader = new THREE.TextureLoader();
 const loadMap = (file, colorSpace = THREE.NoColorSpace) => {
@@ -651,8 +683,10 @@ function addBakedLight(mat) {
 }
 
 // Each instanced tile mesh gets its own copy of the geometry, carrying a random grime window per instance
-const withGrimeOffsets = (geo, count) => geo.clone().setAttribute('grimeOffset', new THREE.InstancedBufferAttribute(
-  Float32Array.from({ length: count * 2 }, () => ((Math.random() * 256) | 0) / 256), 2));
+// span: how tall the mesh's window is (grime-texture v): its offset kept so the window stays in the texture (the drip
+// texture doesn't tile up and down: clamped past its top, its top row ran on up as stripes)
+const withGrimeOffsets = (geo, count, span = 0) => geo.clone().setAttribute('grimeOffset', new THREE.InstancedBufferAttribute(
+  Float32Array.from({ length: count * 2 }, (_, i) => ((Math.random() * 256 * (i % 2 ? 1 - Math.min(span, 1) : 1)) | 0) / 256), 2));
 
 // Parallax mapping, pixel-art style: per pixel, march the eye ray down into a depth map through whole layers
 // and read every other map where it lands, so recessed parts slide behind the rim as you move (a normal map
@@ -666,21 +700,11 @@ const withGrimeOffsets = (geo, count) => geo.clone().setAttribute('grimeOffset',
 // coverScatter: how much the cover diffuses what's behind it (0 = clear). Over the cover, 8 eye rays tilted by up
 // to that much (mostly across the ridges, the way a prismatic cover spreads light) are each marched into the
 // depth map and the colour and glow they land on averaged: deeper things blur more, like real frosted plastic.
-// under: a two-span depth map (RG the first solid's top and bottom, BA the second's, over a floor at floorDepth),
-// so a ray can pass under things (a pipe, the plate it looks out from) to what's beneath; under is the glow of the
-// second span, floor the floor's; pipeRadius: the round things' radius (depth-map units), each shaded by where on
-// its round the ray hit. All its textures repeat: a ray running past the tile's edge finds more of the same.
-function addParallax(mat, depthFile, depth, { coverOpacity = 0, coverScatter = 0, under = null, floor = null, floorDepth = 1, pipeRadius = 1, lampHeight = 0.2,
-  wallOut = 0.2, plateDepth = 0, lampColor = new THREE.Color(), glassBlur = 0 } = {}) {
+function addParallax(mat, depthFile, depth, { coverOpacity = 0, coverScatter = 0 } = {}) {
   const depthMap = loadMap(depthFile);
   depthMap.minFilter = THREE.NearestFilter; // read at full resolution only: crisp layers
   depthMap.generateMipmaps = false;
-  const underMap = under && loadMap(under, THREE.SRGBColorSpace), floorMap = floor && loadMap(floor, THREE.SRGBColorSpace);
-  if (under) {
-    mat.defines = { ...mat.defines, DUAL_PARALLAX: '' };
-    for (const t of [depthMap, underMap, floorMap, ...Object.values(mat).filter((v) => v?.isTexture)]) t.wrapS = t.wrapT = THREE.RepeatWrapping;
-  }
-  mat.customProgramCacheKey = () => (under ? 'parallax:dual' : 'parallax');
+  mat.customProgramCacheKey = () => 'parallax';
   const before = mat.onBeforeCompile; // the grime layer
   mat.onBeforeCompile = (shader, renderer) => {
     before(shader, renderer);
@@ -688,8 +712,6 @@ function addParallax(mat, depthFile, depth, { coverOpacity = 0, coverScatter = 0
     shader.uniforms.parallaxDepth = { value: depth };
     shader.uniforms.coverOpacity = { value: coverOpacity };
     shader.uniforms.coverScatter = { value: coverScatter };
-    if (under) Object.assign(shader.uniforms, { parallaxUnder: { value: underMap }, parallaxFloor: { value: floorMap }, floorDepth: { value: floorDepth }, pipeRadius: { value: pipeRadius }, lampHeight: { value: lampHeight },
-      wallOut: { value: wallOut }, plateDepth: { value: plateDepth }, lampColor: { value: lampColor }, glassBlur: { value: glassBlur } });
     const uvs = ['vMapUv', 'vAoMapUv', 'vRoughnessMapUv', 'vMetalnessMapUv', 'vEmissiveMapUv', 'vSpecularIntensityMapUv', 'vAnisotropyMapUv'];
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>
@@ -697,32 +719,7 @@ uniform sampler2D parallaxMap;
 uniform float parallaxDepth;
 uniform float coverOpacity;
 uniform float coverScatter;
-#ifdef DUAL_PARALLAX
-uniform sampler2D parallaxUnder, parallaxFloor;
-uniform float floorDepth, pipeRadius, lampHeight, wallOut, plateDepth, glassBlur;
-uniform vec3 lampColor;
-float pomWhich = 0.0; // where the ray stopped: 0 the first span, 1 the second, 2 the floor, 3 a wall
-float pomLayer = 0.0; // how deep
-vec4 pomHit = vec4(0.0); // the spans there
-#endif
 vec2 parallaxUv(vec2 uv, vec3 v) { // v: toward the eye, tangent space
-#ifdef DUAL_PARALLAX
-  const float LAYERS = 48.0; // finer: the pipes are thin
-  vec2 stepUv = v.xy / max(v.z, 0.25) * parallaxDepth / LAYERS;
-  float layer = 0.0;
-  pomWhich = 2.0; // (if it runs out of steps: the floor)
-  vec4 d = textureLod(parallaxMap, uv, 0.0);
-  for (int i = 0; i < 48; i++) {
-    if (layer >= d.r && layer <= d.g) { pomWhich = 0.0; break; } // in the first span
-    if (layer >= d.b && layer <= d.a) { pomWhich = 1.0; break; } // in the second
-    if (layer >= floorDepth) { pomWhich = 2.0; break; }          // on the floor
-    if (layer > plateDepth && abs(uv.y - 0.5) > 0.5 + wallOut) { pomWhich = 3.0; break; } // a wall (the trench's sides, along the pipes)
-    uv -= stepUv;
-    layer += 1.0 / LAYERS;
-    d = textureLod(parallaxMap, uv, 0.0);
-  }
-  pomLayer = layer; pomHit = d;
-#else
   const float LAYERS = 24.0;
   vec2 stepUv = v.xy / max(v.z, 0.25) * parallaxDepth / LAYERS;
   float layer = 0.0, d = textureLod(parallaxMap, uv, 0.0).r;
@@ -732,45 +729,9 @@ vec2 parallaxUv(vec2 uv, vec3 v) { // v: toward the eye, tangent space
     layer += 1.0 / LAYERS;
     d = textureLod(parallaxMap, uv, 0.0).r;
   }
-#endif
   return uv;
 }`)
-      .replace('void main() {', `#if defined( DUAL_PARALLAX ) && defined( USE_EMISSIVEMAP )
-// What one ray through the glass sees down in the void, and how its lamps light it. The void is a trench along the
-// pipes: open both ways along them, walled on the two sides parallel to them, wallOut in under the neighbouring
-// panels. A lamp strip runs along the top of each wall, under the neighbouring panel (out of sight but at a
-// slant), as long as this tile; its light falls off with distance (× the angle it reaches the floor at), so it
-// spills on along the trench and fades: computed at where the ray landed, in the tile's UVs unwrapped (the baked
-// glow is fully lit and repeats with the textures; this doesn't).
-vec3 voidGlow(vec2 uv0, vec3 v, vec2 dx, vec2 dy) {
-  vec2 uv = parallaxUv(uv0, v); // before wrapping
-  float l = 0.0;
-  for (int k = 0; k < 2; k++) {
-    vec2 lamp = vec2(clamp(uv.x, 0.0, 1.0), k == 0 ? -wallOut : 1.0 + wallOut); // its nearest point on the strip
-    l += 0.9 * pow(lampHeight / length(vec2(lampHeight, length(uv - lamp))), 3.0);
-  }
-  l = min(l + 0.04 * min(l * 4.0, 1.0), 1.0); // a little bounce light, where there's light to bounce
-  if (pomWhich > 2.5) { // a wall: its lamp along the top, glowing; below it steel, lit by its own lamp, darkening down
-    float below = pomLayer - plateDepth, along = 1.0 - smoothstep(1.0, 1.0 + lampHeight, abs(uv.x - 0.5) + 0.5);
-    if (below < 0.05 && along > 0.0) return lampColor * 6.0 * along;               // the lamp's lens
-    return lampColor * 0.56 * 3.0 * (0.06 + 0.5 * along * exp(-below * 6.0)); // the wall (STEEL, TILE_GLOW)
-  }
-  vec3 e;
-  if (pomWhich > 1.5) e = textureGrad(parallaxFloor, uv, dx, dy).rgb;        // the floor
-  else if (pomWhich > 0.5) e = textureGrad(parallaxUnder, uv, dx, dy).rgb;   // a pipe, under the frame
-  else e = textureGrad(emissiveMap, uv, dx, dy).rgb;                         // a pipe
-  vec2 span = pomWhich > 0.5 ? pomHit.ba : pomHit.rg;
-  bool pipe = pomWhich < 1.5 && span.x > 0.0 && span.y < 0.99;
-  e *= emissive * (pipe ? min(0.25 + 1.3 * l, 1.0) : l); // a pipe catches more (nearer the lamps, glossy paint)
-  if (pipe) { // shaded by where on its round the ray hit, as octagonal facets
-    float nUp = clamp(((span.x + span.y) * 0.5 - pomLayer) / pipeRadius, -1.0, 1.0); // its normal's up-component
-    float q = cos(round(acos(nUp) / (PI / 4.0)) * (PI / 4.0));                       // its facet's
-    e *= 0.12 + 0.88 * pow((q + 1.0) * 0.5, 1.6) + (q > 0.99 ? 0.25 : 0.0);
-  }
-  return e;
-}
-#endif
-void main() {
+      .replace('void main() {', `void main() {
   vec2 pomDx = dFdx(vMapUv), pomDy = dFdy(vMapUv);
   vec3 pomN = normalize(vNormal), pomQ0 = dFdx(-vViewPosition), pomQ1 = dFdy(-vViewPosition);
   vec3 pomT = cross(pomQ1, pomN) * pomDx.x + cross(pomN, pomQ0) * pomDy.x;
@@ -779,16 +740,6 @@ void main() {
   vec3 pomV = normalize(vViewPosition);
   vec3 pomVt = normalize(vec3(dot(pomT, pomV) * pomS, dot(pomB, pomV) * pomS, dot(pomN, pomV))); // eye, tangent space
   vec2 pomUv0 = vMapUv; // the surface UV, kept for the cover's scattered rays
-  bool pomGlass = false; // this pixel looks through the glass
-#if defined( DUAL_PARALLAX ) && defined( USE_CLEARCOAT_NORMALMAP ) && defined( USE_CLEARCOATMAP )
-  if (texture(clearcoatMap, vMapUv).b > 0.5) { // through thick, rolled glass: the view bends at its rippled face (ripples
-    // along the pipes, so the void warps in bands parallel to them). Slope exaggerated ×2: real ripples this gentle
-    // shift things under a pixel at this resolution
-    vec3 pomGlassN = texture(clearcoatNormalMap, vMapUv).xyz * 2.0 - 1.0;
-    pomVt = -refract(-pomVt, normalize(vec3(pomGlassN.xy * 2.0, pomGlassN.z)), 1.0 / 1.5);
-    pomGlass = true;
-  }
-#endif
   vec2 pomUv = parallaxUv(vMapUv, pomVt);
   #undef texture2D
   #define texture2D(s, c) textureGrad(s, c, pomDx, pomDy)
@@ -796,19 +747,6 @@ ${uvs.map((u) => `  #define ${u} pomUv`).join('\n')}`)
       // after normal_fragment_begin, whose tangent frame needs the smooth UVs
       .replace('#include <normal_fragment_maps>', '#define vNormalMapUv pomUv\n#include <normal_fragment_maps>')
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
-#if defined( DUAL_PARALLAX ) && defined( USE_EMISSIVEMAP )
-  if (pomGlass) { // what's down there, blurred by the thick glass: averaged over rays spread round the view
-    vec3 acc = voidGlow(pomUv0, pomVt, pomDx, pomDy);
-    for (int i = 0; i < 3; i++) { // (each ray is a whole march: few of them, the glass row is wide)
-      float a = float(i) * 2.0944 + 0.5, r = glassBlur * 0.8; // three round the view, a third of a turn apart
-      acc += voidGlow(pomUv0, normalize(pomVt + vec3(r * cos(a), r * sin(a), 0.0)), pomDx, pomDy);
-    }
-    totalEmissiveRadiance = acc / 4.0;
-    diffuseColor.rgb = vec3(0.0); // lit by the lamps only, not the room
-    metalnessFactor = 0.0;
-    roughnessFactor = 1.0;
-  }
-#endif
 #ifdef USE_CLEARCOATMAP
   vec4 coverTexel = texture2D(clearcoatMap, vClearcoatMapUv); // the cover lies at the surface: unshifted UVs
 #if defined( USE_MAP ) && defined( USE_EMISSIVEMAP )
@@ -836,14 +774,34 @@ ${uvs.map((u) => `  #define ${u} pomUv`).join('\n')}`)
 }
 
 
-// Arena wall: a square ARENA m out each way, on the floor's tile seams, WALL_ROWS tiles high. The same 2 m
-// tiles as the floor, stood up facing inward, one kind of row per WALL_ROW_KINDS (bottom to top): two rows
-// alternating cover plates and light fixtures, panels with a vertical light slit at each side (pairing up at the seams
-// round the arena), cover plates on top. Single-sided: you can't get out to see the back (the player is kept inside).
-const ARENA = 32, WALL_ROWS = 4; // 8 m ceiling
-const WALL_ROW_KINDS = ['lights', 'lights', 'side', 'cover']; // light band at 0–4 m, side slits at 4–6 m
-const WALL_TILES = ['cover', 'walllight']; // alternate along the wall in the light rows
-// The wall's light fixture: a tube in a deep recess under a ridged clear cover, drawn with parallax mapping
+// Arena wall: a square ARENA m out each way, WALL_ROWS tiles high, in WALL_PANEL m panels (2 × 2 floor tiles, on the
+// floor's seams), stood up facing inward. Flat: each panel one textures/wallpanel, a corrugated steel sheet in a frame,
+// braced across by an X, frame and X flush with the waves' crests (one flat face, futuristic: standing out as real
+// beams, it was a warehouse). Single-sided: you can't get out to see the back (the player is kept inside).
+const ARENA = 28, WALL_ROWS = 4; // 8 m ceiling (14 panels a wall: 16 was too big)
+const WALL_PANEL = 2 * TILE; // m
+// Its lamps: a strip light flush in the frame between the rows, in the middle of every WALL_LAMP_EVERY'th panel, glowing
+// (a lens, brighter than white so it blooms, as the towers' lamps); their light washes the wall round them (worked out
+// in the wall's own shader: see addWallLamps), and their glow lights the sprites and the gun as the other lamps' does
+// (the strip pool)
+const WALL_LAMP = new THREE.Vector2(0.7, 3 / 32), WALL_LAMP_EVERY = 2; // m: its lens (along, up: between the frame's
+// two pills there); panels
+const WALL_LAMP_Y = WALL_PANEL - 7 / 32; // m: its height, the middle of the lower panel's frame along its top (the
+// generator's WALL_BAND / 2 px, at 32 px/m)
+// A flood lamp, shining down: a cone of light (WALL_LAMP_CONE: its full and its edge's half-angles off its axis, which
+// leans WALL_LAMP_TILT off straight down into the wall) from WALL_LAMP_OUT m out from it, so it lights a scallop on the
+// wall below it, its top a curve under the lamp, spreading to the floor (none above it: the top row's lit by the
+// ceiling). Its top about 0.3 m under the lamp, fully lit by 0.6 m (further out, or less leaning, it started lower)
+const WALL_LAMP_INTENSITY = 30, WALL_LAMP_OUT = 0.5; // candela; m
+const WALL_LAMP_CONE = [THREE.MathUtils.degToRad(20), THREE.MathUtils.degToRad(38)], WALL_LAMP_TILT = THREE.MathUtils.degToRad(20);
+// its light's matte share on the wall (as the brush scratches and the grime scatter it), on top of the steel's mirror-
+// like sheen: light from above glances off polished steel down, away from you, so only the scallop's top showed
+const WALL_LAMP_MATTE = 0.4;
+const WALL_LAMP_RANGE = WALL_PANEL * WALL_LAMP_EVERY; // m: its light, faded out by the next lamp (so a pixel only ever
+// has the two either side: further, one swapping in or out as you pass a lamp left a step)
+const wallLamps = []; // where each one's glow sits (the strip pool)
+// The light fixture the wall had, the columns' now (their lamp panels share its material, 'drip:walllight'): a tube in
+// a deep recess under a ridged clear cover, drawn with parallax mapping
 const WALL_STRIP_OFFSET = 0.6; // m off the wall: a wall lamp's glow (strip pool): further out than the floor's, so it doesn't hot-spot its own fixture
 const WALL_LIGHT_DEPTH = 6 / 64; // UV units: the generator's PARALLAX_RANGE (px) over the 64 px tile
 {
@@ -854,50 +812,100 @@ const WALL_LIGHT_DEPTH = 6 / 64; // UV units: the generator's PARALLAX_RANGE (px
   });
   addParallax(mat, 'walllight_depth', WALL_LIGHT_DEPTH, { coverOpacity: 0.2, coverScatter: 0.6 }); // a frosted cover
 }
-// Glass floor panels: a window of tinted glass in a steel frame, a lit lower floor deep under it (parallax), the
-// glass a glossy clearcoat with a little dirt round its rim
-const GLASS_DEPTH = 14 / 64; // UV units: the generator's glass parallax_range (GLASS_DEPTH + 2 px) over the 64 px tile
-for (const name of ['glass_slits']) {
-  const mat = tileMat(name);
-  Object.assign(mat, { clearcoat: 1, clearcoatMap: loadMap(`${name}_ccm`), clearcoatNormalMap: loadMap(`${name}_ccn`), clearcoatRoughness: 0.04 });
-  // its two extra parallax maps (under, floor) would take it past 16 textures: drop the frame's brush grain and its
-  // sheen mask (a 5 px frame barely shows either)
-  Object.assign(mat, { anisotropy: 0, anisotropyMap: null, specularIntensityMap: null });
-  addParallax(mat, `${name}_depth`, GLASS_DEPTH, { // clear glass: barely any haze, no scatter; the void under the floor
-    coverOpacity: 0.06, under: `${name}_under`, floor: `${name}_floor`, floorDepth: 12 / 14, pipeRadius: 2.5 / 14, // the generator's GLASS_DEPTH, PIPE_R over its range
-    lampHeight: 11 / 64, // the lamps' height over that floor (GLASS_DEPTH − 1 px), in the tile's UVs
-    wallOut: 4 / 64, plateDepth: 1 / 14, // the trench's walls: 4 px in under the neighbours; the frame plate's thickness (GLASS_PLATE)
-    lampColor: new THREE.Color().setRGB(126 / 255, 198 / 255, 228 / 255, THREE.SRGBColorSpace), // LIGHT through GLASS_TINT
-    glassBlur: 0.12, // how far its rays spread (tangent units): thick glass blurs what's under it
-  });
+// The lamps' light on the wall: each pixel lit by the lamps either side of it along its wall and, round the corner it's
+// nearer, that wall's nearest one, each a spot light (see WALL_LAMP_CONE), through the material's own lighting (so the
+// corrugation and the steel's brush catch it). Worked out here, not by real lights: one of those costs every pixel on
+// screen (see the spots), this only the wall's. No shadows, and the floor doesn't get it. (Off when real lights light
+// the wall: the bake or the strips in the world)
+const wallLampLight = { value: new THREE.Color(0x96d2ff).multiplyScalar(WALL_LAMP_INTENSITY) }; // STRIP_COLOR
+function addWallLamps(mat) {
+  const before = mat.onBeforeCompile, key = mat.customProgramCacheKey, f = (v) => v.toFixed(4);
+  const lamps = 2 * ARENA / WALL_PANEL / WALL_LAMP_EVERY, step = f(WALL_PANEL * WALL_LAMP_EVERY); // a wall's; m apart
+  const first = f(WALL_PANEL / 2 - ARENA), last = f(WALL_PANEL / 2 - ARENA + (lamps - 1) * WALL_PANEL * WALL_LAMP_EVERY); // along it
+  mat.customProgramCacheKey = () => `${key ? key.call(mat) : ''}:walllamps`;
+  mat.onBeforeCompile = (shader, r) => {
+    before?.(shader, r);
+    if (BAKE_FIXTURES || STRIP_LIGHTS_IN_WORLD) return; // (real lights have it: not twice)
+    shader.uniforms.uWallLamp = wallLampLight;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vLampW;')
+      .replace('#include <project_vertex>', `#include <project_vertex>
+  {
+    vec4 lw = vec4(transformed, 1.0);
+    #ifdef USE_INSTANCING
+      lw = instanceMatrix * lw;
+    #endif
+    vLampW = (modelMatrix * lw).xyz;
+  }`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 uWallLamp;\nvarying vec3 vLampW;')
+      .replace('#include <lights_fragment_begin>', `#include <lights_fragment_begin>
+  {
+    bool xWall = abs(vLampW.x) > abs(vLampW.z);
+    float along = xWall ? vLampW.z : vLampW.x, side = sign(xWall ? vLampW.x : vLampW.z), off = side * ${f(ARENA - WALL_LAMP_OUT)};
+    float j0 = floor((along - ${first}) / ${step}); // (the lamp before it along its wall)
+    IncidentLight wl;
+    wl.visible = true;
+    for (int i = 0; i <= 2; i++) { // the lamps either side of it, and round the corner it's nearer, that wall's nearest
+      vec3 lamp, axis; // (where it is; which way it shines: down, leaning into its wall)
+      if (i == 2) {
+        float s = along < 0.0 ? -1.0 : 1.0, end = side > 0.0 ? ${last} : ${first}; // (not sign(): 0 on the middle seam, a lamp there)
+        lamp = xWall ? vec3(end, ${f(WALL_LAMP_Y)}, s * ${f(ARENA - WALL_LAMP_OUT)}) : vec3(s * ${f(ARENA - WALL_LAMP_OUT)}, ${f(WALL_LAMP_Y)}, end);
+        axis = xWall ? vec3(0.0, -1.0, s * ${f(Math.tan(WALL_LAMP_TILT))}) : vec3(s * ${f(Math.tan(WALL_LAMP_TILT))}, -1.0, 0.0);
+      } else {
+        float j = j0 + float(i), a = ${first} + j * ${step};
+        if (j < 0.0 || j > ${f(lamps - 1)}) continue; // (past the wall's ends: none)
+        lamp = xWall ? vec3(off, ${f(WALL_LAMP_Y)}, a) : vec3(a, ${f(WALL_LAMP_Y)}, off);
+        axis = xWall ? vec3(side * ${f(Math.tan(WALL_LAMP_TILT))}, -1.0, 0.0) : vec3(0.0, -1.0, side * ${f(Math.tan(WALL_LAMP_TILT))});
+      }
+      vec3 down = vLampW - lamp; // (the lamp to here)
+      float spot = smoothstep(${f(Math.cos(WALL_LAMP_CONE[1]))}, ${f(Math.cos(WALL_LAMP_CONE[0]))}, dot(normalize(down), normalize(axis))); // (in its cone?)
+      if (spot <= 0.0) continue;
+      vec3 lv = (viewMatrix * vec4(lamp, 1.0)).xyz - geometryPosition;
+      float d = length(lv);
+      wl.direction = lv / d;
+      wl.color = uWallLamp * spot * getDistanceAttenuation(d, ${f(WALL_LAMP_RANGE)}, 2.0);
+      RE_Direct(wl, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight);
+      reflectedLight.directDiffuse += wl.color * saturate(dot(geometryNormal, wl.direction)) * diffuseColor.rgb * ${f(WALL_LAMP_MATTE)} * RECIPROCAL_PI;
+    }
+  }`);
+  };
 }
-const wallCells = Object.fromEntries([...WALL_TILES, 'cover_hatch', 'sidelight_left'].map((n) => [n, []]));
-const HALF_TURN = new THREE.Quaternion().setFromAxisAngle(AXIS_Z, Math.PI); // in a wall tile's plane
-const wallCover = () => (Math.random() < 0.3 ? 'cover_hatch' : 'cover'); // some cover plates are access hatches
-const wallGeo = new THREE.PlaneGeometry(TILE, TILE); // faces +Z, texture X along the wall, Y up
-for (const [nx, nz] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) { // each wall's inward normal
-  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.atan2(nx, nz));
-  const count = (2 * ARENA) / TILE;
-  for (let k = 0; k < count; k++) {
-    const along = (k - count / 2 + 0.5) * TILE;
-    for (let r = 0; r < WALL_ROWS; r++) {
-      const pos = new THREE.Vector3(nx ? -nx * ARENA : along, (r + 0.5) * TILE, nz ? -nz * ARENA : along);
-      const kind = WALL_ROW_KINDS[r];
-      const name = kind === 'side' ? 'sidelight_left' : kind === 'lights' ? WALL_TILES[k % 2] : 'cover';
-      // the side-slit row alternates a left slit and a right one (the same panel, half turned); others turn at random
-      const turn = kind === 'side' ? (k % 2 ? HALF_TURN : new THREE.Quaternion()) : randomTurn(AXIS_Z, 2);
-      wallCells[name === 'cover' ? wallCover() : name].push({ pos, q: q.clone().multiply(turn), normal: new THREE.Vector3(nx, 0, nz) });
+{ // the panels, and the lamps' lenses
+  const cols = (2 * ARENA) / WALL_PANEL, rows = (WALL_ROWS * TILE) / WALL_PANEL, lenses = [];
+  const panels = {}; // its set's name → the panels with it
+  for (const [nx, nz] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) { // each wall's inward normal
+    const q = new THREE.Quaternion().setFromAxisAngle(AXIS_Y, Math.atan2(nx, nz));
+    const at = (along, y, out) => (nx ? new THREE.Vector3(-nx * (ARENA - out), y, along) : new THREE.Vector3(along, y, -nz * (ARENA - out)));
+    for (let k = 0; k < cols; k++) {
+      const along = -ARENA + (k + 0.5) * WALL_PANEL;
+      for (let r = 0; r < rows; r++) (panels[r ? 'wallpanel' : nx ? 'wallpanel_striped' : 'wallpanel_yellow'] ??= [])
+        .push(new THREE.Matrix4().compose(at(along, (r + 0.5) * WALL_PANEL, 0), q, ONE));
+      if (k % WALL_LAMP_EVERY) continue;
+      lenses.push(new THREE.Matrix4().compose(at(along, WALL_LAMP_Y, 0.002), q, ONE)); // (a hair out: over the panel)
+      wallLamps.push(at(along, WALL_LAMP_Y, WALL_STRIP_OFFSET));
     }
   }
-}
-for (const name of Object.keys(wallCells)) {
-  const cells = wallCells[name], m = new THREE.Matrix4();
-  const mat = tileMat(name, `drip:${name}`, { drip: true });
-  addWallBlood(mat); // (see wallBlood)
-  const mesh = new THREE.InstancedMesh(withGrimeOffsets(wallGeo, cells.length), mat, cells.length);
-  cells.forEach((c, i) => mesh.setMatrixAt(i, m.compose(c.pos, c.q, ONE))); // c.q includes the tile's turn in its plane
-  mesh.castShadow = mesh.receiveShadow = true;
-  scene.add(mesh);
+  // a panel: a quad, its uvs in tiles (so its drip grime's as dense as a tile's) and its maps scaled to match (the 4 m
+  // texture on it once), not turned (its drips run down). The bottom row's its own sets, the lower half of its sheet
+  // painted: the ±z walls' the hazard stripes' yellow, the ±x walls' white striped in it (textures/wallpanel_yellow,
+  // wallpanel_striped)
+  const geo = new THREE.PlaneGeometry(WALL_PANEL, WALL_PANEL), uv = geo.attributes.uv;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * WALL_PANEL / TILE, uv.getY(i) * WALL_PANEL / TILE);
+  for (const [name, row] of Object.entries(panels)) {
+    const mat = tileMat(name, `drip:${name}`, { drip: true }); // (16 px/m: chunkier than the tiles' 32)
+    for (const t of Object.values(mat)) if (t?.isTexture) t.repeat.set(TILE / WALL_PANEL, TILE / WALL_PANEL);
+    addWallBlood(mat); // (see wallBlood)
+    addWallLamps(mat);
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(geo, row.length, WALL_PANEL / TILE * GRIME_TILE), mat, row.length);
+    row.forEach((m, i) => mesh.setMatrixAt(i, m));
+    mesh.castShadow = mesh.receiveShadow = true;
+    scene.add(mesh);
+  }
+  const lens = new THREE.InstancedMesh(new THREE.PlaneGeometry(WALL_LAMP.x, WALL_LAMP.y),
+    new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x96d2ff, emissiveIntensity: 5 }), lenses.length); // STRIP_COLOR
+  lenses.forEach((m, i) => lens.setMatrixAt(i, m));
+  scene.add(lens);
 }
 
 // Ceiling: closes the arena on top of the wall, tiles facing down in a checkerboard of slit vents and plain,
@@ -963,7 +971,7 @@ const COLUMN_REACH = COLUMN_APOTHEM / Math.cos(Math.PI / 8) + 0.4;       // cent
 const NPC_REACH = 0.8; // m: an enemy's body plus yours (you can't walk into the living)
 const NPC_FEET = 0.15; // m: how far its feet reach out from its middle (over a step by that much, it's up on it)
 const slitTiles = []; // the columns' light slits: positions, each with .aim (where its spot points, relative)
-const columnLamps = []; // the columns' wall lamps (the walls' parallax fixture): where each one's glow sits
+const columnLamps = []; // the columns' wall lamps (the parallax fixture the walls had): where each one's glow sits
 {
   const panel = new THREE.PlaneGeometry(COLUMN_SIDE, TILE); // faces +Z
   const uv = panel.attributes.uv;
@@ -1027,15 +1035,11 @@ const towerLamps = []; // where each one's glow sits (the strip pool)
       towerLamps.push(at(y).addScaledVector(out, WALL_STRIP_OFFSET));
     }
   }
-  // drawn: one instanced box per member size, its uvs in tile units of each face's size (no stretched plate)
+  // drawn: one instanced box per member size (see tiledBox)
   const mat = tileMat('plain', 'drip:plain', { drip: true });
   for (const size of [post, strut, bar]) {
-    const parts = TOWER_PARTS.filter((p) => p.size === size), geo = new THREE.BoxGeometry(size.x, size.y, size.z), uv = geo.attributes.uv;
-    for (const g of geo.groups) {
-      const [w, h] = [[size.z, size.y], [size.z, size.y], [size.x, size.z], [size.x, size.z], [size.x, size.y], [size.x, size.y]][g.materialIndex];
-      for (let i = g.start / 1.5; i < (g.start + g.count) / 1.5; i++) uv.setXY(i, uv.getX(i) * w / TILE, uv.getY(i) * h / TILE);
-    }
-    const mesh = new THREE.InstancedMesh(withGrimeOffsets(geo, parts.length), mat, parts.length);
+    const parts = TOWER_PARTS.filter((p) => p.size === size);
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(tiledBox(size), parts.length), mat, parts.length);
     parts.forEach((p, i) => mesh.setMatrixAt(i, p.m));
     scene.add(mesh);
   }
@@ -1055,6 +1059,15 @@ const towerLamps = []; // where each one's glow sits (the strip pool)
       return [[a.x, a.y, a.z, d + h], [-a.x, -a.y, -a.z, h - d]];
     });
   }
+}
+// A box (a steel member), its uvs in tile units of each face's size (no stretched plate)
+function tiledBox(size) {
+  const geo = new THREE.BoxGeometry(size.x, size.y, size.z), uv = geo.attributes.uv;
+  for (const g of geo.groups) {
+    const [w, h] = [[size.z, size.y], [size.z, size.y], [size.x, size.z], [size.x, size.z], [size.x, size.y], [size.x, size.y]][g.materialIndex];
+    for (let i = g.start / 1.5; i < (g.start + g.count) / 1.5; i++) uv.setXY(i, uv.getX(i) * w / TILE, uv.getY(i) * h / TILE);
+  }
+  return geo;
 }
 function rayTowers(o, dir) { // the nearest tower member a ray hits: { t, normal } or null
   let best = null;
@@ -1092,7 +1105,8 @@ function pushOutOfPlatform(p, pad) { // p: a position (x, z used), kept pad metr
   const d = platformDist(p.x, p.z);
   if (d < PLATFORM_APOTHEM + pad) { p.x += _pf.x * (PLATFORM_APOTHEM + pad - d); p.z += _pf.y * (PLATFORM_APOTHEM + pad - d); }
 }
-// Where a ray (origin o, direction dir) enters the platform's solid octagonal prism: its distance, or Infinity
+// Where a ray (origin o, direction dir) enters the platform's solid octagonal prism, its stairs or the balcony (see
+// STAIR_PIECES): its distance, or Infinity
 function rayPlatform(o, dir) {
   let tIn = -Infinity, tOut = Infinity;
   const clip = (den, num) => { // the half-space n·(o + t dir) ≤ k, with den = n·dir, num = k − n·o
@@ -1101,33 +1115,106 @@ function rayPlatform(o, dir) {
   for (const n of PLATFORM_FACES) clip(n.x * dir.x + n.y * dir.z, PLATFORM_APOTHEM - (n.x * o.x + n.y * o.z));
   clip(dir.y, PLATFORM_H - o.y); clip(-dir.y, o.y);
   const t = tIn <= tOut && tOut > 0 ? Math.max(tIn, 0) : Infinity;
-  return Math.min(t, ...STAIR_PIECES.map((p) => rayConvex(o, dir, p)?.t ?? Infinity));
+  return Math.min(t, ...[...STAIR_PIECES, ...BALCONY_PIECES].map((p) => rayConvex(o, dir, p)?.t ?? Infinity));
 }
-// Stairs up the four sides square to the grid: a flight one tile wide, 4 rises of 25 cm to the top, 3 treads of
-// grating each two of the slit tile's rows deep (⅔ m), so the flight runs one tile out. Each step is a solid box
-// from the floor up: { n: the side's outward normal, t: along it, e0..e1: metres out from the side, h: its top }.
+// Stairs: flights one tile wide, rises of 25 cm, treads of grating each two of the slit tile's rows deep (⅔ m): up the
+// platform's four sides square to the grid (4 rises, so a flight runs one tile out), and up to the balcony (see below).
+// A flight: { n: out from its top (x, z), t: across it, o: n·p at its top, c: t·p of its middle, half: half its width,
+// e0..e1 (0..run): how far out it runs, top: its top's height, topAt: a metre in on its top, footAt: STAIR_FOOT m out in
+// front of its bottom step (both on its middle line: see stairsTo), steps }. Each step is a solid box, the same but
+// e0..e1 m out from the top, its top h, its bottom y0: STRINGER_D under its tread (under the high ones you walk, and
+// shots, blood, everything goes).
 const STAIR_SIDES = [0, 2, 4, 6], STAIR_RISE = PLATFORM_H / 4, STAIR_RUN = TILE / 3, STAIR_HALF = TILE / 2;
-const STAIR_BOXES = STAIR_SIDES.flatMap((k) => [0, 1, 2].map((j) => ({
-  n: PLATFORM_FACES[k], t: new THREE.Vector2(PLATFORM_FACES[k].y, -PLATFORM_FACES[k].x),
-  e0: j * STAIR_RUN, e1: (j + 1) * STAIR_RUN, h: PLATFORM_H - (j + 1) * STAIR_RISE,
-})));
-const stairLocal = (b, x, z) => [b.n.x * x + b.n.y * z - PLATFORM_APOTHEM, b.t.x * x + b.t.y * z]; // [out, along]
+const STAIR_TREAD = 3 / 32, STRINGER_W = 2 / 32, STRINGER_D = 0.35, STAIR_SLOPE = STAIR_RISE / STAIR_RUN; // m; m; m
+const STAIR_FOOT = 0.8; // m
+function flight(n, o, c, top, half = STAIR_HALF) {
+  const count = Math.round(top / STAIR_RISE) - 1, run = count * STAIR_RUN, t = new THREE.Vector2(n.y, -n.x);
+  const at = (e) => new THREE.Vector2(n.x * (o + e) + t.x * c, n.y * (o + e) + t.y * c);
+  const f = { n, t, o, c, half, e0: 0, e1: run, run, top, topAt: at(-1), footAt: at(run + STAIR_FOOT) };
+  f.steps = Array.from({ length: count }, (_, j) => {
+    const h = top - (j + 1) * STAIR_RISE;
+    return { ...f, e0: j * STAIR_RUN, e1: (j + 1) * STAIR_RUN, h, y0: Math.max(h - STRINGER_D, 0) };
+  });
+  return f;
+}
+const FLIGHTS = STAIR_SIDES.map((k) => flight(PLATFORM_FACES[k], PLATFORM_APOTHEM, 0, PLATFORM_H)); // the platform's
+// The balcony: a mesh floor (the treads' grating, laid edge to edge) round the whole of the walls, four cells wide (8 m
+// out from them) and two up (4 m: its top at the wall panels' seam), held out from the walls by steel joists, stuck to
+// them: nothing under it but the floor, to walk about on. Its stairs run up along the −z wall, under it, in the cell
+// next to the wall, which is open over them (the stairwell): you come up through it. To everything, its floor is boxes
+// like a step's (DECKS): each wall's strip (round the walls like a pinwheel, each taking the corner at its −t end; the
+// −z one in three, round the stairwell), and the bridges'.
+// Bridges across the room between its opposite strips, one each way: a cell wide, beside the towers between them, just
+// clear of them (BALCONY_BRIDGE along the wall it sets out from: x for the one along z, −z for the one along x), the
+// two crossing near the middle.
+const BALCONY_Y = WALL_PANEL, BALCONY_D = 4 * TILE, BALCONY_IN = ARENA - BALCONY_D; // m: its top; how far out from the walls; its open edge, out from the middle
+const BALCONY_WALLS = [[0, 1], [-1, 0], [0, -1], [1, 0]].map(([x, z]) => new THREE.Vector2(x, z)); // out from each wall: −z, +x, +z, −x
+const BALCONY_WELL = [-4 * TILE, TILE]; // m: the stairwell's ends along the −z wall (x): its flight's run; its top on a joist (see BALCONY_STEEL)
+const deckBox = (n, a0, a1, d0, d1) => ({ n, t: new THREE.Vector2(n.y, -n.x), o: -ARENA, c: (a0 + a1) / 2, half: (a1 - a0) / 2,
+  e0: d0, e1: d1, h: BALCONY_Y, y0: BALCONY_Y - STRINGER_D }); // a0..a1 along wall n (t), d0..d1 out from it
+const BALCONY_BRIDGE = [TILE, 2 * TILE]; // m
+const BALCONY_BRIDGES = [BALCONY_WALLS[0], BALCONY_WALLS[3]].map((n) => deckBox(n, ...BALCONY_BRIDGE, BALCONY_D, 2 * ARENA - BALCONY_D)); // (along z, along x)
+const DECKS = BALCONY_WALLS.flatMap((n, k) => {
+  const [w0, w1] = BALCONY_WELL;
+  return k ? [deckBox(n, -ARENA, BALCONY_IN, 0, BALCONY_D)]
+    : [deckBox(n, -ARENA, w0, 0, BALCONY_D), deckBox(n, w1, BALCONY_IN, 0, BALCONY_D), deckBox(n, w0, w1, TILE, BALCONY_D)];
+}).concat(BALCONY_BRIDGES);
+const overDeck = (x, z) => DECKS.some((b) => inStairBox(b, x, z, 1e-6)); // (on a seam between two: on it)
+const BALCONY_FLIGHT = flight(new THREE.Vector2(1, 0), BALCONY_WELL[0], ARENA - STAIR_HALF, BALCONY_Y, STAIR_HALF - STRINGER_W); // (down
+// the stairwell, its stringers in the cell: the outer one on the wall)
+// The balcony's steel, each { at: its middle, size } (a box along the axes), under the treads: a joist out from the wall
+// at every other panel seam (between the wall lamps: see WALL_LAMP_EVERY; short of the stairwell), a beam along each
+// strip's open edge; the stairwell's, along its open side and across its foot (its top's on a joist); and under each
+// bridge a beam along either side and a joist across at every other panel seam (the one along x broken where the other
+// crosses it: that one carries the crossing)
+const BEAM_D = STRINGER_D - STAIR_TREAD; // m (down to the floor's y0)
+const beam = (x0, x1, z0, z1) => ({ at: new THREE.Vector3((x0 + x1) / 2, BALCONY_Y - STAIR_TREAD - BEAM_D / 2, (z0 + z1) / 2),
+  size: new THREE.Vector3(Math.abs(x1 - x0), BEAM_D, Math.abs(z1 - z0)) }); // (x0..x1, z0..z1)
+function steelBox(n, a0, a1, d0, d1) { // a0..a1 along wall n, d0..d1 out from it
+  const t = new THREE.Vector2(n.y, -n.x), x = (a, d) => t.x * a + n.x * (d - ARENA), z = (a, d) => t.y * a + n.y * (d - ARENA);
+  return beam(x(a0, d0), x(a1, d1), z(a0, d0), z(a1, d1));
+}
+const BALCONY_STEEL = BALCONY_WALLS.flatMap((n, k) => {
+  const W = STRINGER_W, [w0, w1] = BALCONY_WELL, steel = [steelBox(n, -BALCONY_IN, BALCONY_IN, BALCONY_D - W, BALCONY_D)];
+  for (let a = WALL_PANEL - ARENA; a <= BALCONY_IN; a += WALL_PANEL) {
+    const well = !k && a > w0 && a < w1;
+    steel.push(steelBox(n, a - W / 2, a + W / 2, well ? TILE + W : 0, BALCONY_D - W));
+  }
+  if (!k) steel.push(steelBox(n, w0, w1, TILE, TILE + W), steelBox(n, w1, w1 + W, 0, TILE));
+  return steel;
+});
+{ // the bridges' (x0..x1 across the one along z, z0..z1 across the one along x)
+  const W = STRINGER_W, I = BALCONY_IN, [x0, x1] = BALCONY_BRIDGE, z0 = -x1, z1 = -x0;
+  BALCONY_STEEL.push(beam(x0, x0 + W, -I, I), beam(x1 - W, x1, -I, I));
+  for (const [u0, u1] of [[-I, x0], [x1, I]]) BALCONY_STEEL.push(beam(u0, u1, z0, z0 + W), beam(u0, u1, z1 - W, z1));
+  for (let u = WALL_PANEL - I; u < I; u += WALL_PANEL) {
+    BALCONY_STEEL.push(beam(x0 + W, x1 - W, u - W / 2, u + W / 2));
+    if (u < x0 || u > x1) BALCONY_STEEL.push(beam(u - W / 2, u + W / 2, z0 + W, z1 - W));
+  }
+}
+const ALL_FLIGHTS = [...FLIGHTS, BALCONY_FLIGHT], STAIR_BOXES = ALL_FLIGHTS.flatMap((f) => f.steps), BOXES = [...STAIR_BOXES, ...DECKS];
+const stairLocal = (b, x, z) => [b.n.x * x + b.n.y * z - b.o, b.t.x * x + b.t.y * z - b.c]; // [out, along]
 const inStairBox = (b, x, z, pad = 0) => {
   const [e, a] = stairLocal(b, x, z);
-  return e > b.e0 - pad && e < b.e1 + pad && Math.abs(a) < STAIR_HALF + pad;
+  return e > b.e0 - pad && e < b.e1 + pad && Math.abs(a) < b.half + pad;
 };
-const stairHeight = (x, z) => STAIR_BOXES.reduce((h, b) => (inStairBox(b, x, z) ? Math.max(h, b.h) : h), 0);
-const floorAt = (x, z) => (platformDist(x, z) < PLATFORM_APOTHEM ? PLATFORM_H : stairHeight(x, z)); // the platform's top, a step, or 0
+// Over (x, z), for something at height y: the top of the highest step (of boxes: the balcony's too) it isn't under, or
+// 0; the bottom of the lowest one it is under, or the ceiling
+const stairHeight = (x, z, y, boxes = STAIR_BOXES) => boxes.reduce((h, b) => (y >= b.y0 && inStairBox(b, x, z) ? Math.max(h, b.h) : h), 0);
+const ceilingAt = (x, z, y, pad = 0) => BOXES.reduce((c, b) => (y < b.y0 && inStairBox(b, x, z, pad) ? Math.min(c, b.y0) : c), WALL_ROWS * TILE);
+const floorAt = (x, z, y) => Math.max(platformDist(x, z) < PLATFORM_APOTHEM ? PLATFORM_H : 0, stairHeight(x, z, y, BOXES)); // the platform's top, a step, the balcony (a bridge over the platform), or 0
 function pushOutOfStairBox(p, b, pad) { // the shortest way out of one step's (padded) footprint
   const [e, a] = stairLocal(b, p.x, p.z);
   const ways = [[b.e1 + pad - e, b.n.x, b.n.y], [e - b.e0 + pad, -b.n.x, -b.n.y],
-    [STAIR_HALF + pad - a, b.t.x, b.t.y], [a + STAIR_HALF + pad, -b.t.x, -b.t.y]];
+    [b.half + pad - a, b.t.x, b.t.y], [a + b.half + pad, -b.t.x, -b.t.y]];
   const [d, x, z] = ways.reduce((m, w) => (w[0] < m[0] ? w : m));
   if (d > 0) { p.x += x * d; p.z += z * d; }
 }
-// What a body at p (its feet at y, pad m round) stands on: the floor (0), or the platform's top or a step its feet (foot m
-// round its middle) are over, if they're up to it (within PLATFORM_STEP of its top: it steps up onto it, so up the stairs
-// a step at a time). One too high is a wall: p is pushed out of it. (You, and the enemies: they climb the stairs too)
+// What a body at p (its feet at y, pad m round, BODY_H tall) stands on: the floor (0), or the platform's top, a step or
+// the balcony its feet (foot m round its middle) are over, if they're up to it (within PLATFORM_STEP of its top: it
+// steps up onto it, so up the stairs a step at a time). One too high is a wall: p is pushed out of it; one it's all
+// under, it walks under. (You, and the enemies: they climb the stairs too)
+const BODY_H = 1.9; // m
 function standOn(p, y, pad, foot = pad) {
   let floor = 0;
   const d = platformDist(p.x, p.z);
@@ -1135,24 +1222,27 @@ function standOn(p, y, pad, foot = pad) {
     if (y < PLATFORM_H - PLATFORM_STEP) pushOutOfPlatform(p, pad);
     else if (d < PLATFORM_APOTHEM + foot) floor = PLATFORM_H;
   }
-  for (const b of STAIR_BOXES) if (inStairBox(b, p.x, p.z, pad)) {
+  for (const b of BOXES) if (y + BODY_H > b.y0 && inStairBox(b, p.x, p.z, pad)) {
     if (y < b.h - PLATFORM_STEP) pushOutOfStairBox(p, b, pad);
     else if (inStairBox(b, p.x, p.z, foot)) floor = Math.max(floor, b.h);
   }
   return floor;
 }
 // The stairs are open (cheap): each tread a thin grating, slotted right through, carried between two slanted
-// stringers; no risers, nothing underneath. You still walk them as the solid steps above (no ducking under them),
-// but shots and sight lines see only the treads and stringers: each a convex solid, its faces' planes n·p ≤ k.
-const STAIR_TREAD = 3 / 32, STRINGER_W = 2 / 32, STRINGER_D = 0.35, STAIR_SLOPE = STAIR_RISE / STAIR_RUN; // m; m; m
-const STAIR_PIECES = STAIR_BOXES.map((b) => [ // the treads
-  [b.n.x, 0, b.n.y, PLATFORM_APOTHEM + b.e1], [-b.n.x, 0, -b.n.y, -PLATFORM_APOTHEM - b.e0],
-  [b.t.x, 0, b.t.y, STAIR_HALF], [-b.t.x, 0, -b.t.y, STAIR_HALF], [0, 1, 0, b.h], [0, -1, 0, STAIR_TREAD - b.h],
-]).concat(STAIR_BOXES.filter((b) => b.e0 === 0).flatMap(({ n, t }) => [1, -1].map((side) => { // the stringers
-  const lo = side > 0 ? STAIR_HALF : -STAIR_HALF - STRINGER_W, A = PLATFORM_APOTHEM, s = STAIR_SLOPE;
-  return [[t.x, 0, t.y, lo + STRINGER_W], [-t.x, 0, -t.y, -lo], [n.x, 0, n.y, A + 3 * STAIR_RUN], [-n.x, 0, -n.y, -A],
-    [0, -1, 0, 0], [s * n.x, 1, s * n.y, PLATFORM_H + s * A], [-s * n.x, -1, -s * n.y, STRINGER_D - PLATFORM_H - s * A]];
-})));
+// stringers; no risers, nothing underneath. You still walk them as the solid steps above (but for ducking under the
+// balcony's high ones), but shots and sight lines see only the treads and stringers (and the balcony's floor and
+// steel): each a convex solid, its faces' planes n·p ≤ k.
+const treadPiece = (b) => [[b.n.x, 0, b.n.y, b.o + b.e1], [-b.n.x, 0, -b.n.y, -b.o - b.e0],
+  [b.t.x, 0, b.t.y, b.c + b.half], [-b.t.x, 0, -b.t.y, b.half - b.c], [0, 1, 0, b.h], [0, -1, 0, STAIR_TREAD - b.h]];
+const flightPieces = (f) => f.steps.map(treadPiece).concat([1, -1].map((side) => { // its treads; its stringers
+  const { n, t, o, top } = f, lo = f.c + (side > 0 ? f.half : -f.half - STRINGER_W), s = STAIR_SLOPE;
+  return [[t.x, 0, t.y, lo + STRINGER_W], [-t.x, 0, -t.y, -lo], [n.x, 0, n.y, o + f.run], [-n.x, 0, -n.y, -o],
+    [0, -1, 0, 0], [s * n.x, 1, s * n.y, top + s * o], [-s * n.x, -1, -s * n.y, STRINGER_D - top - s * o]];
+}));
+const boxPiece = ({ at, size }) => [[1, 0, 0, at.x + size.x / 2], [-1, 0, 0, size.x / 2 - at.x],
+  [0, 1, 0, at.y + size.y / 2], [0, -1, 0, size.y / 2 - at.y], [0, 0, 1, at.z + size.z / 2], [0, 0, -1, size.z / 2 - at.z]];
+const STAIR_PIECES = FLIGHTS.flatMap(flightPieces); // (the platform's: see wayTo)
+const BALCONY_PIECES = [...flightPieces(BALCONY_FLIGHT), ...DECKS.map(treadPiece), ...BALCONY_STEEL.map(boxPiece)];
 function rayConvex(o, dir, planes) { // where a ray enters a convex solid: { t, normal } or null
   let tIn = -Infinity, tOut = Infinity, nIn = null;
   for (const [nx, ny, nz, k] of planes) {
@@ -1268,31 +1358,65 @@ function rayConvex(o, dir, planes) { // where a ray enters a convex solid: { t, 
       tuv.setX(i, tuv.getX(i) * w / TILE); tuv.setY(i, tuv.getY(i) * STAIR_TREAD / TILE);
     }
   }
-  const treads = new THREE.InstancedMesh(withGrimeOffsets(tread, STAIR_BOXES.length),
-    [plainSide, plainSide, grating, new THREE.MeshBasicMaterial({ visible: false }), nosing, plainSide], STAIR_BOXES.length);
-  STAIR_BOXES.forEach((b, i) => {
-    const e = PLATFORM_APOTHEM + (b.e0 + b.e1) / 2;
-    treads.setMatrixAt(i, m.compose(new THREE.Vector3(b.n.x * e, b.h - STAIR_TREAD / 2, b.n.y * e),
-      new THREE.Quaternion().setFromAxisAngle(AXIS_Y, Math.atan2(b.n.x, b.n.y)), ONE)); // its +z out from the side
+  const hidden = new THREE.MeshBasicMaterial({ visible: false });
+  const lay = (boxes, mats) => { // a tread on each of boxes (its width theirs; turn: turned round), its faces drawn with mats
+    const treads = new THREE.InstancedMesh(withGrimeOffsets(tread, boxes.length), mats, boxes.length);
+    boxes.forEach((b, i) => {
+      const e = b.o + (b.e0 + b.e1) / 2;
+      treads.setMatrixAt(i, m.compose(new THREE.Vector3(b.n.x * e + b.t.x * b.c, b.h - STAIR_TREAD / 2, b.n.y * e + b.t.y * b.c),
+        new THREE.Quaternion().setFromAxisAngle(AXIS_Y, Math.atan2(b.n.x, b.n.y) + (b.turn ? Math.PI : 0)), // its +z out from the top
+        new THREE.Vector3(b.half / STAIR_HALF, 1, 1)));
+    });
+    scene.add(treads);
+  };
+  lay(STAIR_BOXES, [plainSide, plainSide, grating, hidden, nosing, plainSide]);
+  // the balcony's floor: each wall's strip in rows of treads out from the wall, edge to edge (none over the stairwell);
+  // the nosings in the stripes along its open edge and round the stairwell (those treads turned to face it), the rest
+  // hidden (seen from under it, they striped the whole of it)
+  const deck = [[], []], rows = Math.round(BALCONY_D / STAIR_RUN), wellRows = Math.round(TILE / STAIR_RUN), [w0, w1] = BALCONY_WELL;
+  BALCONY_WALLS.forEach((n, k) => {
+    for (let r = 0; r < rows; r++) for (let a = STAIR_HALF - ARENA; a < BALCONY_IN; a += TILE) { // a: a tread's middle along the wall
+      const well = !k && a > w0 && a < w1;
+      if (well && r < wellRows) continue;
+      const d = BALCONY_D + 0.5 - ARENA, bridged = BALCONY_BRIDGES.some((b) => inStairBox(b, n.y * a + n.x * d, -n.x * a + n.y * d)); // (a
+      // bridge goes on from it)
+      const turn = well && r === wellRows, edge = turn || (r === rows - 1 && Math.abs(a) < BALCONY_IN && !bridged);
+      deck[+edge].push({ ...deckBox(n, a - STAIR_HALF, a + STAIR_HALF, r * STAIR_RUN, (r + 1) * STAIR_RUN), turn });
+    }
   });
-  scene.add(treads);
-  // A stringer: drawn in (out from the side, up), its top along the treads' nosings, STRINGER_D deep, cut off
-  // level with the floor and the platform's side; extruded STRINGER_W across the flight
-  const run = 3 * STAIR_RUN, foot = (PLATFORM_H - STRINGER_D) / STAIR_SLOPE;
-  const plate = new THREE.ExtrudeGeometry(new THREE.Shape([[0, PLATFORM_H], [0, PLATFORM_H - STRINGER_D], [foot, 0], [run, 0],
-    [run, PLATFORM_H - run * STAIR_SLOPE]].map(([x, y]) => new THREE.Vector2(x, y))), { depth: STRINGER_W, bevelEnabled: false });
-  const puv = plate.attributes.uv;
-  for (let i = 0; i < puv.count; i++) puv.setXY(i, puv.getX(i) / TILE, puv.getY(i) / TILE); // metres → tiles
-  const stringerCount = STAIR_SIDES.length * 2, stringers = new THREE.InstancedMesh(withGrimeOffsets(plate, stringerCount), plainSide, stringerCount);
-  let si = 0;
-  for (const b of STAIR_BOXES.filter((b) => b.e0 === 0)) for (const side of [1, -1]) {
-    // basis: x out from the side, y up, z = x × y (= −t); extruded along z, so it starts at the far edge of its strip
-    const a = side > 0 ? STAIR_HALF + STRINGER_W : -STAIR_HALF;
-    m.makeBasis(new THREE.Vector3(b.n.x, 0, b.n.y), AXIS_Y, new THREE.Vector3(-b.t.x, 0, -b.t.y))
-      .setPosition(b.n.x * PLATFORM_APOTHEM + b.t.x * a, 0, b.n.y * PLATFORM_APOTHEM + b.t.y * a);
-    stringers.setMatrixAt(si++, m);
+  for (const b of BALCONY_BRIDGES) for (let r = 0; r < Math.round((b.e1 - b.e0) / STAIR_RUN); r++) { // the bridges: rows
+    // of treads along each, a tread across (none on the one along x where the other crosses it)
+    const e0 = b.e0 + r * STAIR_RUN, mid = e0 + STAIR_RUN / 2 - ARENA;
+    if (!b.n.x || mid < BALCONY_BRIDGE[0] || mid > BALCONY_BRIDGE[1]) deck[0].push({ ...b, e0, e1: e0 + STAIR_RUN });
   }
-  scene.add(stringers);
+  lay(deck[0], [plainSide, plainSide, grating, hidden, hidden, hidden]);
+  lay(deck[1], [plainSide, plainSide, grating, hidden, nosing, hidden]);
+  // A stringer: drawn in (out from the top, up), its top along the treads' nosings, STRINGER_D deep, cut off level
+  // with the floor and the top's edge; extruded STRINGER_W across the flight (the platform's flights one shape, the
+  // balcony's another)
+  for (const flights of [FLIGHTS, [BALCONY_FLIGHT]]) {
+    const { top, run } = flights[0], foot = (top - STRINGER_D) / STAIR_SLOPE;
+    const plate = new THREE.ExtrudeGeometry(new THREE.Shape([[0, top], [0, top - STRINGER_D], [foot, 0], [run, 0],
+      [run, top - run * STAIR_SLOPE]].map(([x, y]) => new THREE.Vector2(x, y))), { depth: STRINGER_W, bevelEnabled: false });
+    const puv = plate.attributes.uv;
+    for (let i = 0; i < puv.count; i++) puv.setXY(i, puv.getX(i) / TILE, puv.getY(i) / TILE); // metres → tiles
+    const stringers = new THREE.InstancedMesh(withGrimeOffsets(plate, flights.length * 2), plainSide, flights.length * 2);
+    flights.forEach((f, i) => [1, -1].forEach((side, k) => {
+      // basis: x out from the top, y up, z = x × y (= −t); extruded along z, so it starts at the far edge of its strip
+      const a = f.c + (side > 0 ? f.half + STRINGER_W : -f.half);
+      m.makeBasis(new THREE.Vector3(f.n.x, 0, f.n.y), AXIS_Y, new THREE.Vector3(-f.t.x, 0, -f.t.y))
+        .setPosition(f.n.x * f.o + f.t.x * a, 0, f.n.y * f.o + f.t.y * a);
+      stringers.setMatrixAt(i * 2 + k, m);
+    }));
+    scene.add(stringers);
+  }
+  const steel = {}; // the balcony's steel (see BALCONY_STEEL): one instanced box a size
+  for (const b of BALCONY_STEEL) (steel[b.size.toArray()] ??= []).push(b);
+  for (const parts of Object.values(steel)) {
+    const mesh = new THREE.InstancedMesh(withGrimeOffsets(tiledBox(parts[0].size), parts.length), plainSide, parts.length);
+    parts.forEach((b, i) => mesh.setMatrixAt(i, m.makeTranslation(b.at)));
+    scene.add(mesh);
+  }
   // Two strip lights set into the top, parallel: opposite sides of a square in the middle. A shallow steel
   // housing, its top a glowing lens, barely proud of the plate (you walk over them).
   const len = PLATFORM_STRIP_SQUARE, half = len / 2, strip = new THREE.BoxGeometry(len, 0.02, 3 / 32);
@@ -1322,13 +1446,6 @@ function rayConvex(o, dir, planes) { // where a ray enters a convex solid: { t, 
   scene.add(mark);
 }
 
-// Glass floor: one row of glass panels across the arena, one tile out from the centre platform on its −z side (the
-// plain row between is where its stairs come down; the platform reaches z = −4.8, the stairs −6.8, this row −8..−10).
-// Laid unturned, so the pipes under them run along the row, one run under the whole of it.
-const GLASS_ROW = TILES / 2 - 5;
-for (let col = TILES / 2 - ARENA / TILE; col < TILES / 2 + ARENA / TILE; col++)
-  tilePick[GLASS_ROW * TILES + col] = Object.keys(FLOOR_TILES).indexOf('glass_slits');
-
 // Weld seams: the welded plates aren't scattered at random. Their seams join up into networks, the way plates
 // are welded along runs: grown like a maze (randomised depth-first search, the "recursive backtracker") on a
 // lattice of every other tile, a node each 4 m with a passage tile between, over the open floor (clear of the
@@ -1345,7 +1462,7 @@ const weldTurn = new Map(); // cell → quarter turns about +Y
   const at = (col, row) => row * TILES + col;
   const open = (col, row) => {
     const cell = at(col, row), p = tilePos(cell);
-    if (tilePick[cell] === floorLightType || Math.abs(Math.floor(cell / TILES) - GLASS_ROW) < 1 || links.has(cell)) return false; // not the lamps or the glass
+    if (tilePick[cell] === floorLightType || links.has(cell)) return false; // not the lamps
     if (Math.abs(p.x) > ARENA - TILE || Math.abs(p.z) > ARENA - TILE) return false;
     if (platformDist(p.x, p.z) < PLATFORM_APOTHEM + TILE || STAIR_BOXES.some((b) => inStairBox(b, p.x, p.z, TILE))) return false;
     return COLUMNS.every((c) => Math.hypot(p.x - c.x, p.z - c.y) > COLUMN_REACH + TILE)
@@ -1384,7 +1501,7 @@ const weldTurn = new Map(); // cell → quarter turns about +Y
 
 Object.keys(FLOOR_TILES).forEach((name, type) => {
   const mat = tileMat(name);
-  if (name !== 'glass_slits') addFloorBlood(mat); // (glass: out of texture units; its landings stay stickers)
+  addFloorBlood(mat);
   const cells = tilePick.flatMap((t, i) => (t === type ? [i] : []));
   const mesh = new THREE.InstancedMesh(withGrimeOffsets(tileGeo, cells.length), mat, cells.length);
   const m = new THREE.Matrix4();
@@ -1393,7 +1510,6 @@ Object.keys(FLOOR_TILES).forEach((name, type) => {
   cells.forEach((cell, i) => mesh.setMatrixAt(i, m.compose(tilePos(cell),
     type === floorLightType ? (cell % TILES % 3 === 0 ? halfTurn : noTurn)
       : weldTurn.has(cell) ? new THREE.Quaternion().setFromAxisAngle(AXIS_Y, weldTurn.get(cell) * Math.PI / 2) // its seam joined up
-        : name.startsWith('glass') ? noTurn // unturned: the pipes under the glass line up from one panel to the next
         : randomTurn(AXIS_Y, 4), ONE)));
   mesh.receiveShadow = true;
   scene.add(mesh);
@@ -1404,7 +1520,7 @@ Object.keys(FLOOR_TILES).forEach((name, type) => {
 // stage like the flashes. Each fades out toward the pool's edge (the next-nearest tile left out, or
 // STRIP_REACH), so a light handing over to another tile is already at zero: no popping.
 const STRIP_POOL = 8, STRIP_REACH = 14, STRIP_FADE = 4; // lights, metres, metres
-// Trying: the floor/wall strips light nothing in the world, only glow (emissive + bloom). Their pool still lights
+// Trying: the floor strips and the lamps light nothing in the world, only glow (emissive + bloom). Their pool still lights
 // the demon sprites and the gun.
 const STRIP_LIGHTS_IN_WORLD = false;
 const STRIP_COLOR = 0x96d2ff, STRIP_INTENSITY = 2, STRIP_RANGE = 5, STRIP_HEIGHT = 0.25; // match LIGHT in the generator
@@ -1412,9 +1528,9 @@ const lightType = Object.keys(FLOOR_TILES).indexOf(FLOOR_LAMP);
 const stripTiles = [
   ...tilePick.flatMap((t, cell) => (t === lightType ? [tilePos(cell, STRIP_HEIGHT)] : []))
     .filter((p) => Math.abs(p.x) < ARENA && Math.abs(p.z) < ARENA), // only those inside the arena can be seen
-  ...wallCells.walllight.map((c) => c.pos.clone().addScaledVector(c.normal, WALL_STRIP_OFFSET)),
   ...columnLamps,
   ...towerLamps,
+  ...wallLamps,
   ...platformLamps,
 ];
 const stripLights = Array.from({ length: STRIP_POOL }, () => {
@@ -1465,7 +1581,7 @@ const ceilLights = Array.from({ length: CEIL_POOL }, () => {
 // ceiling slits and up from the floor ones, a little outward. 40 slits, so again a pool over the nearest, mirrored
 // into the sprite stage (and the gun). Each spot costs ~1.8 ms/frame at 1600×1000, hence 8: one column's set.
 const SPOT_POOL = 8, SPOT_REACH = 24, SPOT_FADE = 6, SPOT_INTENSITY = 40; // lights (a whole column's 8 slits), m, m, candela
-// Like the floor/wall strips: the column slits light nothing in the world, only glow (emissive + bloom); their pool
+// Like the floor strips: the column slits light nothing in the world, only glow (emissive + bloom); their pool
 // still lights the demon sprites and the gun.
 const SLIT_LIGHTS_IN_WORLD = false;
 // Point mode: a point light 0.45 m further out from the face instead of an aimed cone
@@ -1482,17 +1598,18 @@ const spotLights = Array.from({ length: SPOT_POOL }, () => {
   return { world, sprite };
 });
 
-// The bake (see addBakedLight): every static fixture's light summed into a 64 × 8 × 64 m volume in 0.5 m cells, with
+// The bake (see addBakedLight): every static fixture's light summed into a volume over the arena (2·ARENA × 8 × 2·ARENA m) in 0.5 m cells, with
 // the same falloff three.js uses (1/d², windowed to zero at the range), spot cones, and the ceiling's area lights
 // as small down-facing (cosine) emitters along each strip. Per cell: rgb = Σ light × direction to it, a = Σ light.
 // Done at load, since the floor's light tiles are placed at random. Each source only touches cells within its reach.
-// No occlusion: light passes through the columns. The main scene keeps only the muzzle flashes as real lights; the
+// No occlusion: light passes through the columns. The main scene keeps only the muzzle flashes and the portals' lights
+// (see portalLights) as real lights; the
 // pools above stay for the sprite stage and the gun, which are drawn small and cheap.
 if (BAKE_FIXTURES) {
   const CELL = 0.5, W = (2 * ARENA) / CELL, H = (WALL_ROWS * TILE) / CELL, D = W;
   const origin = new THREE.Vector3(-ARENA, 0, -ARENA), acc = new Float32Array(W * H * D * 4);
   const sources = [
-    ...stripTiles.filter((p) => Math.abs(p.x) < ARENA && Math.abs(p.z) < ARENA) // floor (inside the arena) and wall strips
+    ...stripTiles.filter((p) => Math.abs(p.x) < ARENA && Math.abs(p.z) < ARENA) // the floor strips (inside the arena) and the lamps
       .map((p) => ({ p, I: STRIP_INTENSITY, range: STRIP_RANGE })),
     ...ceilLightTiles.flatMap((p) => [-0.6, 0, 0.6].map((o) => ({ // 1.6 × 0.2 m at CEIL_INTENSITY nits, in 3 pieces
       p: p.clone().setX(p.x + o), I: (CEIL_INTENSITY * 1.6 * 0.2) / 3, range: 16, axis: new THREE.Vector3(0, -1, 0), lambert: true }))),
@@ -1536,7 +1653,8 @@ if (BAKE_FIXTURES) {
 const VIEW_FOV = 70; // ° (narrower while aiming: see ADS_FOV)
 const camera = new THREE.PerspectiveCamera(VIEW_FOV, innerWidth / innerHeight, 0.1, 200);
 camera.layers.enable(1); // (a skull's fire: see SpriteImpostor's cam)
-camera.position.set(0, EYE_HEIGHT, 8); // in front of the centre platform, which you face
+camera.position.set(0, EYE_HEIGHT + PLATFORM_H, 0); jumpY = PLATFORM_H; // on the centre platform, on its X, facing −z
+// (your feet up there too: else, below its top, you were pushed out off its side)
 
 // Post: the world renders into an HDR buffer, everything bleeds a glow in proportion to its brightness (so only the
 // emissive strips and hot metal glints show one), then OutputPass applies the renderer's ACES tone mapping and sRGB.
@@ -1707,6 +1825,116 @@ const dof = new DofPass({
     }`,
 });
 composer.addPass(dof);
+// Lensing (see Portals): where an enemy's just come through, a sphere of denser air bursts out round it (its refractive
+// index up from air's to PORTAL_LENS_INDEX and back): the world behind it seen through it, each pixel's view bent in
+// going into the sphere and again coming out (by 2·(asin ρ − asin(ρ/n)) towards its middle, ρ how far out from its
+// middle it passes, n its index over air's: next to nothing in its middle, steeply more towards its rim), and carried
+// on as far as what's seen there lies behind its middle (the world's depth). Only what's behind its middle is bent:
+// what's come through, and anything nearer, is left be, and a bent view landing on them shows what's behind instead.
+// And before that, while a portal's point hangs there: waves of bent space round it (uWaveA, uWaveB), crests laid out
+// in rings round the point and running in to it at a steady pace, each dragged inwards as a brush stroke drags paint:
+// strokes from every crest in towards the point (PORTAL_WAVE_STREAKS round it, each crest its own, each its own length:
+// some a short way in, many all the way), a pixel on one showing what's at its crest and beyond it (the world there
+// mirrored at the crest, in to the point); a stroke from further out over the ones from nearer in. The point's core
+// left be (its light), dying away to their reach. LENSES of each at once at most; off when there
+// are none
+const LENSES = 12; // (every portal of a wave, coming through at once)
+const PORTAL_WAVE_STREAKS = 48, PORTAL_WAVE_BEND = 2; // a portal's waves: the strokes round each crest (see lensPass); how
+// hard they bend (1: just the crest's world, smeared in; 2: mirrored at the crest, at its own size; more: squeezed in
+// from further out)
+// (drawn into its own target and copied back: the world's depth is in the composer's other target, the one a pass
+// would draw into next, and a target can't be read while it's drawn into)
+class LensPass extends ShaderPass {
+  constructor(shader) {
+    super(shader);
+    this.needsSwap = false;
+    this.target = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType });
+    this.copy = new FullScreenQuad(new THREE.ShaderMaterial({
+      uniforms: { tDiffuse: { value: this.target.texture } }, depthTest: false, depthWrite: false,
+      vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+      fragmentShader: `uniform sampler2D tDiffuse; varying vec2 vUv; void main() { gl_FragColor = texture2D(tDiffuse, vUv); }`,
+    }));
+  }
+  setSize(w, h) { this.target.setSize(w, h); }
+  render(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
+    // the world's depth: in the target it was drawn into (the depth of field drew into the other, if it ran)
+    this.uniforms.tDepth.value = (dof.enabled ? writeBuffer : readBuffer).depthTexture;
+    super.render(renderer, this.target, readBuffer, deltaTime, maskActive);
+    renderer.setRenderTarget(readBuffer);
+    this.copy.render(renderer);
+  }
+}
+const lensPass = new LensPass({
+  uniforms: { tDiffuse: { value: null }, tDepth: { value: null }, uLens: { value: Array.from({ length: LENSES }, () => new THREE.Vector4()) },
+    uDepth: { value: new Array(LENSES).fill(0) }, uAspect: { value: 1 }, uTan: { value: 1 },
+    uWaveA: { value: Array.from({ length: LENSES }, () => new THREE.Vector4()) }, uWaveB: { value: Array.from({ length: LENSES }, () => new THREE.Vector4()) },
+    uNear: { value: camera.near }, uFar: { value: camera.far } },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    #include <packing>
+    uniform sampler2D tDiffuse, tDepth;
+    uniform vec4 uLens[${LENSES}]; // x, y: its middle (0..1); z: its radius (screen heights); w: its index over air's (1, or 0: none)
+    uniform float uDepth[${LENSES}]; // its middle's depth in your view (m)
+    uniform float uAspect, uNear, uFar, uTan; // uTan: screen heights' worth of m, a m away (2 tan(fov / 2))
+    uniform vec4 uWaveA[${LENSES}]; // a portal's waves: x, y: its point (0..1); z: their reach (screen heights); w: how strong (0..1; 0: none)
+    uniform vec4 uWaveB[${LENSES}]; // x: their wavelength (screen heights); y: how many have run in; z: its strokes' seed; w: the point's depth (m)
+    varying vec2 vUv;
+    float depthAt(vec2 uv) { return -perspectiveDepthToViewZ(texture2D(tDepth, uv).x, uNear, uFar); } // (m, in your view)
+    vec2 fold(vec2 uv) { return 1.0 - abs(1.0 - abs(uv)); } // (folded back at the screen's edge: a lens just off it pulled
+    // what's past the edge in, and the target held that to its edge pixels, a smear)
+    float hash(float x) { return fract(sin(x * 127.1) * 43758.5453); }
+    float strokes(float x, float k) { // value noise round a circle (x: 0..1 round it), PORTAL_WAVE_STREAKS cells (crest k's own)
+      x *= ${PORTAL_WAVE_STREAKS}.0;
+      float i = floor(x), f = fract(x), o = ${PORTAL_WAVE_STREAKS}.0 * k;
+      return mix(hash(mod(i, ${PORTAL_WAVE_STREAKS}.0) + o), hash(mod(i + 1.0, ${PORTAL_WAVE_STREAKS}.0) + o), f * f * (3.0 - 2.0 * f));
+    }
+    void main() {
+      vec2 uv = vUv;
+      float nearest = 1e9, z = depthAt(vUv);
+      for (int i = 0; i < ${LENSES}; i++) { // the waves
+        vec4 a = uWaveA[i], b = uWaveB[i];
+        if (a.w <= 0.0) continue;
+        vec2 d = (vUv - a.xy) * vec2(uAspect, 1.0);
+        float r = length(d), behind = smoothstep(b.w + 0.3, b.w + 1.5, z);
+        if (r >= a.z || r < 1e-5 || behind <= 0.0) continue;
+        float round01 = atan(d.y, d.x) / 6.2831853 + 0.5 + b.z, first = floor(r / b.x + b.y) + 1.0, push = 0.0;
+        for (int j = 0; j < 8; j++) { // the crests outside it, from the nearest out (crest k where r / λ + run is k, so
+          // running in as the run grows; r / λ − run, they ran out)
+          float k = first + float(j), crest = (k - b.y) * b.x; // (screen heights out)
+          if (crest >= a.z) break;
+          float reach = mix(0.25, 1.4, strokes(round01, k)), in01 = 1.0 - r / crest; // (how far in its stroke goes here, of
+          // the way to the point: past 1, all the way; how far in this is)
+          float on = (1.0 - smoothstep(0.7 * reach, reach, in01)) * (1.0 - smoothstep(0.55 * a.z, a.z, crest)); // (faint out
+          // at their reach)
+          push = mix(push, (crest - r) * ${PORTAL_WAVE_BEND.toFixed(1)}, on); // (showing what's at its crest, and beyond: over
+          // the strokes from nearer in)
+        }
+        vec2 o = d / r * push * a.w * smoothstep(0.35 * b.x, 0.6 * b.x, r) * behind / vec2(uAspect, 1.0); // (the point's
+        // core left be, its light: the strokes fading out 0.35 to 0.2 m from it, their samples always further out)
+        vec2 q = vUv + o; // (and none from past the screen's edge: folded back, a stroke there would show the point again)
+        uv += o * (1.0 - smoothstep(0.0, 0.05, max(max(-q.x, q.x - 1.0), max(-q.y, q.y - 1.0))));
+        nearest = min(nearest, b.w);
+      }
+      for (int i = 0; i < ${LENSES}; i++) { // the spheres
+        vec4 l = uLens[i];
+        if (l.w <= 1.0) continue;
+        vec2 d = (vUv - l.xy) * vec2(uAspect, 1.0); // out from its middle (screen heights)
+        float r = length(d), rho = r / l.z;
+        float behind = smoothstep(uDepth[i] + 0.3, uDepth[i] + 1.5, z); // (behind its middle: bent; it, and what's nearer, not)
+        if (rho >= 1.0 || r < 1e-5 || behind <= 0.0) continue;
+        float bent = 2.0 * (asin(rho) - asin(rho / l.w)); // (radians, towards its middle: in, and out again)
+        uv -= d / r * bent * (z - uDepth[i]) / (uTan * z) * behind / vec2(uAspect, 1.0); // (carried as far as what's seen is
+        // behind its middle; m there, as screen heights)
+        nearest = min(nearest, uDepth[i]);
+      }
+      vec2 at = fold(uv);
+      float keep = nearest < 1e8 ? smoothstep(nearest + 0.3, nearest + 1.5, depthAt(at)) : 1.0; // (landing on what's come
+      // through, or nearer: not that)
+      gl_FragColor = keep < 1.0 ? mix(texture2D(tDiffuse, vUv), texture2D(tDiffuse, at), keep) : texture2D(tDiffuse, at);
+    }`,
+});
+lensPass.enabled = false;
+composer.addPass(lensPass);
 
 composer.addPass(bloom);
 // the glow isn't blended into the world's pixels (the blocky upscale would cut its soft falloff into steps): the output
@@ -1736,6 +1964,7 @@ composer.addPass(new (class extends OutputPass {
 })());
 const look = new PointerLockControls(camera, renderer.domElement);
 renderer.domElement.addEventListener('click', () => { if (!look.isLocked) look.lock(); audio.resume(); music.play().catch(() => {}); }); // (browsers start audio on a click)
+const firstClick = new Promise((go) => renderer.domElement.addEventListener('click', go, { once: true })); // (the enemies come in then)
 // Playing: just the crosshair, health, ammo and credits; paused (Esc, or not started): the menu, with the controls,
 // toggles and stats over the dimmed game
 look.addEventListener('lock', () => document.body.classList.add('playing'));
@@ -1746,7 +1975,7 @@ look.addEventListener('unlock', () => { document.body.classList.remove('playing'
 const opts = {
   stage, resolution: RT_SIZES[0], snaps: 16, pitchSnaps: 8, distance: 5, animFps: 12,
   stepped: true, snap: true, lockDist: true, real: false, bounds: false, spriteShadows: false,
-  lod: true, lodNear: 8, lodFalloff: 0.25, sun, flashLights: [...flashes, ...stripLights, ...spotLights].map((l) => l.sprite),
+  lod: true, lodNear: 8, lodFalloff: 0.25, sun, flashLights: [...flashes, ...stripLights, ...spotLights, ...portalLights].map((l) => l.sprite),
 };
 
 // ---------------------------------------------------------------------------
@@ -1791,6 +2020,7 @@ const gunFlashes = flashes.map((f) => { const l = f.world.clone(); gunScene.add(
 const gunStrips = stripLights.map((s) => { const l = s.world.clone(); gunScene.add(l); return l; });
 const gunCeil = ceilLights.map((c) => { const l = c.world.clone(); gunScene.add(l); return l; });
 const gunSpots = spotLights.map(() => { const l = spotLight(); gunScene.add(l); if (l.target) gunScene.add(l.target); return l; });
+const gunPortals = portalLights.map((p) => { const l = p.world.clone(); gunScene.add(l); return l; }); // (see Portals)
 const gunCam = new THREE.PerspectiveCamera(GUN_FOV, 1, 0.01, 10);
 const gunRT = new THREE.WebGLRenderTarget(1, 1, {
   type: THREE.HalfFloatType, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter,
@@ -2633,7 +2863,10 @@ const DECAL_FLAT = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 
 // Paint: on the blood maps a landing's stain is PAINT_SCALE times a sticker's (to PAINT_MAX m), and one bigger than
 // PAINT_SPRAY_FROM m throws PAINT_SPRAY smaller ones on around it: a can of red paint flung, not a drop
 const PAINT_SCALE = 1.5, PAINT_MAX = 1.2, PAINT_SPRAY_FROM = 0.4, PAINT_SPRAY = 3; // −, m, m, splats
+const _throughDeck = new THREE.Vector3();
 function spawnDecal(at, normal, v, dropSize, size = THREE.MathUtils.clamp(dropSize * (1.5 + 0.6 * v.length()), 0.06, 0.45)) {
+  if (!normal && at.y > BALCONY_Y - 0.05 && overDeck(at.x, at.z)) at = _throughDeck.copy(at).setY(floorAt(at.x, at.z, BALCONY_Y - STRINGER_D - 0.01)); // (on
+  // the balcony: through its mesh, onto the floor, or the platform's top under a bridge)
   // into the blood maps: as paint (see PAINT_SCALE), a big splat and, for a big one, a spray of smaller ones thrown on
   // ahead of it along its travel
   const onWall = normal && wallBloodAt(at), paint = Math.min(size * PAINT_SCALE, PAINT_MAX);
@@ -2695,7 +2928,7 @@ function spawnDecal(at, normal, v, dropSize, size = THREE.MathUtils.clamp(dropSi
 // surfaces unwrapped: each wall a strip (along it × up), then a strip of the four columns, each its eight faces side by
 // side. On it the blood runs (see the flow): wet blood past what sticks drips down, leaving a film, its front a bead;
 // what runs off the bottom drains onto the floor's map at the base, where it pools.
-// The glass row (out of texture units) and everything else (platform, stairs, towers) keep the stickers.
+// Everything else (platform, stairs, towers) keeps the stickers.
 const BLOOD_PX = 32, BLOOD_RES = 2 * ARENA * BLOOD_PX, BLOOD_DRY_TAU = 10, BLOOD_DRY_STEP = 0.25; // texels/m, texels, s, s
 const BLOOD_STAMPS = 512; // most landings painted a frame, per map
 // The platform's top has its own map (topBloodMap), TOP_BLOOD_HALF m each way from the centre: the floor's would do,
@@ -2718,10 +2951,8 @@ const wallBloodTex = { value: wallBloodRTs[0].texture }; // the current one, sha
 // varied per texel column so it runs in separate streaks) moves one texel down. Dried blood doesn't run; the walls
 // dry slower than the floor (BLOOD_WALL_DRY_TAU), so drips run a metre or two before they stop
 const BLOOD_FLOW_STEP = 1 / 30, BLOOD_FLOW_RATE = 0.5, BLOOD_HOLD = 0.15, BLOOD_WALL_DRY_TAU = 12, BLOOD_WALL_IDLE = 40; // s, share, depth, s, s
-const glassType = Object.keys(FLOOR_TILES).indexOf('glass_slits');
-function onBloodFloor(x, y, z) { // the floor proper (not the platform's top or a stair), inside the arena, not glass
-  if (y > 0.01 || Math.abs(x) >= ARENA || Math.abs(z) >= ARENA) return false;
-  return tilePick[Math.floor(z / TILE + TILES / 2) * TILES + Math.floor(x / TILE + TILES / 2)] !== glassType;
+function onBloodFloor(x, y, z) { // the floor proper (not the platform's top or a stair), inside the arena
+  return y <= 0.01 && Math.abs(x) < ARENA && Math.abs(z) < ARENA;
 }
 // where a point on a wall or a column face is in the atlas (texels, x along, y up), or null: not one
 function wallBloodAt(p) {
@@ -3348,7 +3579,7 @@ function flStep(dt) {
     const i = flAct[a], k = i * 3;
     for (let c = 0; c < 3; c++) { flV[k + c] += flD[k + c]; flP[k + c] = flX[k + c]; }
     _bp.fromArray(flP, k);
-    const surface = gooSurface();
+    const surface = gooSurface(flV[k + 1] > 0);
     if (!surface) continue;
     const normal = surface === 'floor' ? null : _bn;
     if (flSheet[i] >= 0) landSheet(flSheet[i], i, normal);
@@ -3436,22 +3667,24 @@ function throwUnflown(hit, gobs, now) {
     const p = from.clone().addScaledVector(d, FL_GOB_START), v = d.multiplyScalar(3.5 + Math.random() * 2.5);
     for (let t = 0; t < FL_LIFE; t += FL_STEP) {
       v.y -= FL_GRAVITY * FL_STEP;
+      const was = p.y;
       p.addScaledVector(v, FL_STEP);
       if (Math.abs(p.x) > ARENA - 0.05 || Math.abs(p.z) > ARENA - 0.05) break; // a wall
-      const ground = floorAt(p.x, p.z);
-      if (p.y > ground) continue;
+      const ground = floorAt(p.x, p.z, was);
+      if (p.y > ground || v.y > 0) continue; // (not going up: up into a high step from under it, it isn't on it)
       unflown.push({ at: p.setY(ground), v, when: now + t, size: STAIN_MAX * (0.6 + 0.4 * Math.random()) });
       break;
     }
   }
 }
 const _bv = new THREE.Vector3(), _bp = new THREE.Vector3(), _bn = new THREE.Vector3();
-// What a blob at _bp hit: the floor, a wall (the arena's square) or a column (inside its face distance: snapped onto
-// that face, its normal in _bn); null if nothing
-function gooSurface() {
+// What a blob at _bp hit (rising: going up), the floor, a wall (the arena's square) or a column (inside its face distance:
+// snapped onto that face, its normal in _bn); null if nothing
+function gooSurface(rising) {
   if (_bp.y <= 0.01) { _bp.y = 0; return 'floor'; }
-  const sh = stairHeight(_bp.x, _bp.z);
-  if (_bp.y <= sh) { _bp.y = sh; return 'floor'; } // a stair: onto its tread
+  const sh = stairHeight(_bp.x, _bp.z, _bp.y);
+  if (_bp.y <= sh && !rising) { _bp.y = sh; return 'floor'; } // a stair: onto its tread, from over it (not the balcony: it
+  // goes through its mesh)
   const pd = platformDist(_bp.x, _bp.z);
   if (pd < PLATFORM_APOTHEM && _bp.y <= PLATFORM_H) { // the platform: its top or a side, whichever it's nearer
     if (PLATFORM_H - _bp.y < PLATFORM_APOTHEM - pd) { _bp.y = PLATFORM_H; return 'floor'; }
@@ -4151,7 +4384,7 @@ function rayWorld(o, dir) {
   if (dir.x > 0) take((ARENA - o.x) / dir.x, -1, 0, 0); else if (dir.x < 0) take((-ARENA - o.x) / dir.x, 1, 0, 0);
   if (dir.z > 0) take((ARENA - o.z) / dir.z, 0, 0, -1); else if (dir.z < 0) take((-ARENA - o.z) / dir.z, 0, 0, 1);
   for (const c of COLUMNS) { const h = rayOctagon(o, dir, c.x, c.y, COLUMN_APOTHEM, H); if (h && (!best || h.t < best.t)) best = h; }
-  for (const h of [rayOctagon(o, dir, 0, 0, PLATFORM_APOTHEM, PLATFORM_H), ...STAIR_PIECES.map((p) => rayConvex(o, dir, p)), rayTowers(o, dir)])
+  for (const h of [rayOctagon(o, dir, 0, 0, PLATFORM_APOTHEM, PLATFORM_H), ...[...STAIR_PIECES, ...BALCONY_PIECES].map((p) => rayConvex(o, dir, p)), rayTowers(o, dir)])
     if (h && (!best || h.t < best.t)) best = h;
   return best;
 }
@@ -4292,15 +4525,15 @@ function updateCasings(dt) {
   for (let i = 0; i < CASE_MAX; i++) {
     if (caseLife[i] <= 0) continue;
     if ((caseLife[i] -= dt) <= 0) continue;
-    const k = i * 3;
+    const k = i * 3, y0 = casePos[k + 1]; // (where it was)
     caseVel[k + 1] -= CASE_GRAVITY * dt;
     for (let c = 0; c < 3; c++) casePos[k + c] += caseVel[k + c] * dt;
     caseAngle[i] += caseSpin[i] * dt;
     for (const c of [0, 2]) if (Math.abs(casePos[k + c]) > ARENA - 0.02) { // the walls
       casePos[k + c] = Math.sign(casePos[k + c]) * (ARENA - 0.02); caseVel[k + c] *= -0.4;
     }
-    const ground = floorAt(casePos[k], casePos[k + 2]) + 0.008; // lying: its radius
-    if (casePos[k + 1] < ground) {
+    const ground = floorAt(casePos[k], casePos[k + 2], y0) + 0.008; // lying: its radius
+    if (casePos[k + 1] < ground && caseVel[k + 1] <= 0) { // (not going up: up into a high step from under it, it isn't on it)
       casePos[k + 1] = ground;
       if (!caseLanded[i]) { // its first landing: the clink (the sound has its own little bounces after)
         caseLanded[i] = 1;
@@ -4504,7 +4737,11 @@ function firePellets() {
 }
 function shotMissed(o, dir) { // it hits the arena
   const w = rayWorld(o, dir);
-  if (w) spawnHole(_v.copy(o).addScaledVector(dir, w.t), w.normal);
+  if (!w) return;
+  const at = _v.copy(o).addScaledVector(dir, w.t);
+  if (w.normal.y < -0.5 && BOXES.some((b) => Math.abs(at.y - (b.h - STAIR_TREAD)) < 1e-4 && inStairBox(b, at.x, at.z, 1e-4))) at.y += STAIR_TREAD; // (a
+  // tread's underside, or the balcony's: drawn at its grating, the top seen from under it; else the hole hung under it)
+  spawnHole(at, w.normal);
 }
 // How far along the shot it first meets a column (their octagons, as circles round them), or Infinity
 function rayColumns(o, dir) {
@@ -4690,9 +4927,14 @@ const DEMON_DEATHS = 4; // sounds/demon_death_0..3.wav: the four calls in dragon
 // at its silences, mono, trimmed, faded, and peak-normalized like the others); sounds/zombie_death.wav, its death, from
 // "zombie dying" (one, whole: its gasps and last rattle, trimmed and levelled the same)
 const ZOMBIE_SOUNDS = 18, zombieSound = (k) => `zombie_${String(k).padStart(2, '0')}`;
+// sounds/portal_spark_00..25.wav: the portals' lightning crackling (see Portals), the bursts of freesound "electric
+// sparks" (split at its quiet gaps, levelled like the others); sounds/portal_whoosh.wav, one coming through: dragon-studio
+// "sci-fi portal jump" (cut where it dies away, 1.55 s in, faded: the rest was near silence)
+const PORTAL_ZAPS = 26, portalZap = (k) => `portal_spark_${String(k).padStart(2, '0')}`;
 for (const name of ['rifle_shot', 'shotgun_blast', 'punch', 'shell_drop', 'reload', 'demon_shot', ...Array.from({ length: DEMON_GRUNTS }, (_, k) => `demon_grunt_${k}`),
   ...(ENEMIES.includes('zombie') ? [...Array.from({ length: ZOMBIE_SOUNDS }, (_, k) => zombieSound(k)), 'zombie_death'] : []),
   ...Array.from({ length: DEMON_DEATHS }, (_, k) => `demon_death_${k}`),
+  ...Array.from({ length: PORTAL_ZAPS }, (_, k) => portalZap(k)), 'portal_whoosh',
   ...Array.from({ length: GRUNTS }, (_, k) => `hurt_grunt_${k}`),
   ...Array.from({ length: FOOTSTEPS }, (_, k) => `footstep_${k}`)])
   fetch(`sounds/${name}.wav`).then((r) => r.arrayBuffer()).then((b) => audio.decodeAudioData(b)).then((b) => (sounds[name] = b));
@@ -4846,6 +5088,10 @@ function updateGun(dt, now) {
     gunStrips[i].position.copy(s.world.position).applyMatrix4(_toGun);
     gunStrips[i].intensity = s.world.intensity;
   });
+  portalLights.forEach((p, i) => {
+    gunPortals[i].position.copy(p.world.position).applyMatrix4(_toGun);
+    gunPortals[i].intensity = p.world.intensity;
+  });
   _toGun.decompose(_tgp, _tgq, _gs);
   ceilLights.forEach((c, i) => { // area lights have a facing too
     gunCeil[i].position.copy(c.world.position).applyMatrix4(_toGun);
@@ -4923,7 +5169,7 @@ function demonShot(npc, damage = DEMON_DAMAGE) {
   muzzleFlash(from);
   // its gun (sounds/demon_shot.wav: freesound "submachine gun", one shot and its tail), quieter the further off
   demonVoice(npc, 'demon_shot', 0.9);
-  if (npc.police) policeHear(from, npc.seenAt.x, npc.seenAt.y, clock.elapsedTime); // (the others too: at where it thinks you are)
+  if (npc.police) policeHear(from, npc.seenAt.x, npc.seenAt.y, clock.elapsedTime, npc.seenOn); // (the others too: at where it thinks you are)
   _shotDir.subVectors(camera.position, from);
   const dist = _shotDir.length();
   _shotDir.divideScalar(dist);
@@ -4940,6 +5186,11 @@ const HUD_SPECKS = 12, HUD_ARCS = 4, SPECK_LIFE = 1.6, ARC_LIFE = 1.1; // s
 // The vignette: darkening from VIGNETTE[0] out from the middle to full at VIGNETTE[1] (1: the middle of an edge; ~1.41:
 // a corner), up to VIGNETTE_STRENGTH dark
 const VIGNETTE = [0.45, 1.45], VIGNETTE_STRENGTH = 0.6;
+// And a red one, thickening as your health goes: by p(1 − h), h your health (0..1 of PLAYER_HEALTH), p the polynomial
+// HURT_VIGNETTE (its coefficients, the constant first: x², so it's next to nothing till you're well down, then comes on
+// fast). At p = 0, none; at 1, red from HURT_VIGNETTE_IN out from the middle, to HURT_VIGNETTE_MAX at the edges
+const HURT_VIGNETTE = [0, 0, 1], HURT_VIGNETTE_IN = 0.35, HURT_VIGNETTE_MAX = 0.9;
+const poly = (c, x) => c.reduceRight((s, k) => s * x + k, 0); // c[0] + c[1] x + c[2] x² + …
 // A speck: a scatter of SPECK_DROPS droplets, SPECK_DROP_MIN..MAX in radius (screen heights; the big ones fewer and
 // nearer the middle). They're on the lens, too near to focus on, so they're drawn as a camera would see them: sharp
 // first (lensDrops: little domes, lit, what's behind showing through them, and a tiny, very bright glint where each
@@ -4957,11 +5208,12 @@ const hudFx = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMate
     uSpecks: { value: Array.from({ length: HUD_SPECKS }, () => new THREE.Vector4(0, 0, 0, -1e3)) }, // x, y (0..1), size, birth
     uArcs: { value: Array.from({ length: HUD_ARCS }, () => new THREE.Vector2(0, -1e3)) },             // angle, birth
     uLens: { value: null }, // the blurred drops (lensBlur), or null: none
+    uLow: { value: 0 }, // how low your health is, through HURT_VIGNETTE (0..1)
   },
   vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
   fragmentShader: `
     uniform vec2 uRes;
-    uniform float uTime;
+    uniform float uTime, uLow;
     uniform vec2 uArcs[${HUD_ARCS}];
     uniform sampler2D uLens;
     uniform bool uLensOn;
@@ -4991,8 +5243,16 @@ const hudFx = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMate
         float a = max(arc, smoothstep(-0.022, 0.012, d)) * (1.0 - smoothstep(0.0, ${ARC_LIFE.toFixed(2)}, age)) * 0.85;
         if (a > col.a) col = vec4(vec3(0.85, 0.05, 0.04) * a, a);
       }
-      // the vignette: the lens darker toward the edges and corners, under the rest (black, premultiplied)
+      // the hurt: red in from the edges, thicker and redder the lower your health (see HURT_VIGNETTE), under the rest
       vec2 vo = (gl_FragCoord.xy / uRes - 0.5) * 2.0; // −1…1 across and up
+      if (uLow > 0.0) {
+        float r0 = mix(${VIGNETTE[1].toFixed(2)}, ${HURT_VIGNETTE_IN.toFixed(2)}, uLow); // where it starts, out from the middle
+        float red = smoothstep(r0, r0 + 0.55, length(vo)) * mix(0.35, ${HURT_VIGNETTE_MAX.toFixed(2)}, uLow);
+        col.rgb += vec3(0.5, 0.02, 0.01) * red * (1.0 - col.a);
+        col.a += red * (1.0 - col.a);
+      }
+      // the vignette: the lens darker toward the edges and corners, under the rest (black, premultiplied: the red's
+      // corners darker still)
       float vig = smoothstep(${VIGNETTE[0].toFixed(2)}, ${VIGNETTE[1].toFixed(2)}, length(vo)) * ${VIGNETTE_STRENGTH.toFixed(2)};
       col.a += vig * (1.0 - col.a);
       if (col.a <= 0.0 && dot(col.rgb, vec3(1.0)) <= 0.0) discard;
@@ -5355,7 +5615,8 @@ function updateCorpses(dt) {
     else if (!c.imp.still && !c.death.isRunning()) { // (down: a carcass from now, see Gibs; counted from its death, a demon
       // burst a moment after it, as it fell: as if it, not its carcass, had)
       c.imp.still = true; c.carcass = 0;
-      const p = c.imp.model.position, under = floorAt(p.x + c.imp.fit.x, p.z + c.imp.fit.z); // (fallen out over an edge: its
+      const p = c.imp.model.position, edge = ARENA - 0.01, under = floorAt(THREE.MathUtils.clamp(p.x + c.imp.fit.x, -edge, edge),
+        THREE.MathUtils.clamp(p.z + c.imp.fit.z, -edge, edge), p.y + 1); // (fallen out over an edge: its
       if (under < p.y) { p.y = under; c.imp.lastKey = undefined; } // middle's what it lies on, not where its feet were)
     }
   }
@@ -5368,8 +5629,7 @@ function addNpcs(n) {
   for (let i = 0; i < n; i++) {
     const name = ENEMIES[dealt++ % ENEMIES.length], kind = KINDS[name], police = name === 'police', { gltf, rig } = kind;
     const model = cloneSkinned(gltf.scene);
-    do model.position.set((Math.random() - 0.5) * 2 * (ARENA - 2), 0, (Math.random() - 0.5) * 2 * (ARENA - 2));
-    while (model.position.distanceTo(camera.position) < NPC_SPAWN_GAP); // (not on top of you)
+    portalSpot(model.position, NPC_SPAWN_GAP); // (not on top of you, nor in anything)
     if (police) model.rotation.y = Math.random() * 2 * Math.PI; // (facing all ways: what they see, see policeLook)
     model.traverse((o) => { if (o.isMesh) o.castShadow = false; }); // blob/sprite shadows in both modes, so V compares fairly
     const bloodRT = new THREE.WebGLRenderTarget(WOUND_RES, WOUND_RES); // its wounds (see paintWound)
@@ -5400,11 +5660,29 @@ function addNpcs(n) {
       health: DEMON_HEALTH, dead: false, death, // see damageNpc
     };
     if (npc.demon) imp.mixer.addEventListener('loop', (e) => { if (e.action === fire && !npc.dead) demonShot(npc); }); // each shot
-    npcs.push(npc);
+    // in through a portal (see Portals): unseen till then, but posed now, its programs built (see prewarm); one of them
+    // (moving, fighting, to be shot) once it's built up
+    imp.visible = false;
+    imp.update(renderer, camera, 0);
+    prewarm(imp);
+    openPortal(model.position.x, model.position.z, model.position.y + imp.fit.y, () => {
+      npc.standUntil = clock.elapsedTime + Math.random() * POLICE_STAND[1]; // (an officer stands about first: from now)
+      npcs.push(npc);
+    }, npc, imp);
   }
 }
-function removeNpcs(n) {
-  for (const { imp, bloodRT, mesh } of npcs.splice(-n)) { imp.dispose(); bloodRT.dispose(); mesh.material.dispose(); }
+function removeNpcs(n) { // the newest first, those still coming in first of all (called off: their portals go)
+  const dispose = ({ imp, bloodRT, mesh }) => { imp.dispose(); bloodRT.dispose(); mesh.material.dispose(); };
+  for (const p of portals.filter((p) => p.npc && p.arrive).slice(-n)) { p.arrive = null; p.t = Infinity; dispose(p.npc); n--; }
+  if (n > 0) for (const npc of npcs.splice(-n)) dispose(npc); // (n > 0: splice(-0) takes them all)
+}
+// Its programs built now, hidden or out of view (compile goes through both; drawing it skipped what you couldn't see),
+// into targets like those it's drawn into (their keys: no tone mapping, linear), so not as it comes in, mid-play
+function prewarm(imp) {
+  const was = renderer.getRenderTarget();
+  renderer.setRenderTarget(imp.rt); renderer.compile(imp.model, imp.cam, opts.stage); // its sprite
+  renderer.setRenderTarget(composer.renderTarget1); renderer.compile(imp, camera, scene); // its card
+  renderer.setRenderTarget(was);
 }
 const nextVolley = () => 3 + Math.random() * 5; // seconds of walking between volleys
 
@@ -5436,8 +5714,10 @@ Promise.all([
   setupGun(m4, { pistol: pistol.scene, shotgun: shotgun.scene });
   // ?n=100 spawns 100 enemies (default 8, dealt out between the kinds), ?skulls=n that many skulls (default SKULLS), ?real starts in real-3D mode
   const params = new URLSearchParams(location.search);
-  addNpcs(params.has('n') ? Number(params.get('n')) : 8);
-  addSkulls(skull, params.has('skulls') ? Number(params.get('skulls')) : SKULLS);
+  firstClick.then(() => { // (not till you first click to play: else they were on you while the page sat waiting)
+    addNpcs(params.has('n') ? Number(params.get('n')) : 8);
+    addSkulls(skull, params.has('skulls') ? Number(params.get('skulls')) : SKULLS);
+  });
   opts.real = params.has('real');
 });
 
@@ -5576,7 +5856,7 @@ const SHUDDER = 0.03, SHUDDER_RATE = 45; // m, rad/s
 // and stays where it fell, lying there for good, drawn only from the front from then on. A body still bleeds and takes wounds when shot, but nothing else.
 const DEMON_HEALTH = 12;
 // A demon's voice: as it walks, a grunt every DEMON_GRUNT_EVERY s or so (at random within it), quieter the further
-// off; each demon pitched a little differently, so the pack doesn't all sound alike
+// off; each demon pitched a little differently, so the pack doesn't all sound alike. Returns the sound (to stop it)
 const DEMON_GRUNT_EVERY = [3, 8]; // s
 function demonVoice(npc, name, level, pitch = 1) {
   npc.voice ??= 0.88 + Math.random() * 0.24;
@@ -5588,6 +5868,9 @@ function demonVoice(npc, name, level, pitch = 1) {
   gain.gain.value = level / (1 + d * 0.12);
   src.connect(gain).connect(shotOut);
   src.start();
+  if (name !== 'demon_shot' && name !== 'punch') { (npc.voices ??= new Set()).add(src); src.onended = () => npc.voices.delete(src); } // (its
+  // voice, playing: see cutBody)
+  return src;
 }
 function damageNpc(npc, dir) {
   if (npc.dead) return;
@@ -5596,8 +5879,8 @@ function damageNpc(npc, dir) {
     return staggerNpc(npc, dir);
   }
   npc.dead = true;
-  if (npc.zombie) demonVoice(npc, 'zombie_death', 1.2); // its death cry (a zombie's: quieter, made up for)
-  else demonVoice(npc, `demon_death_${(Math.random() * DEMON_DEATHS) | 0}`, 1.0); // (one of the calls)
+  if (npc.zombie) demonVoice(npc, 'zombie_death', 1.2); // its death cry (a zombie's: quieter, made up for; its top blown
+  else demonVoice(npc, `demon_death_${(Math.random() * DEMON_DEATHS) | 0}`, 1.0); // off, cut short: see cutBody)
   npc.stagger = 0;
   // a demon turns to face you as it dies (it falls back); a zombie or an officer falls forward whichever way it's facing,
   // as Mixamo's Zombie Dying does (turned away, it spun round as it died). From then on it's only drawn from one side:
@@ -5607,7 +5890,7 @@ function damageNpc(npc, dir) {
   _v.set(0, 0, 1).applyQuaternion(m.quaternion);
   npc.imp.frontOnly = true;
   npc.imp.frontAz = toYou - Math.atan2(_v.x, _v.z); // (round from its front: see SpriteImpostor)
-  if (npc.fall) m.position.y = floorAt(m.position.x, m.position.z); // (killed as it dropped off an edge: down there, not hung in the air)
+  if (npc.fall) m.position.y = floorAt(m.position.x, m.position.z, m.position.y); // (killed as it dropped off an edge: down there, not hung in the air)
   npc.firing = false;
   npc.walk.fadeOut(0.15);
   npc.fire.fadeOut(0.15);
@@ -5619,7 +5902,7 @@ function damageNpc(npc, dir) {
   const k = npcs.indexOf(npc); // its body goes on as a corpse; the enemy goes
   if (k >= 0) npcs.splice(k, 1);
   const now = clock.elapsedTime, leak = Math.exp(-(now - (npc.hurtAt ?? now)) / GIB_TAU), trauma = (npc.trauma ?? 0) * leak; // (see Gibs)
-  npc.corpse = { demon: npc.demon, imp: npc.imp, mesh: npc.mesh, dead: true, bloodRT: npc.bloodRT, death: npc.death, trauma, hurtAt: now, carcass: 0, diedAt: now, deathTrauma: trauma };
+  npc.corpse = { demon: npc.demon, imp: npc.imp, mesh: npc.mesh, dead: true, bloodRT: npc.bloodRT, death: npc.death, trauma, hurtAt: now, carcass: 0, diedAt: now, deathTrauma: trauma, voices: npc.voices };
   corpses.push(npc.corpse); // (and the enemy names it: a shot's later pellets still name the enemy)
 }
 function staggerNpc(npc, dir) {
@@ -5661,16 +5944,21 @@ const TOWER_BODY = TOWER_HALF * Math.SQRT2 + 0.5; // a tower's corner post, plus
 const AROUND = [[new THREE.Vector2(), Math.hypot(PLATFORM_APOTHEM + 3 * STAIR_RUN, STAIR_HALF) + 0.5, null],
   ...COLUMNS.map((c) => [c, COLUMN_BODY, COLUMN_APOTHEM / Math.cos(Math.PI / 8)]),
   ...TOWERS.map((c) => [c, TOWER_BODY, TOWER_HALF * Math.SQRT2])];
-let youUp = false; // you're up on the platform or the stairs, above their bottom step (see the floor, in the main loop)
-// How far (x, z) is from the platform or its stairs, across the floor (0: on them)
+// How far (x, z) is from the platform or its stairs; from the balcony or its; across the floor (0: on them, or under)
+const boxGap = (b, x, z) => {
+  const [e, a] = stairLocal(b, x, z);
+  return Math.hypot(e - THREE.MathUtils.clamp(e, b.e0, b.e1), a - THREE.MathUtils.clamp(a, -b.half, b.half));
+};
 function platformGap(x, z) {
   let g = Math.max(platformDist(x, z) - PLATFORM_APOTHEM, 0);
-  for (const k of STAIR_SIDES) {
-    const b = STAIR_BOXES.find((s) => s.n === PLATFORM_FACES[k] && s.e0 === 0), [e, a] = stairLocal(b, x, z);
-    g = Math.min(g, Math.hypot(e - THREE.MathUtils.clamp(e, 0, 3 * STAIR_RUN), a - THREE.MathUtils.clamp(a, -STAIR_HALF, STAIR_HALF)));
-  }
+  for (const f of FLIGHTS) g = Math.min(g, boxGap(f, x, z));
   return g;
 }
+const balconyGap = (x, z) => DECKS.reduce((g, b) => Math.min(g, boxGap(b, x, z)), boxGap(BALCONY_FLIGHT, x, z));
+// The raised places, to the enemies: { flights up to it, gap: how far from it (see above), y: its top }; and the one
+// you're up on (above its stairs' bottom step: see the floor, in the main loop), or null
+const PLATFORM = { flights: FLIGHTS, gap: platformGap, y: PLATFORM_H }, BALCONY = { flights: [BALCONY_FLIGHT], gap: balconyGap, y: BALCONY_Y };
+let youOn = null;
 const _zo = new THREE.Vector3(), _zd = new THREE.Vector3();
 // Is your aim on this demon? (its body within AI_AIM_MARGIN of your line of fire); if so, which side of it it's on
 function aimedAt(p, centreY) {
@@ -5691,7 +5979,7 @@ function thinkDemon(npc, dt, out) {
   _ai.divideScalar(dist); // towards you
   let pace = 1;
   if (npc.zombie) { // a zombie: straight at you (no circling, no dodging, no backing off), past anything big in the way
-    wayTo(npc, p, camera.position.x, camera.position.z, youUp, out);
+    wayTo(npc, p, camera.position.x, camera.position.z, youOn, out);
   } else {
     const tx = -_ai.z * npc.orbitDir, tz = _ai.x * npc.orbitDir; // round you
     const side = aimedAt(p, p.y + npc.imp.fit.y);
@@ -5704,9 +5992,10 @@ function thinkDemon(npc, dt, out) {
       }
     }
     // closing in till it's within orbitR + 0.5, and again once it's out past orbitR + 3 (at the one line, orbitR + 1, it
-    // flicked between the two as it circled; the police fire only in among it, not closing); or, you up on the platform,
-    // till it's at its edge, as near as it gets (else it circled there, closing in, for good, and never fired)
-    npc.closing = dist > npc.orbitR + (npc.closing ? 0.5 : 3) && !(youUp && platformGap(p.x, p.z) < 0.5 + AI_AVOID + 0.2);
+    // flicked between the two as it circled; the police fire only in among it, not closing); or, you up on the platform
+    // (or the balcony), till it's at its edge, as near as it gets (else it circled there, closing in, for good, and
+    // never fired)
+    npc.closing = dist > npc.orbitR + (npc.closing ? 0.5 : 3) && !(youOn && youOn.gap(p.x, p.z) < 0.5 + AI_AVOID + 0.2);
     if (npc.dodge > 0) { // break sideways off your line of fire (perpendicular to it, the side it's on), a little forward
       camera.getWorldDirection(_aim).setY(0).normalize();
       out.set(-_aim.z * npc.dodgeSide * -1, 0, _aim.x * npc.dodgeSide * -1).addScaledVector(_ai, 0.2);
@@ -5732,7 +6021,7 @@ function thinkDemon(npc, dt, out) {
   // (a zombie closing on you feels obstacles less and less: backed up to a wall or a column, you were held just out of
   // its reach; the hard collisions still keep it out of them. Not on its way round to the stairs, up to you: near you
   // across the floor, it's a long way off)
-  steerClear(npc, out, npc.zombie && !(youUp && !onTop(p)) ? THREE.MathUtils.clamp((dist - ZOMBIE_REACH) / AI_AVOID, 0, 1) : 1);
+  steerClear(npc, out, npc.zombie && !(youOn && !onTop(p, youOn)) ? THREE.MathUtils.clamp((dist - ZOMBIE_REACH) / AI_AVOID, 0, 1) : 1);
   return pace;
 }
 // out (a way to go, XZ), pushed off what's near: obstacles, as it nears them, and nudged round them the way it's going;
@@ -5745,71 +6034,162 @@ function steerClear(npc, out, near) {
     const k = (1 - gap / AI_AVOID) * 2.5 * near, round = out.x * -nz + out.z * nx >= 0 ? 1 : -1;
     out.x += (nx + -nz * round) * k; out.z += (nz + nx * round) * k;
   };
-  for (const [c, r] of [...COLUMNS.map((c) => [c, COLUMN_BODY]), ...TOWERS.map((c) => [c, TOWER_BODY])]) {
+  const high = p.y > BALCONY_Y - 0.5; // (up on the balcony: the columns and towers aren't in its way; and the others aren't
+  // felt, a bridge's only a cell wide: they pushed each other off it, and off the towers' bridges by the towers)
+  if (!high) for (const [c, r] of [...COLUMNS.map((c) => [c, COLUMN_BODY]), ...TOWERS.map((c) => [c, TOWER_BODY])]) {
     _obs.set(p.x - c.x, 0, p.z - c.y);
     const d = Math.max(_obs.length(), 1e-3);
     avoid(_obs.x / d, _obs.z / d, d - r);
   }
-  if (!npc.climb && p.y < 0.01) { // the platform and its stairs: in the way of one on the floor, not on its way up them
+  if (!npc.climb && p.y < 0.01) { // the platform and the stairs: in the way of one on the floor, not on its way up them
     const pd = platformDist(p.x, p.z);
     avoid(_pf.x, _pf.y, pd - PLATFORM_APOTHEM - 0.5);
-    for (const b of FLIGHTS) { // each flight: away from its nearest point
-      const [e, a] = stairLocal(b, p.x, p.z);
-      const de = e - THREE.MathUtils.clamp(e, 0, 3 * STAIR_RUN), da = a - THREE.MathUtils.clamp(a, -STAIR_HALF, STAIR_HALF);
+    for (const f of ALL_FLIGHTS) { // each flight: away from its nearest point (of the steps it can't walk under: under
+      // the balcony's high ones, you were out of reach), or inside them, out its open side (−t: the balcony's)
+      const [e, a] = stairLocal(f, p.x, p.z), top = f.steps.find((b) => b.y0 < p.y + BODY_H).e0;
+      const de = e - THREE.MathUtils.clamp(e, top, f.run), da = a - THREE.MathUtils.clamp(a, -f.half, f.half);
       const d = Math.hypot(de, da);
-      if (d > 1e-3) avoid((b.n.x * de + b.t.x * da) / d, (b.n.y * de + b.t.y * da) / d, d - 0.5);
+      if (d > 1e-3) avoid((f.n.x * de + f.t.x * da) / d, (f.n.y * de + f.t.y * da) / d, d - 0.5);
+      else avoid(-f.t.x, -f.t.y, 0);
     }
   }
   for (const o of npcs) { // each other: pushed apart, harder the closer (not on its way up a flight: in single file up it,
-    // else they held each other back at its foot, or pushed each other off its sides; they never overlap: see pushApart)
-    if (o === npc || npc.climb) continue;
+    // else they held each other back at its foot, or pushed each other off its sides; they never overlap: see pushApart;
+    // nor one up on the balcony and one under it)
+    if (o === npc || npc.climb || high) continue;
     const q = o.imp.model.position, dx = p.x - q.x, dz = p.z - q.z, d = Math.hypot(dx, dz);
     const spacing = npc.zombie ? ZOMBIE_SPACING : AI_SPACING;
-    if (d >= spacing || d < 1e-4) continue;
+    if (d >= spacing || d < 1e-4 || Math.abs(p.y - q.y) > 1) continue;
     const k = (1 - d / spacing) * 2;
     out.x += dx / d * k; out.z += dz / d * k;
   }
-  for (const [nx, nz, gap] of [[-1, 0, ARENA - p.x], [1, 0, ARENA + p.x], [0, -1, ARENA - p.z], [0, 1, ARENA + p.z]]) avoid(nx, nz, gap - 0.6);
+  const foot = npc.stairs && npc.flight.footAt; // (the walls: not on its way up, or down, a flight, nor at its foot: the
+  // balcony's runs along one, a metre off it; else, making for it along the wall, it was held off it, or stuck under it)
+  if (!npc.climb && !(foot && Math.hypot(foot.x - p.x, foot.y - p.z) < AI_AVOID + 1)) {
+    for (const [nx, nz, gap] of [[-1, 0, ARENA - p.x], [1, 0, ARENA + p.x], [0, -1, ARENA - p.z], [0, 1, ARENA + p.z]]) avoid(nx, nz, gap - 0.6);
+  }
   out.normalize();
 }
-// The way up to (gx, gz), on the platform or its stairs, from below: to the foot of the flight that's least out of the
-// way (STAIR_FOOT m out in front of its bottom step), then straight up its middle to a metre in on the top. It keeps to
-// the flight it picked unless another's 2 m less out of the way (half way between two, it dithered). Into _way the point
-// to make for, and npc.climb: it's on its way up (in line with the flight, in front of it, or on a step of it); returns
-// how far it is, that way, to (gx, gz)
-const STAIR_FOOT = 0.8, FLIGHTS = STAIR_BOXES.filter((b) => b.e0 === 0), _way = new THREE.Vector2();
-const onTop = (p) => p.y > PLATFORM_H - 0.01; // up on the platform's top
-function stairsTo(npc, p, gx, gz) {
-  const top = PLATFORM_APOTHEM - 1, foot = PLATFORM_APOTHEM + 3 * STAIR_RUN + STAIR_FOOT, was = npc.flight;
+// The way up to (gx, gz), on a raised place (up, see PLATFORM) or its stairs, from below: to the foot of the flight
+// that's least out of the way (footAt), then straight up its middle to a metre in on the top (topAt). It keeps to the
+// flight it picked unless another's 2 m less out of the way (half way between two, it dithered). Into _way the point to
+// make for, and npc.climb: it's on its way up (in line with the flight, in front of it, or on a step of it; not under
+// it); returns how far it is, that way, to (gx, gz)
+const _way = new THREE.Vector2();
+const onTop = (p, up) => p.y > up.y - 0.01 && p.y < up.y + 1 && up.gap(p.x, p.z) < 0.5; // up on its top (not over it, on a bridge)
+function stairsTo(npc, p, gx, gz, up) {
+  const was = npc.flight;
   let best = Infinity, left = Infinity;
   npc.climb = false;
-  for (const b of FLIGHTS) {
-    const [e, a] = stairLocal(b, p.x, p.z), tx = b.n.x * top, tz = b.n.y * top, on = Math.hypot(gx - tx, gz - tz);
+  for (const f of up.flights) {
+    const [e, a] = stairLocal(f, p.x, p.z), on = Math.hypot(gx - f.topAt.x, gz - f.topAt.y);
     // in line: up it (from as far out as the flight's felt, see steerClear: else, head on, its push and the pull on
-    // cancelled out short of it, on the spot)
-    if (e > -0.5 && e < 3 * STAIR_RUN + 0.5 + AI_AVOID && Math.abs(a) < STAIR_HALF + (p.y > 0.01 ? 0.2 : -0.1)) {
-      npc.climb = true; npc.flight = b;
-      const [ge, ga] = stairLocal(b, gx, gz); // (there on this flight too: straight to it; else, coming down to you on
+    // cancelled out short of it, on the spot); not down under its high steps, or its top
+    if (e > -0.5 && e < f.run + 0.5 + AI_AVOID && Math.abs(a) < f.half + (p.y > 0.01 ? 0.2 : -0.1)
+      && p.y + 1 > f.top - Math.max(e, 0) * STAIR_SLOPE) {
+      npc.climb = true; npc.flight = f;
+      const [ge, ga] = stairLocal(f, gx, gz); // (there on this flight too: straight to it; else, coming down to you on
       // it from the top, it was turned back up each time it stepped down, and bobbed at the top step)
-      if (ge > -0.4 && ge < 3 * STAIR_RUN + 0.4 && Math.abs(ga) < STAIR_HALF + 0.4) { _way.set(gx, gz); return Math.hypot(gx - p.x, gz - p.z); }
-      _way.set(tx, tz);
-      return Math.hypot(tx - p.x, tz - p.z) + on;
+      if (ge > -0.4 && ge < f.run + 0.4 && Math.abs(ga) < f.half + 0.4) { _way.set(gx, gz); return Math.hypot(gx - p.x, gz - p.z); }
+      _way.copy(f.topAt);
+      return Math.hypot(f.topAt.x - p.x, f.topAt.y - p.z) + on;
     }
-    const fx = b.n.x * foot, fz = b.n.y * foot, way = Math.hypot(fx - p.x, fz - p.z) + foot - top + on;
-    if (way - (b === was ? 2 : 0) < best) { best = way - (b === was ? 2 : 0); left = way; npc.flight = b; _way.set(fx, fz); }
+    const way = Math.hypot(f.footAt.x - p.x, f.footAt.y - p.z) + f.run + STAIR_FOOT + 1 + on;
+    if (way - (f === was ? 2 : 0) < best) { best = way - (f === was ? 2 : 0); left = way; npc.flight = f; _way.copy(f.footAt); }
   }
   return left;
+}
+// Up on the balcony, the way over it to (gx, gz), up on it too, into _way: straight there, if that's over its floor all
+// the way (a little in from its edges, to set off that way; once going straight there, less: else, a little off a
+// bridge's middle, it turned back for the waypoint it had just left); else to the next of its waypoints (DECK_NODES)
+// on the shortest way there by them (round it, or over a bridge: not across, that's a drop), from the one it's at, if
+// it's at one. That's looked for again every BALCONY_REROUTE s, and on getting to one (npc.deckTo, npc.deckAt).
+const BALCONY_RING = ARENA - BALCONY_D / 2, BALCONY_REROUTE = 0.3; // m: its walkway's middle, out from the room's; s
+function deckClear(ax, az, bx, bz, m = 0.6) { // over the balcony's floor all the way from (ax, az) to (bx, bz), m in from
+  // its edges? (a metre at either end: just on it)
+  const len = Math.hypot(bx - ax, bz - az), n = Math.ceil(len / 0.5);
+  for (let i = 0; i <= n; i++) {
+    const u = n ? i / n : 0, x = ax + (bx - ax) * u, z = az + (bz - az) * u;
+    if (!overDeck(x, z)) return false;
+    if (m && Math.min(u, 1 - u) * len > 1 && !(overDeck(x + m, z) && overDeck(x - m, z) && overDeck(x, z + m) && overDeck(x, z - m))) return false;
+  }
+  return true;
+}
+const BRIDGE_MID = (BALCONY_BRIDGE[0] + BALCONY_BRIDGE[1]) / 2; // m: the bridges' middle lines (x = this; z = −this)
+const DECK_NODES = [new THREE.Vector2(BALCONY_FLIGHT.topAt.x, -BALCONY_RING), // (by the stairs' top, and the stairwell)
+  new THREE.Vector2(BRIDGE_MID, -BRIDGE_MID)]; // (where the bridges cross)
+for (const s of [-1, 1]) DECK_NODES.push(new THREE.Vector2(s * BALCONY_RING, -BALCONY_RING), new THREE.Vector2(s * BALCONY_RING, BALCONY_RING), // its corners,
+  new THREE.Vector2(BRIDGE_MID, s * BALCONY_RING), new THREE.Vector2(s * BALCONY_RING, -BRIDGE_MID)); // where the bridges meet it
+const DECK_LINKS = DECK_NODES.map((a) => DECK_NODES.map((b) => (a !== b && deckClear(a.x, a.y, b.x, b.y) ? a.distanceTo(b) : Infinity)));
+// (x, z) if it's over the balcony's floor, else the nearest spot that is (a little in), into out: what deckWay goes
+// from and to (on its stairs' top step, or at its rail, feet on it and middle off it, there was no way from there, or to)
+function snapDeck(x, z, out) {
+  if (overDeck(x, z)) return out.set(x, z);
+  let b = DECKS[0], g = Infinity;
+  for (const d of DECKS) { const k = boxGap(d, x, z); if (k < g) { g = k; b = d; } }
+  const [e, a] = stairLocal(b, x, z), m = 0.05;
+  const ee = THREE.MathUtils.clamp(e, b.e0 + m, b.e1 - m) + b.o, aa = THREE.MathUtils.clamp(a, m - b.half, b.half - m) + b.c;
+  return out.set(b.n.x * ee + b.t.x * aa, b.n.y * ee + b.t.y * aa);
+}
+const _deckP = new THREE.Vector2(), _deckG = new THREE.Vector2();
+function deckWay(npc, p, gx, gz) {
+  const P = snapDeck(p.x, p.z, _deckP), G = snapDeck(gx, gz, _deckG);
+  _way.copy(G);
+  if ((npc.deckStraight = deckClear(P.x, P.y, G.x, G.y, npc.deckStraight ? 0.2 : 0.6))) return;
+  const now = clock.elapsedTime, to = npc.deckTo;
+  if (to && now < npc.deckAt && Math.hypot(to.x - p.x, to.y - p.z) > 1) { _way.copy(to); return; }
+  const n = DECK_NODES.length, done = [], first = DECK_NODES.map((_, i) => i); // first: each one's first waypoint, on the way to it
+  const at = DECK_NODES.findIndex((q) => Math.hypot(q.x - P.x, q.y - P.y) < 0.5); // (the one it's at: well in, else it
+  // set off from a metre short of a bridge's end, along its very edge)
+  const dist = DECK_NODES.map((q, i) => (at >= 0 ? (i === at ? 0 : Infinity)
+    : deckClear(P.x, P.y, q.x, q.y) ? Math.hypot(q.x - P.x, q.y - P.y) : Infinity));
+  for (let k = 0; k < n; k++) { // (Dijkstra's: the nearest one not done yet, and on from it)
+    let i = -1;
+    for (let j = 0; j < n; j++) if (!done[j] && (i < 0 || dist[j] < dist[i])) i = j;
+    if (dist[i] === Infinity) break;
+    done[i] = true;
+    for (let j = 0; j < n; j++) if (dist[i] + DECK_LINKS[i][j] < dist[j]) { dist[j] = dist[i] + DECK_LINKS[i][j]; first[j] = i === at ? j : first[i]; }
+  }
+  let best = Infinity;
+  DECK_NODES.forEach((q, i) => { // (its last leg a little in from the edges: off a bridge's middle, there was none)
+    const d = dist[i] + Math.hypot(G.x - q.x, G.y - q.y);
+    if (d < best && deckClear(q.x, q.y, G.x, G.y, 0.3)) { best = d; if (i === at) _way.copy(G); else _way.copy(DECK_NODES[first[i]]); }
+  });
+  if (best === Infinity) DECK_NODES.forEach((q, i) => { // none to it: as near as they go (not straight there, across a drop)
+    const d = dist[i] + Math.hypot(G.x - q.x, G.y - q.y);
+    if (i !== at && d < best) { best = d; _way.copy(DECK_NODES[first[i]]); }
+  });
+  npc.deckStraight = best < Infinity && _way.equals(G); // (on from the one it's at, straight there)
+  (npc.deckTo ??= new THREE.Vector2()).copy(_way); npc.deckAt = now + BALCONY_REROUTE;
+}
+// The nearest spot off the balcony's floor to (x, z) under it (a metre on from its edge, inside the walls), into _way
+function offDeck(x, z) {
+  _way.set(x, z);
+  for (let r = 1; r < 2 * BALCONY_D; r++) for (let k = 0; k < 8; k++) {
+    const sx = Math.sin(k * Math.PI / 4), sz = Math.cos(k * Math.PI / 4), qx = x + sx * r, qz = z + sz * r;
+    if (Math.abs(qx) < ARENA - 1.5 && Math.abs(qz) < ARENA - 1.5 && !overDeck(qx, qz)) { _way.set(qx + sx, qz + sz); return; }
+  }
 }
 // The way for npc, from p to (gx, gz), into out (unit, XZ): straight there, or past anything big in the way (see
 // AROUND), along the line that just clears whichever of its edges is more on the way (pushing straight at it, the
 // obstacle's push and the pull on cancelled out: a zombie stood there running on the spot); right by it, that's round
 // its edge. That edge it keeps to till it's been clear of it a moment, or the way on's turned back from it (head on, it
 // picked one, then the other, frame by frame: on the spot again; kept when it had turned round, it went back and forth,
-// the obstacle in its way one frame and not the next). up: (gx, gz) is up on the platform or its stairs: from below, it
-// goes by the stairs (see stairsTo), and once it's on its way up them they're where it's going, not in the way
+// the obstacle in its way one frame and not the next). up: the raised place (gx, gz) is up on (see PLATFORM), if it is:
+// from below, it goes by its stairs (see stairsTo; npc.stairs), and once it's on its way up them they're where it's
+// going, not in the way; up on the balcony, over it (see deckWay). null: (gx, gz) is down on the floor (off the
+// balcony: down its stairs, if it's on them, boxed in by its floor; to under it, off its edge, the nearest bit to it:
+// see offDeck); false: it's only a way to go. (Down its stairs only from above where it can just step off them, the
+// platform's height: lower, it was sent back to their foot from each low step it walked onto, for good; and not as it
+// drops into the stairwell (more than a step), else it was turned back onto the floor it fell from. Off its edge even as it drops off it:
+// a moment into its fall, it had turned back for you, and was lifted back up.)
 function wayTo(npc, p, gx, gz, up, out) {
-  npc.climb = false;
-  if (up && !onTop(p)) { stairsTo(npc, p, gx, gz); gx = _way.x; gz = _way.y; up = npc.climb; }
+  npc.climb = npc.stairs = false;
+  if (up !== BALCONY && up !== false && p.y > PLATFORM_H + 0.01 && p.y - floorAt(p.x, p.z, p.y) < PLATFORM_STEP && boxGap(BALCONY_FLIGHT, p.x, p.z) < 0.5 && !onTop(p, BALCONY)) {
+    gx = BALCONY_FLIGHT.footAt.x; gz = BALCONY_FLIGHT.footAt.y; up = false; npc.climb = npc.stairs = true; npc.flight = BALCONY_FLIGHT;
+  } else if (up && !onTop(p, up)) { stairsTo(npc, p, gx, gz, up); gx = _way.x; gz = _way.y; up = npc.climb; npc.stairs = true; }
+  else if (up === BALCONY) { deckWay(npc, p, gx, gz); gx = _way.x; gz = _way.y; }
+  else if (up === null && p.y > BALCONY_Y - 1 && overDeck(gx, gz)) { offDeck(gx, gz); gx = _way.x; gz = _way.y; }
   const ex = gx - p.x, ez = gz - p.z, len = Math.max(Math.hypot(ex, ez), 1e-3);
   out.set(ex / len, 0, ez / len);
   let nearest = Infinity, round = null;
@@ -5870,9 +6250,10 @@ function policeLook(npc, now) {
   }
   if (!npc.sees && npc.alert && now - npc.seenTime > POLICE_FORGET) { npc.alert = false; npc.strolling = false; npc.standUntil = now + between(POLICE_STAND); }
 }
-function policeAlert(npc, now, x = camera.position.x, z = camera.position.z) { // on to you, at (x, z): where you are now
+function policeAlert(npc, now, x = camera.position.x, z = camera.position.z, on = youOn) { // on to you, at (x, z), up on
+  // on (see PLATFORM): where you are now
   if (!npc.alert) demonVoice(npc, `demon_grunt_${(Math.random() * DEMON_GRUNTS) | 0}`, 1); // (a growl: it's on to you)
-  npc.alert = true; npc.seenTime = now; npc.seenAt.set(x, z); npc.bestGap = Infinity;
+  npc.alert = true; npc.seenTime = now; npc.seenAt.set(x, z); npc.seenOn = on; npc.bestGap = Infinity;
 }
 // Is it getting no nearer to where it's going (gap m off) for POLICE_STALL s? (others got there first, and it was
 // pushed off them; or it's in the way of something: it ran on the spot)
@@ -5884,10 +6265,10 @@ function stalled(npc, gap, now) {
 }
 // A shot, from from (x, z: you, there, as far as they can tell): those in earshot are on to you (an officer's shot gives
 // away where it's shooting, not where you are: when it couldn't see you, they all ran straight to you)
-function policeHear(from, x, z, now) {
+function policeHear(from, x, z, now, on = youOn) {
   for (const npc of npcs) {
     const q = npc.imp.model.position;
-    if (npc.police && !npc.sees && Math.hypot(q.x - from.x, q.z - from.z) < POLICE_HEAR) policeAlert(npc, now, x, z);
+    if (npc.police && !npc.sees && Math.hypot(q.x - from.x, q.z - from.z) < POLICE_HEAR) policeAlert(npc, now, x, z, on);
   }
 }
 // Not on to you: standing about, then strolling somewhere near, and standing again; somewhere out in the open, clear of
@@ -5912,16 +6293,18 @@ function policeStroll(npc, now, out) {
   steerClear(npc, out, 1);
   return 1;
 }
-// On to you, not seeing you: to where it last saw (or heard) you (up the stairs, if that's up on the platform: how far
-// it is that way, then), and there (near enough: it may be right by a column, where it's pushed off) it waits; or as
-// near as it gets (see stalled); into out (unit, XZ) the way it's going; returns its pace (0: waiting)
+// On to you, not seeing you: to where it last saw (or heard) you (up the stairs, if that's up on the platform or the
+// balcony: how far it is that way, then), and there (near enough: it may be right by a column, where it's pushed off)
+// it waits; or as near as it gets (see stalled); into out (unit, XZ) the way it's going; returns its pace (0: waiting)
 function policeSearch(npc, now, out) {
-  const p = npc.imp.model.position, g = npc.seenAt, up = platformGap(g.x, g.y) === 0, byStairs = up && !onTop(p);
-  const gap = byStairs ? stairsTo(npc, p, g.x, g.y) : Math.hypot(g.x - p.x, g.y - p.z);
+  const p = npc.imp.model.position, g = npc.seenAt, up = npc.seenOn, byStairs = up && !onTop(p, up);
+  const down = !up && p.y > 0.01 && boxGap(BALCONY_FLIGHT, p.x, p.z) < 0.5 && !onTop(p, BALCONY); // (down the balcony's stairs)
+  const gap = byStairs ? stairsTo(npc, p, g.x, g.y, up) : Math.hypot(g.x - p.x, g.y - p.z);
   // (not stalled on its way round to the stairs: held back at their foot by the others going up first, it gave up there;
-  // and in line again, it's a fresh POLICE_STALL from there)
-  if (byStairs && !npc.climb) npc.bestGap = Infinity;
-  if (gap < 2 || (!(byStairs && !npc.climb) && stalled(npc, gap, now))) return 0;
+  // and in line again, it's a fresh POLICE_STALL from there; nor on its way down the balcony's, away from you at first.
+  // There only on your level: else it waited on the balcony, right over you)
+  if ((byStairs && !npc.climb) || down) npc.bestGap = Infinity;
+  if ((gap < 2 && Math.abs(p.y - (up ? up.y : 0)) < 1) || (!(byStairs && !npc.climb) && !down && stalled(npc, gap, now))) return 0;
   wayTo(npc, p, g.x, g.y, up, out);
   steerClear(npc, out, 1);
   return 1;
@@ -6044,17 +6427,21 @@ function addSkulls(gltf, n) {
     model.add(mesh);
     const imp = new SpriteImpostor(model, new THREE.AnimationMixer(model), opts);
     imp.r = imp.rBase = SKULL_FRAME; imp.fit.set(0, SKULL_FRAME_UP, 0); imp.below = true; // (its frame: its head and fire)
+    imp.blob.scale.setScalar(0); // (no contact shadow, up where it comes in: see updateSkull, from when it's built)
     const fire = skullFire();
     model.add(fire);
-    do model.position.set((Math.random() - 0.5) * 2 * (ARENA - 4), between(SKULL_HEIGHT), (Math.random() - 0.5) * 2 * (ARENA - 4));
-    while (model.position.distanceTo(camera.position) < 12 || AROUND.some(([c, R]) => Math.hypot(c.x - model.position.x, c.y - model.position.z) < R));
+    portalSpot(model.position, 12, between(SKULL_HEIGHT));
     scene.add(imp);
-    skulls.push({
+    const s = {
       imp, mesh, fire, glow, skull: true, dead: false, health: SKULL_HEALTH, vel: new THREE.Vector3(), aim: new THREE.Vector3(),
       state: 'cruise', stateAt: 0, attackAt: clock.elapsedTime + between(SKULL_ATTACK), left: 0, // see updateSkull
       height: between(SKULL_HEIGHT), range: between(SKULL_RANGE), angle: Math.random() * 2 * Math.PI,
       orbitDir: Math.random() < 0.5 ? -1 : 1, phase: Math.random() * 10, fade: 1, spin: 0, resting: false,
-    });
+    };
+    imp.visible = false; // (in through a portal, as the others: see addNpcs)
+    imp.update(renderer, camera, 0);
+    prewarm(imp);
+    openPortal(model.position.x, model.position.z, model.position.y + imp.fit.y, () => { s.attackAt = clock.elapsedTime + between(SKULL_ATTACK); skulls.push(s); }, null, imp);
   }
 }
 const _sk = new THREE.Vector3(), _skG = new THREE.Vector3(), _skM = new THREE.Matrix4(), _skQ = new THREE.Quaternion();
@@ -6064,22 +6451,24 @@ function skullSees(p, dist) {
   return !w || w.t > dist - 0.3;
 }
 // Moves it on (v for dt) and keeps it in the room: inside the walls, out of the columns and towers, lift m above the
-// floor (see floorAt), under the ceiling. Below the platform's top before it moved, the platform's sides are walls to
-// it (else it was lifted up onto it). Did it have to?
+// floor (see floorAt), under the ceiling (and the balcony, under it). Below the platform's top before it moved, the
+// platform's sides are walls to it (else it was lifted up onto it); so are a step's, or the balcony's floor's, level
+// with it. Did it have to?
 function keepSkullIn(p, v, dt, lift) {
-  const low = p.y < PLATFORM_H + lift - 0.01;
+  const low = p.y < PLATFORM_H + lift - 0.01, was = p.y;
   p.addScaledVector(v, dt);
   const x = p.x, y = p.y, z = p.z;
   p.x = THREE.MathUtils.clamp(p.x, -ARENA + 0.5, ARENA - 0.5); p.z = THREE.MathUtils.clamp(p.z, -ARENA + 0.5, ARENA - 0.5);
   pushOutOfColumns(p);
   if (low) pushOutOfPlatform(p, lift);
-  p.y = THREE.MathUtils.clamp(p.y, floorAt(p.x, p.z) + lift, WALL_ROWS * TILE - 0.5);
+  for (const b of BOXES) if (was > b.y0 - lift && was < b.h + lift && inStairBox(b, p.x, p.z, lift)) pushOutOfStairBox(p, b, lift);
+  p.y = THREE.MathUtils.clamp(p.y, floorAt(p.x, p.z, was) + lift, Math.min(ceilingAt(p.x, p.z, was) - lift, WALL_ROWS * TILE - 0.5));
   return p.x !== x || p.y !== y || p.z !== z;
 }
 function skullRecover(s, now) { s.state = 'recover'; s.stateAt = now; }
 function updateSkull(s, dt, now) {
   const m = s.imp.model, p = m.position, v = s.vel, you = camera.position;
-  s.imp.blob.scale.setScalar(0.4 * THREE.MathUtils.clamp(1 - (p.y - floorAt(p.x, p.z) - 0.25) / 1.5, 0, 1)); // (a contact shadow: only near the floor)
+  s.imp.blob.scale.setScalar(0.4 * THREE.MathUtils.clamp(1 - (p.y - floorAt(p.x, p.z, p.y) - 0.25) / 1.5, 0, 1)); // (a contact shadow: only near the floor)
   _sk.subVectors(you, p);
   const dist = Math.max(_sk.length(), 1e-3);
   if (s.state === 'cruise' || s.state === 'recover') { // to its place round you: its distance, its height (bobbing)
@@ -6126,7 +6515,7 @@ function updateSkull(s, dt, now) {
 // A dead skull (its corpse, c): falling, its fire going out, then lying there; at rest, its fire out, it's settled
 function fallSkull(c, dt) {
   const m = c.imp.model, p = m.position, v = c.vel;
-  c.imp.blob.scale.setScalar(0.4 * THREE.MathUtils.clamp(1 - (p.y - floorAt(p.x, p.z) - 0.25) / 1.5, 0, 1)); // (a contact shadow: only near the floor)
+  c.imp.blob.scale.setScalar(0.4 * THREE.MathUtils.clamp(1 - (p.y - floorAt(p.x, p.z, p.y) - 0.25) / 1.5, 0, 1)); // (a contact shadow: only near the floor)
   c.fade = Math.max(c.fade - dt / 0.6, 0);
   c.fire.material.uniforms.uFade.value = c.fade; c.fire.visible = c.fade > 0;
   c.glow.value = SKULL_GLOW * c.fade;
@@ -6136,7 +6525,7 @@ function fallSkull(c, dt) {
   }
   v.y -= 9.8 * dt;
   m.rotateX(c.spin * dt);
-  if (keepSkullIn(p, v, dt, 0.25) && v.y < 0 && p.y <= floorAt(p.x, p.z) + 0.25) { // landed
+  if (keepSkullIn(p, v, dt, 0.25) && v.y < 0 && p.y <= floorAt(p.x, p.z, p.y) + 0.25) { // landed
     if (v.y < -3) { v.y *= -0.3; v.x *= 0.5; v.z *= 0.5; c.spin *= 0.5; } else { c.resting = true; v.set(0, 0, 0); } // (a bounce, then still)
   }
   if (v.y > 0 && p.y >= WALL_ROWS * TILE - 0.5) v.y *= -0.3; // (off the ceiling: shot up there, it stuck to it)
@@ -6157,77 +6546,402 @@ function hitSkull(s, at, dir, dmg) {
   if (k >= 0) skulls.splice(k, 1);
   corpses.push({ imp: s.imp, mesh: s.mesh, dead: true, skull: true, fire: s.fire, glow: s.glow, vel: s.vel, spin: (Math.random() - 0.5) * 12, fade: 1, resting: false });
 }
-// Meat: gore piles on the floor, what's left where a body's top half was shot to pieces (see cutBody);
-// textures/meat_*.png (see tools/meat_textures.py), the game's one true billboard: a picture on a card that turns to
-// face you, standing on its bottom edge, and leaning back as you look down on it (up to MEAT_LEAN: from above it went
-// edge on). Lit like the blood (see bloodLight): the light where it lies, capped at MEAT_LIGHT_MAX, from its main
-// direction onto each pixel's normal (the texture's: the pile's own shape), with a glint where it's wet; fogged like
-// the world. Not solid: you, the enemies and the shots go through them.
-const MEAT_KINDS = ['heap', 'heap_bone', 'guts', 'mound'], MEAT_W = 72 * 0.015, MEAT_H = 32 * 0.015; // m (its W×H px at its PX)
-const MEAT_LEAN = THREE.MathUtils.degToRad(70), MEAT_LIGHT_MAX = 3;
-const meatMap = (file, color, onLoad) => { // a meat texture: pixels (nearest, as the sprites'), no mipmaps (they ate the silhouettes away with distance)
+// ---------------------------------------------------------------------------
+// Portals
+// ---------------------------------------------------------------------------
+// How an enemy comes in: not all at once, nor out of nowhere. Each where it'll stand (or fly), after up to PORTAL_DELAY
+// s, over PORTAL_TIME s:
+// - waves of bent space round its point (lensing, see lensPass), their crests running in to it and dragged in after it
+//   in streaks, as brush strokes; swelling as it grows
+// - a point of light hangs at its middle, swelling and brightening, light drawn in to it from all round (streaks
+//   rushing in, and sparks falling in to it, stretched by their speed, drifting off as embers once it's gone: see
+//   sparkGeo); a real light too, for the
+//   PORTAL_LIGHTS lighting you most (see portalLights: it lights the floor, the walls)
+// - lightning out of it (a Lichtenberg figure: lightning's branching, in the air all round it: see crackle), reaching
+//   further as it grows, its newest tips brightest, crackling (a new one every PORTAL_CRACKLE s or so), striking the
+//   floor where it gets down to it
+// - a streak of light through its point, straight up and down your view (as a lens, or an eye, smears a light this
+//   bright: an astigmatism streak, not a thing in the room), drawing out, then fading again: gone as the enemy comes
+//   through
+// then it's there, built up from embers over PORTAL_BUILD s (burning backwards, out from its middle to its foot and its top;
+// one of them, moving, fighting and to be shot, only once it's built): the point
+// flares and is gone, a sphere of denser air bursts out round it (the world behind bent
+// through it: see lensPass), fast at first, its index back to air's as it spreads, over PORTAL_LENS s; and the
+// lightning dies away over PORTAL_FADE s. All of it light (added on, brighter than white: the bloom
+// haloes it), in bands like the skulls' fire, fogged. It crackles as long as its lightning's there (a burst of sparks
+// every PORTAL_ZAP s or so, one at random, louder as it grows), and what comes through comes with a whoosh, from its
+// first pixels (see portalZap).
+const PORTAL_TIME = 2.6, PORTAL_FADE = 0.9, PORTAL_DELAY = 4, PORTAL_FLARE = 0.15, PORTAL_LENS = 0.8; // s
+const PORTAL_FIGURE = 1.6, PORTAL_STREAK = 3, PORTAL_ORB = 1.3, PORTAL_LENS_R = 2.5, PORTAL_GAP = 3; // m: the
+// lightning's reach, the streak's (up and down), the drawn-in light's, the lens sphere's (burst out to); how far apart two open
+// its waves (see lensPass): m out from its point; m between crests; crests run in a s
+const PORTAL_WAVE_R = 3, PORTAL_WAVE_LENGTH = 0.6, PORTAL_WAVE_RATE = 1.4;
+const PORTAL_LENS_INDEX = 1.077, AIR_INDEX = 1.000293; // the lens sphere's refractive index at its peak, and air's (of vacuum)
+const PORTAL_STREAK_PX = 12; // the streak's card: the world's pixels across (its line a couple of them: sharp, however far)
+const PORTAL_CRACKLE = [0.06, 0.14], PORTAL_ZAP = [0.25, 0.9]; // s: how long one figure of its lightning lasts; between its crackles' bursts
+const PORTAL_SPARKS = 48, PORTAL_SPARK_FROM = [0.7, 1.6]; // sparks a portal; m: how far out each starts falling in
+const PORTAL_BUILD = 0.7; // s: what comes through, built up from embers over this (see SpriteImpostor's uBuild)
+const PORTAL_BUILD_LEAD = 0.1; // how far short of its middle its fronts start (of the burn's 0..1 out to its ends): none
+// of it there for that first share of PORTAL_BUILD, then its first pixels, at its middle (its whoosh starts with them)
+const PORTAL_BUILD_FIRST = 0.05; // how far out its fronts have got (as above) when its first pixel shows: its middle row's
+// least noise and grain (in the burn; measured: 0.03–0.06 over the zombie, the officer and the demon, from all round)
+const PORTAL_EMBERS = 1.4, PORTAL_EMBER_SLOW = 0.3; // s: how long its sparks linger once it's come through (embers); how
+// quickly they lose the speed they had (to 1/e)
+const PORTAL_GLOW = 14, PORTAL_TINT = new THREE.Color(PORTAL_LIGHT_COLOR); // its point at its brightest (× white); its colour:
+// red-orange, as hellfire (it was a cold violet: not frightening), its hottest a yellow-orange (PORTAL_HOT: not white,
+// else between the two it went pink)
+const PORTAL_HOT = new THREE.Color(0xffd27a);
+// Its lightning: a tree of it out of its point, every way. Arms wander out, forking as they go (each fork dimmer and
+// shorter), drawn as lines (a pixel wide: the world's); one that gets down to the floor strikes it and stops there.
+// Each vertex: how far along the branches it is (of the furthest: when the growth gets there) and how bright its
+// branch is (aWhen, aBright).
+const BOLT_SEGS = 600, BOLT_STEP = 0.07, BOLT_ARMS = 7; // segments at most; m a step; arms out of the point
+const boltGeometry = () => {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(BOLT_SEGS * 6), 3).setUsage(THREE.DynamicDrawUsage));
+  for (const a of ['aWhen', 'aBright']) g.setAttribute(a, new THREE.BufferAttribute(new Float32Array(BOLT_SEGS * 2), 1).setUsage(THREE.DynamicDrawUsage));
+  g.setDrawRange(0, 0);
+  return g;
+};
+function crackle(geo, up) { // a new figure into geo, round its point (up m above the floor)
+  const P = geo.attributes.position.array, W = geo.attributes.aWhen.array, B = geo.attributes.aBright.array;
+  let n = 0, furthest = 1e-3;
+  const grow = (x, y, z, dx, dy, dz, steps, b, d, depth) => {
+    const ax = dx, ay = dy, az = dz; // (the way it set out: it wanders, but on out, not back)
+    for (let s = 0; s < steps && n < BOLT_SEGS; s++) {
+      dx = dx * 0.6 + ax * 0.4 + (Math.random() - 0.5) * 1.2; dy = dy * 0.6 + ay * 0.4 + (Math.random() - 0.5) * 1.2;
+      dz = dz * 0.6 + az * 0.4 + (Math.random() - 0.5) * 1.2;
+      const l = Math.hypot(dx, dy, dz); dx /= l; dy /= l; dz /= l;
+      const nx = x + dx * BOLT_STEP, nz = z + dz * BOLT_STEP, floor = 0.02 - up, ny = Math.max(y + dy * BOLT_STEP, floor);
+      P.set([x, y, z, nx, ny, nz], n * 6);
+      W[n * 2] = d; W[n * 2 + 1] = d + BOLT_STEP; B[n * 2] = B[n * 2 + 1] = b;
+      n++; d += BOLT_STEP; furthest = Math.max(furthest, d);
+      x = nx; y = ny; z = nz;
+      if (y <= floor) return; // (struck the floor)
+      if (depth < 4 && Math.random() < 0.14) {
+        grow(x, y, z, dx + (Math.random() - 0.5) * 1.6, dy + (Math.random() - 0.5) * 1.6, dz + (Math.random() - 0.5) * 1.6,
+          (steps - s) * (0.4 + Math.random() * 0.35), b * 0.65, d, depth + 1);
+      }
+    }
+  };
+  for (let k = 0; k < BOLT_ARMS; k++) {
+    const a = (k + Math.random()) / BOLT_ARMS * 2 * Math.PI, e = (Math.random() - 0.6) * 1.6; // (round it, more down than up)
+    grow(0, 0, 0, Math.cos(a) * Math.cos(e), Math.sin(e), Math.sin(a) * Math.cos(e), PORTAL_FIGURE / BOLT_STEP, 1, 0, 0);
+  }
+  for (let i = 0; i < n * 2; i++) W[i] /= furthest;
+  geo.setDrawRange(0, n * 2);
+  for (const a of ['position', 'aWhen', 'aBright']) geo.attributes[a].needsUpdate = true;
+}
+const PORTAL_NOISE = `
+  float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+  float noise(vec2 p, float period) { // value noise, repeating every period along x (round a circle: no seam)
+    vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+    float i0 = mod(i.x, period), i1 = mod(i.x + 1.0, period);
+    return mix(mix(hash(vec2(i0, i.y)), hash(vec2(i1, i.y)), f.x), mix(hash(vec2(i0, i.y + 1.0)), hash(vec2(i1, i.y + 1.0)), f.x), f.y);
+  }`;
+const PORTAL_FOG = `
+  #ifdef USE_FOG // (light added on: dimmed by the fog, not tinted)
+    gl_FragColor.rgb *= exp(-fogDensity * fogDensity * vFogDepth * vFogDepth);
+  #endif`;
+const portalVertex = (body, decls) => `
+  attribute float aWhen, aBright;
+  ${decls}
+  varying vec2 vUv;
+  varying vec3 vN, vV, vLocal;
+  varying float vWhen, vBright;
+  uniform vec3 uAt;
+  uniform float uSize;
+  #include <fog_pars_vertex>
+  void main() {
+    vUv = uv; vLocal = position; vWhen = aWhen; vBright = aBright;
+    ${body}
+    gl_Position = projectionMatrix * mvPosition;
+    #include <fog_vertex>
+  }`;
+const portalMaterial = (vertexBody, fragmentBody, decls = '') => new THREE.ShaderMaterial({ // (fresh uniforms each: the program's shared)
+  uniforms: { ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog), uTint: { value: PORTAL_TINT }, uHot: { value: PORTAL_HOT },
+    uAt: { value: new THREE.Vector3() }, uSize: { value: 1 }, uGrow: { value: 0 }, uGlow: { value: 0 }, uFlare: { value: 0 },
+    uTime: { value: 0 }, uSeed: { value: 0 }, uAfter: { value: 0 } },
+  fog: true,
+  vertexShader: portalVertex(vertexBody, decls),
+  fragmentShader: `
+    uniform vec3 uTint, uHot;
+    uniform float uGrow, uGlow, uFlare, uTime, uSeed;
+    varying vec2 vUv;
+    varying vec3 vN, vV, vLocal;
+    varying float vWhen, vBright;
+    #include <fog_pars_fragment>
+    ${PORTAL_NOISE}
+    void main() {
+      ${fragmentBody}
+      ${PORTAL_FOG}
+    }`,
+  transparent: true, depthWrite: false, side: THREE.DoubleSide,
+  blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+// the lightning: there as far as it's grown, its newest tips brightest, its trunks brighter than its forks
+const boltVertex = `vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);`;
+const boltFragment = `
+  if (vWhen > uGrow) discard;
+  float tip = smoothstep(uGrow - 0.2, uGrow, vWhen);
+  float b = floor((0.4 + 0.8 * vBright + 1.2 * tip) * uGlow * 3.0) / 3.0; // (in bands)
+  if (b <= 0.0) discard;
+  gl_FragColor = vec4(mix(uTint, uHot, 0.3 + 0.5 * max(vBright, tip)) * b, 0.0);`;
+// the streak: a card on its point, upright in your view, PORTAL_STREAK m up and down it and PORTAL_STREAK_PX of the
+// world's pixels across (uSize: a pixel's size, in m per m away), whatever the distance; a thin hot line down its
+// middle in a soft glow, tapering in steps to its tips. Drawn over what's nearer (it's in the lens, not the room),
+// while its point's in sight (see updatePortals)
+const streakVertex = `
+  vec4 mvPosition = viewMatrix * vec4(uAt, 1.0);
+  mvPosition.xy += position.xy * vec2(${PORTAL_STREAK_PX}.0 * uSize * -mvPosition.z, ${(2 * PORTAL_STREAK).toFixed(1)});
+  vWhen = smoothstep(${PORTAL_NEAR_FADE[0].toFixed(1)}, ${PORTAL_NEAR_FADE[1].toFixed(1)}, -mvPosition.z); // (not in your face: see PORTAL_NEAR_FADE)`;
+const streakFragment = `
+  vec2 q = vUv * 2.0 - 1.0;
+  float px = abs(q.x) * ${(PORTAL_STREAK_PX / 2).toFixed(1)}; // (pixels out from its line)
+  float b = (exp(-px * px / 1.2) + 0.45 * exp(-px / 2.5)) * pow(1.0 - abs(q.y), 2.0) * uGlow * vWhen;
+  b = floor(b * 4.0) / 4.0;
+  if (b <= 0.0) discard;
+  gl_FragColor = vec4(mix(uTint, uHot, exp(-px * px / 1.2) * 0.7) * b, 0.0);`;
+// the point and the light drawn in to it: a card facing you at its middle. A hot core, swelling as it grows and flaring
+// as it comes through; streaks all round it, rushing in (the noise's rings run in as time goes on), faster as it grows
+const orbVertex = `
+  vec4 mvPosition = viewMatrix * vec4(uAt, 1.0);
+  mvPosition.xy += position.xy * uSize;
+  vWhen = smoothstep(${PORTAL_NEAR_FADE[0].toFixed(1)}, ${PORTAL_NEAR_FADE[1].toFixed(1)}, -mvPosition.z); // (not in your face: see PORTAL_NEAR_FADE)`;
+const orbFragment = `
+  vec2 q = vUv * 2.0 - 1.0;
+  float r = length(q);
+  if (r >= 1.0) discard;
+  float s = 0.025 + 0.06 * uGrow + 0.3 * uFlare;
+  float core = exp(-r * r / (s * s));
+  float n = noise(vec2((atan(q.y, q.x) / 6.2831853 + 0.5) * 64.0, r * 1.2 + uTime + uSeed), 64.0); // (uTime: how far they've rushed, see updatePortals)
+  float streak = smoothstep(0.72, 0.9, n) * smoothstep(1.0, 0.45, r) * smoothstep(0.03, 0.15, r) * uGrow; // (thin, long:
+  // round it, many and narrow; out along it, slow)
+  float b = (core * (1.0 + 2.0 * uFlare) * uGlow + streak * (1.0 + 3.0 * uGrow) * (1.4 - r)) * vWhen;
+  b = floor(b * 4.0) / 4.0;
+  if (b <= 0.0) discard;
+  gl_FragColor = vec4(mix(uTint, uHot, clamp(core * 1.5, 0.0, 1.0)) * b, 0.0);`;
+// the sparks: each falling in to the point from its own way and distance, over and over (where it is in its fall
+// worked out from the time: nothing to move each frame), faster as it nears it, and faster and more often as the
+// portal grows; a little ellipse facing you, stretched out along its fall as you see it, by its speed. Fading in where
+// it sets out, out as it's swallowed; none once the point's gone. (Every portal's the same sparks, turned its own way.)
+const sparkGeo = new THREE.InstancedBufferGeometry();
+{
+  const quad = new THREE.PlaneGeometry(1, 1), dir = [], phase = [], from = [];
+  sparkGeo.index = quad.index;
+  sparkGeo.setAttribute('position', quad.attributes.position);
+  for (let i = 0; i < PORTAL_SPARKS; i++) {
+    const e = Math.asin(Math.random() * 2 - 1) * 0.8, a = Math.random() * 2 * Math.PI; // (round it, flatter than a ball)
+    dir.push(Math.cos(a) * Math.cos(e), Math.sin(e), Math.sin(a) * Math.cos(e));
+    phase.push(Math.random()); from.push(between(PORTAL_SPARK_FROM));
+  }
+  sparkGeo.setAttribute('aDir', new THREE.InstancedBufferAttribute(new Float32Array(dir), 3));
+  sparkGeo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(new Float32Array(phase), 1));
+  sparkGeo.setAttribute('aFrom', new THREE.InstancedBufferAttribute(new Float32Array(from), 1));
+  sparkGeo.instanceCount = PORTAL_SPARKS;
+}
+const sparkDecls = `attribute vec3 aDir; attribute float aPhase, aFrom; uniform float uTime, uGrow, uSeed, uAfter; // uSize: a world pixel, m per m away`;
+const sparkVertex = `
+  vec3 dir = vec3(cos(uSeed) * aDir.x - sin(uSeed) * aDir.z, aDir.y, sin(uSeed) * aDir.x + cos(uSeed) * aDir.z);
+  float rate = 0.5 + 1.3 * uGrow, life = fract(uTime + aPhase); // (uTime: its falls so far, see updatePortals; life: 0
+  // setting out, 1 swallowed)
+  float r = aFrom * (1.0 - life * life), speed = 2.0 * aFrom * life * rate; // m; m/s (from rest, ever faster: drawn in)
+  // come through (uAfter s ago; its fall stopped there, see updatePortals): nothing pulling it in now. It carries on the
+  // way it was going, slowing (to 1/e in PORTAL_EMBER_SLOW s), and drifts as an ember does: fluttering, rising a little
+  float go = ${PORTAL_EMBER_SLOW.toFixed(2)} * (1.0 - exp(-uAfter / ${PORTAL_EMBER_SLOW.toFixed(2)}));
+  vec3 drift = -dir * speed * go + vec3(sin(uAfter * 3.1 + aPhase * 40.0), 0.0, cos(uAfter * 2.7 + aPhase * 23.0)) * 0.08 * min(uAfter, 1.0)
+    + vec3(0.0, 0.12 * uAfter + 0.05 * sin(uAfter * 4.3 + aPhase * 17.0), 0.0);
+  speed *= exp(-uAfter / ${PORTAL_EMBER_SLOW.toFixed(2)}); // (and so rounds, its streak gone)
+  vec4 mvPosition = viewMatrix * vec4(uAt + dir * r + drift, 1.0);
+  vec3 fall = (viewMatrix * vec4(-dir, 0.0)).xyz;
+  vec2 sv = fall.xy - mvPosition.xy * fall.z / min(mvPosition.z, -0.1); // (its fall as you see it, perspective and all)
+  vec2 along = normalize(sv + vec2(1e-5, 0.0)), across = vec2(-along.y, along.x);
+  float w = max(0.035, 1.5 * uSize * -mvPosition.z); // m: its width (never under a pixel and a half: it shimmered, or went)
+  float len = max(0.04 + 0.12 * speed * length(sv), 2.0 * w); // (stretched by how fast it falls across your view)
+  mvPosition.xy += along * (position.y - 0.5) * len + across * position.x * w; // (its head at the front)
+  vUv = position.xy * 2.0;
+  vWhen = smoothstep(0.0, 0.2, life) * smoothstep(0.0, 0.1, r) * uGrow;
+  if (uAfter > 0.0) vWhen *= (1.0 - smoothstep(0.4 * ${PORTAL_EMBERS.toFixed(2)}, ${PORTAL_EMBERS.toFixed(2)}, uAfter)) // (flickering out)
+    * (0.5 + 0.5 * step(0.35, fract(sin(floor(uAfter * 14.0) + aPhase * 91.0) * 43758.5453)));
+  vWhen *= smoothstep(${PORTAL_NEAR_FADE[0].toFixed(1)}, ${PORTAL_NEAR_FADE[1].toFixed(1)}, -mvPosition.z); // (not in your face: see PORTAL_NEAR_FADE)`;
+const sparkFragment = `
+  float e = 1.0 - dot(vUv, vUv);
+  if (e <= 0.0) discard;
+  float b = floor(min(e * 2.0, 1.0) * vWhen * uGlow * 3.0) / 3.0;
+  if (b <= 0.0) discard;
+  gl_FragColor = vec4(mix(uTint, uHot, 0.6) * b, 0.0);`;
+const orbGeo = new THREE.PlaneGeometry(1, 1);
+const portals = [];
+// Where an enemy can come in: on the open floor (clear of the platform, the stairs, the columns and the towers; under the
+// balcony's fine, a skull not in its floor), at least gap m from you, not on top of another coming in; into out (its y: y)
+function portalSpot(out, gap, y = 0) {
+  for (let tries = 0; ; tries++) {
+    out.set((Math.random() - 0.5) * 2 * (ARENA - 3), y, (Math.random() - 0.5) * 2 * (ARENA - 3));
+    if (Math.hypot(out.x - camera.position.x, out.z - camera.position.z) < gap) continue;
+    if (y > BALCONY_Y - STRINGER_D - 0.5 && y < BALCONY_Y + 0.5 && overDeck(out.x, out.z)) continue;
+    if (platformGap(out.x, out.z) < 1.5 || boxGap(BALCONY_FLIGHT, out.x, out.z) < 1.5 || AROUND.some(([c, R], i) => i > 0 && Math.hypot(c.x - out.x, c.y - out.z) < R + 0.5)) continue;
+    if (tries < 50 && portals.some((p) => Math.hypot(p.x - out.x, p.z - out.z) < PORTAL_GAP)) continue; // (crowded: by
+    // another, then; never in anything, nor on you)
+    return out;
+  }
+}
+// A portal at (x, z), its point orbY up; arrive: what comes through, when it does (npc: that, if an enemy: see removeNpcs;
+// imp: its sprite, built up as it comes through)
+function openPortal(x, z, orbY, arrive, npc, imp) {
+  const floor = floorAt(x, z, orbY), parts = [[boltGeometry(), boltVertex, boltFragment], [orbGeo, streakVertex, streakFragment],
+    [orbGeo, orbVertex, orbFragment], [sparkGeo, sparkVertex, sparkFragment, sparkDecls]].map(([g, v, f, d], i) => {
+    const m = new (i ? THREE.Mesh : THREE.LineSegments)(g, portalMaterial(v, f, d));
+    m.position.set(x, floor, z); m.frustumCulled = false; m.renderOrder = 1; m.visible = false;
+    m.material.uniforms.uSeed.value = Math.random() * 100;
+    scene.add(m);
+    return m;
+  });
+  const was = renderer.getRenderTarget(); // (its programs built now, in the spawn, not as it opens mid-play: see prewarm)
+  renderer.setRenderTarget(composer.renderTarget1);
+  for (const m of parts) renderer.compile(m, camera, scene);
+  renderer.setRenderTarget(was);
+  parts[0].position.y = orbY; // (out of its point)
+  parts[1].material.uniforms.uAt.value.set(x, orbY, z);
+  parts[1].material.depthTest = false; parts[1].renderOrder = 10; // (over everything: see streakVertex)
+  parts[2].material.uniforms.uAt.value.set(x, orbY, z);
+  parts[3].material.uniforms.uAt.value.set(x, orbY, z);
+  parts[3].material.uniforms.uSeed.value = Math.random() * 2 * Math.PI; // (its sparks turned its own way)
+  parts[2].material.uniforms.uSize.value = 2 * PORTAL_ORB;
+  if (imp) imp.depthU.uBuild.value = 0;
+  portals.push({ x, z, orbY, arrive, npc, imp, t: -Math.random() * PORTAL_DELAY, parts, light: 0, crackleAt: 0, spark: 0, swirl: 0,
+    turn: Math.random() }); // (turn: its waves' strokes' seed)
+}
+const _portalP = new THREE.Vector3(), _portalD = new THREE.Vector3();
+// Is p's point in sight from you (nothing in between)? Into _portalP, it (and its distance: returned)
+function portalSeen(p) {
+  _portalP.set(p.x, p.orbY, p.z);
+  const dist = _portalP.distanceTo(camera.position), w = rayWorld(camera.position, _portalD.subVectors(_portalP, camera.position).divideScalar(dist));
+  return !w || w.t > dist - 0.5 ? dist : 0;
+}
+const portalSound = (p, name, level) => playSound(name, level / (1 + Math.hypot(p.x - camera.position.x, p.orbY - camera.position.y,
+  p.z - camera.position.z) * 0.12), 0.12); // (quieter the further off, as a demon's voice; pitched a little at random)
+function updatePortals(dt, now) {
+  const px = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / composer.renderTarget1.height; // (a world pixel, m per m)
+  for (let k = portals.length - 1; k >= 0; k--) {
+    const p = portals[k], [bolts, streak, orb, sparks] = p.parts;
+    p.t += dt;
+    if (p.t < 0) continue; // (not yet)
+    const grow = Math.min(p.t / PORTAL_TIME, 1), after = Math.max(p.t - PORTAL_TIME, 0), fade = 1 - Math.min(after / PORTAL_FADE, 1);
+    if (p.imp) p.imp.depthU.uBuild.value = THREE.MathUtils.clamp(after / PORTAL_BUILD, 0, 1); // (built up as it comes through)
+    if (after > 0) p.lens ??= portals.filter((q) => q.lens && q.t > PORTAL_TIME && q.t < PORTAL_TIME + PORTAL_LENS).length < LENSES; // (its
+    // lens, if there's one left: claimed as it comes through, none cut off part way)
+    if (after > 0 && p.arrive) { // it's here: seen as it's built up (held still: see below), one of them once it's built
+      if (p.imp && !p.imp.visible) { p.imp.visible = true; p.imp.lastKey = undefined; } // (drawn afresh: its picture's
+      // from the spawn, seconds ago, lit as you were then)
+      if (after >= PORTAL_BUILD) { p.arrive(); p.arrive = null; }
+    }
+    if (fade <= 0 && after >= Math.max(PORTAL_EMBERS, PORTAL_BUILD)) { for (const m of p.parts) { scene.remove(m); m.material.dispose(); } bolts.geometry.dispose(); portals.splice(k, 1); continue; } // (all of it built first)
+    const flare = after > 0 ? Math.max(1 - after / PORTAL_FLARE, 0) : 0;
+    bolts.visible = true;
+    const streakGlow = THREE.MathUtils.smoothstep(grow, 0.05, 0.4) * (1 - THREE.MathUtils.smoothstep(grow, 0.7, 1)) * 5;
+    p.seen = p.t < PORTAL_TIME + PORTAL_LENS ? portalSeen(p) : 0; // (its point in sight: how far; 0: hidden)
+    p.wave ??= portals.filter((q) => q.wave && q.t >= 0 && q.t < PORTAL_TIME).length < LENSES; // (its waves, if there's room: claimed as it opens)
+    streak.visible = streakGlow > 0 && p.seen > 0; // (behind something: its point hidden, no streak, as with a lens)
+    orb.visible = after < PORTAL_FLARE;
+    sparks.visible = after < PORTAL_EMBERS; // (embers, once it's come through)
+    for (const m of p.parts) m.material.uniforms.uTime.value = now;
+    // (the sparks' falls and the drawn-in streaks' rush, each so far: their pace grows with it; as the time × the pace,
+    // they raced ever faster the longer the game had run)
+    if (after <= 0) p.spark += dt * (0.5 + 1.3 * grow); // (stopped as it comes through: embers from there)
+    sparks.material.uniforms.uTime.value = p.spark;
+    sparks.material.uniforms.uAfter.value = after;
+    orb.material.uniforms.uTime.value = p.swirl += dt * (0.6 + 1.4 * grow);
+    if (p.t >= p.crackleAt) { // a new figure of its lightning, flickering brighter or dimmer
+      crackle(bolts.geometry, p.orbY - floorAt(p.x, p.z, p.orbY));
+      p.crackleAt = p.t + between(PORTAL_CRACKLE); p.flick = 0.6 + 0.4 * Math.random();
+    }
+    const whooshAt = PORTAL_TIME + PORTAL_BUILD * (PORTAL_BUILD_LEAD + PORTAL_BUILD_FIRST) / (1 + 2 * PORTAL_BUILD_LEAD); // (with
+    // the first pixel of what comes through: see PORTAL_BUILD_FIRST)
+    if (p.t >= whooshAt && !p.whooshed) { p.whooshed = true; portalSound(p, 'portal_whoosh', 1); }
+    if (fade > 0 && now >= (p.zapAt ?? 0)) { // and its sound: a burst of sparks
+      portalSound(p, portalZap((Math.random() * PORTAL_ZAPS) | 0), (0.2 + 0.5 * grow + 0.3 * flare) * fade);
+      p.zapAt = now + between(PORTAL_ZAP);
+    }
+    bolts.material.uniforms.uGrow.value = Math.min(grow * 1.1, 1) + flare; // (all of it, as it comes through)
+    bolts.material.uniforms.uGlow.value = (0.6 + 1.4 * grow + 2 * flare) * fade * p.flick;
+    streak.material.uniforms.uGlow.value = streakGlow;
+    streak.material.uniforms.uSize.value = px;
+    orb.material.uniforms.uGrow.value = grow;
+    orb.material.uniforms.uGlow.value = PORTAL_GLOW * grow * grow;
+    orb.material.uniforms.uFlare.value = flare;
+    sparks.material.uniforms.uGrow.value = grow;
+    sparks.material.uniforms.uGlow.value = (1.5 + 4 * grow) * (after > 0 ? 0.7 : 1);
+    sparks.material.uniforms.uSize.value = px;
+    p.light = after > 0 ? flare : grow * grow; // (its light: as bright as its point)
+  }
+  // the lights: to the portals giving you the most light (theirs over how far off), each dimmed as the next one's nears
+  // its own, so it hands over at nothing (by distance alone, a pool of light jumped from one to the next)
+  const give = (p) => p.light / Math.max((p.x - camera.position.x) ** 2 + (p.z - camera.position.z) ** 2, 1);
+  const lit = portals.filter((p) => p.t >= 0 && p.light > 0).sort((a, b) => give(b) - give(a));
+  const next = lit.length > PORTAL_LIGHTS ? give(lit[PORTAL_LIGHTS]) : 0;
+  portalLights.forEach((l, i) => {
+    const p = lit[i];
+    const near = p ? Math.min(1, ((p.x - camera.position.x) ** 2 + (p.orbY - camera.position.y) ** 2 + (p.z - camera.position.z) ** 2) / PORTAL_NEAR ** 2) : 0;
+    l.world.intensity = l.sprite.intensity = p ? PORTAL_INTENSITY * p.light * Math.min(1, 4 * (1 - next / give(p))) * near : 0;
+    if (p) { l.world.position.set(p.x, p.orbY, p.z); l.sprite.position.copy(l.world.position); }
+  });
+  // what's being built up: not one of them yet (nothing updates it), so its sprite here, facing you, in these lights, its
+  // pose held (no time for it: it starts moving once it's built)
+  let renders = 0;
+  for (const p of portals) if (p.imp?.visible && p.arrive) renders += p.imp.update(renderer, camera, 0);
+  return renders;
+}
+// The lens, for each come through within PORTAL_LENS s: where its point is on your screen (its size by how deep it is
+// in your view), if it's in front of you and in sight. Its sphere bursts out (fast, then slowing) to PORTAL_LENS_R, its
+// index up to PORTAL_LENS_INDEX at once and back to air's as it goes. After the camera's shaken (see the frame), so it's
+// on its spot
+let lensBuilt = false; // (the pass drawn once, on the first frame, bending nothing: its program built then, not mid-play)
+function portalLenses() {
+  let lenses = 0, waves = 0;
+  const tan2 = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+  for (const p of portals) { // the waves, as it grows (gone as it comes through, the sphere taking over)
+    const grow = p.t / PORTAL_TIME;
+    if (!(p.wave && grow > 0 && grow < 1) || waves >= LENSES || !(p.seen > 0)) continue;
+    _portalP.set(p.x, p.orbY, p.z).applyMatrix4(camera.matrixWorldInverse);
+    const depth = -_portalP.z;
+    _portalP.applyMatrix4(camera.projectionMatrix);
+    if (depth <= 0.1) continue;
+    const m = 1 / (tan2 * depth), swell = THREE.MathUtils.smoothstep(grow, 0.05, 0.4) * (1 - THREE.MathUtils.smoothstep(grow, 0.92, 1));
+    lensPass.uniforms.uWaveA.value[waves].set(_portalP.x * 0.5 + 0.5, _portalP.y * 0.5 + 0.5, Math.min(PORTAL_WAVE_R, 0.3 * p.seen) * m, swell);
+    lensPass.uniforms.uWaveB.value[waves++].set(PORTAL_WAVE_LENGTH * m, p.t * PORTAL_WAVE_RATE, p.turn, depth);
+  }
+  for (let i = waves; i < LENSES; i++) lensPass.uniforms.uWaveA.value[i].w = 0;
+  for (const p of portals) {
+    const age = (p.t - PORTAL_TIME) / PORTAL_LENS; // (0 as it comes through, 1 gone)
+    if (!(p.lens && age > 0 && age < 1) || lenses >= LENSES) continue;
+    const dist = p.seen; // (see updatePortals)
+    _portalP.set(p.x, p.orbY, p.z).applyMatrix4(camera.matrixWorldInverse);
+    const depth = -_portalP.z;
+    _portalP.applyMatrix4(camera.projectionMatrix);
+    if (depth > 0.1 && dist > 0) {
+      const radius = Math.min(PORTAL_LENS_R, 0.3 * dist) * (0.05 + 0.95 * (1 - (1 - age) ** 3)); // m (never up to you: walked
+      // up to it as it came through, it filled the screen and smeared it)
+      const swell = THREE.MathUtils.smoothstep(age, 0, 0.1) * (1 - THREE.MathUtils.smoothstep(age, 0.25, 1));
+      lensPass.uniforms.uDepth.value[lenses] = depth;
+      lensPass.uniforms.uTan.value = tan2;
+      lensPass.uniforms.uLens.value[lenses++].set(_portalP.x * 0.5 + 0.5, _portalP.y * 0.5 + 0.5, radius / (tan2 * depth),
+        (AIR_INDEX + (PORTAL_LENS_INDEX - AIR_INDEX) * swell) / AIR_INDEX);
+    }
+  }
+  for (let i = lenses; i < LENSES; i++) lensPass.uniforms.uLens.value[i].w = 0;
+  lensPass.enabled = lenses > 0 || waves > 0 || !lensBuilt;
+  lensBuilt = true;
+  lensPass.uniforms.uAspect.value = camera.aspect;
+}
+// Meat textures (textures/meat_*.png: see tools/meat_textures.py): pixels (nearest, as the sprites'), no mipmaps (they
+// ate the silhouettes away with distance); lit no brighter than MEAT_LIGHT_MAX (see the gibs)
+const MEAT_LIGHT_MAX = 3;
+const meatMap = (file, color, onLoad) => {
   const t = texLoader.load(`textures/${file}.png`, onLoad);
   t.colorSpace = color ? THREE.SRGBColorSpace : THREE.NoColorSpace;
   t.magFilter = t.minFilter = THREE.NearestFilter; t.generateMipmaps = false;
   return t;
 };
-const meatMaps = MEAT_KINDS.map((k) => [meatMap(`meat_${k}`, true), meatMap(`meat_${k}_n`, false)]);
-const meatGeo = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0); // (its foot: the bottom edge's middle)
-const meatPiles = [];
-function addMeatPile(x, z, kind, size, mirror) { // a pile of a kind (MEAT_KINDS' index), size × its own, maybe mirrored
-  const [color, normal] = meatMaps[kind];
-  const mat = new THREE.ShaderMaterial({
-    uniforms: { ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog), uColor: { value: color }, uNormal: { value: normal },
-      uLight: { value: new THREE.Vector3() }, uLightDir: { value: new THREE.Vector3(0, 1, 0) }, uMirror: { value: mirror ? 1 : 0 } },
-    fog: true,
-    vertexShader: `
-      varying vec2 vUv;
-      #include <fog_pars_vertex>
-      void main() {
-        vUv = uv;
-        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-        gl_Position = projectionMatrix * mvPosition;
-        #include <fog_vertex>
-      }`,
-    fragmentShader: `
-      uniform sampler2D uColor, uNormal;
-      uniform vec3 uLight, uLightDir; // the light where it lies, and where it comes from (in the card's own axes)
-      uniform float uMirror;
-      varying vec2 vUv;
-      #include <fog_pars_fragment>
-      void main() {
-        vec2 uv = vec2(uMirror > 0.5 ? 1.0 - vUv.x : vUv.x, vUv.y);
-        vec4 c = texture2D(uColor, uv);
-        if (c.a < 0.5) discard;
-        vec4 t = texture2D(uNormal, uv);
-        vec3 n = normalize(t.xyz * 2.0 - 1.0);
-        if (uMirror > 0.5) n.x = -n.x;
-        float d = max(dot(n, uLightDir), 0.0); // (towards the light, and a little all round: the room's other lights)
-        float glint = pow(max(dot(n, normalize(uLightDir + vec3(0.0, 0.0, 1.0))), 0.0), 40.0) * t.a; // (wet: t.a)
-        gl_FragColor = vec4(c.rgb * uLight * (0.35 + d) + uLight * glint * 0.6, 1.0);
-        #include <fog_fragment>
-      }`,
-  });
-  const card = new THREE.Mesh(meatGeo, mat), blob = new THREE.Mesh(blobGeo, blobMat);
-  card.position.set(x, floorAt(x, z) + 0.005, z);
-  card.scale.set(MEAT_W * size, MEAT_H * size, 1);
-  blob.position.set(x, card.position.y + 0.01, z);
-  blob.scale.set(MEAT_W * size * 0.75, 1, MEAT_W * size * 0.75); // (a contact shadow under it: round, as the pile turns)
-  scene.add(card, blob);
-  meatPiles.push(card);
-}
-const _meatE = new THREE.Euler(0, 0, 0, 'YXZ'), _meatL = [0, 0, 0], _meatD = [0, 0, 0], _meatQ = new THREE.Quaternion();
-function updateMeat() { // each card turned to you and leant back towards you, and lit where it lies
-  for (const card of meatPiles) {
-    const p = card.position, dx = camera.position.x - p.x, dz = camera.position.z - p.z;
-    const up = camera.position.y - (p.y + card.scale.y / 2);
-    card.quaternion.setFromEuler(_meatE.set(-THREE.MathUtils.clamp(Math.atan2(up, Math.hypot(dx, dz)), 0, MEAT_LEAN), Math.atan2(dx, dz), 0));
-    bloodLight(p.x, p.y + card.scale.y * 0.5, p.z, _meatL, 0, _meatD);
-    const u = card.material.uniforms;
-    u.uLight.value.set(Math.min(_meatL[0], MEAT_LIGHT_MAX), Math.min(_meatL[1], MEAT_LIGHT_MAX), Math.min(_meatL[2], MEAT_LIGHT_MAX));
-    u.uLightDir.value.set(_meatD[0], _meatD[1], _meatD[2]).applyQuaternion(_meatQ.copy(card.quaternion).invert());
-  }
-}
 // Gibs: bodies shot to pieces. Every bullet or pellet that hits a body adds to its trauma, which leaks away (to 1/e in
 // GIB_TAU s); a hit's traumatic when that reaches GIB_TRAUMA (two-thirds of the M4's magazine in one spray, or a
 // shotgun blast up close: most of one blast's 16 pellets).
@@ -6238,18 +6952,23 @@ function updateMeat() { // each card turned to you and leant back towards you, a
 // - A carcass (a whole corpse, or its legs, down: done falling) whose own trauma (counted from then) gets there
 //   bursts, all of it: its sprite and mesh go.
 // Either way, from what bursts: blood (GIB_BURSTS full bursts, as hard as GIB_BLOOD_SPEED, as wide as
-// GIB_BLOOD_SPLAT; GIB_STAINS more thrown over the floor; a splash on your lens up close), a heap of meat left
-// (see addMeatPile), and GIB_BITS bits (textures/meat_bits.png: see tools/meat_textures.py) flying out of its bones,
+// GIB_BLOOD_SPLAT; GIB_STAINS more thrown over the floor; a splash on your lens up close) and GIB_BITS bits, all of it
+// in small pieces (no big chunk left lying: a heap of meat read as dung), flying out of its bones (textures/meat_bits.png),
 // away from you, tumbling (the sheet's frames: a full turn), each splatting where it lands (GIB_BIT_STAIN m), lying
-// there for good (the oldest reused past GIB_MAX). Each bit's a quad facing you, lit like the piles (the light where
-// it is, from its main direction on the sheet's normals, a wet glint), fogged like the casings.
-const GIB_TRAUMA = 12, GIB_TAU = 1.2, GIB_BITS = 24, GIB_MAX = 400; // hits; s; bits a burst; bits at once (14 of 16
+// there for good (the oldest reused past GIB_MAX): small, spread out over its blood, so the bloodied floor isn't flat
+// (as grass is to the ground). Each bit's a quad facing you, lit like the blood (see bloodLight: the light where it is,
+// capped at MEAT_LIGHT_MAX, from its main direction on the sheet's normals, a wet glint), fogged like the casings.
+const GIB_TRAUMA = 12, GIB_TAU = 1.2, GIB_BITS = 30, GIB_MAX = 1200; // hits; s; bits a burst; bits at once (14 of 16
 // pellets: a blast up close often had only 13 land; the pistol, as fast as it fires, tops out at 10.5)
+// (ponytail: every bit's relit every frame, about 0.5 ms for GIB_MAX of them lying still; relight the still ones in
+// turns if more are wanted)
 const GIB_KILL_MIN = 5, GIB_KILL_WINDOW = 1.5; // hits; s (see above: shredded as it dies)
-const GIB_SCALE = [1.3, 2.0]; // × a bit's frame (a body's pieces: big; small, many and strewn wide, they were litter)
-const GIB_BURSTS = 1, GIB_BLOOD_SPEED = 1.3, GIB_BLOOD_SPLAT = 1.2, GIB_STAINS = 60, GIB_GUSH = 40; // ; × a hit's; × the
-// weapon's splats; gobs; spurts (about 3 s): the burst a big splash (three, harder, was too much), the stump's gush the show
-const GIB_BIT_STAIN = [0.1, 0.25]; // m: a landing bit's splat
+const GIB_SCALE = [0.4, 0.8]; // × a bit's frame (small, a few, spread over its blood: big ones were too big on screen;
+// many, too many)
+const GIB_BURSTS = 1, GIB_BLOOD_SPEED = 1.3, GIB_BLOOD_SPLAT = 1.2, GIB_STAINS = 60, GIB_GUSH = 5; // ; × a hit's; × the
+// weapon's splats; gobs; spurts (BLEED_EVERY apart: 0.4 s; 3 s, then 1.6, then 0.8, dragged on): the burst a big splash
+// (three, harder, was too much), the stump's gush the show
+const GIB_BIT_STAIN = [0.04, 0.1]; // m: a landing bit's splat
 const GIB_KINDS = 6, GIB_FRAMES = 8, GIB_SIZE = 16 * 0.015; // the sheet's rows (chunk, fatty, bone, gut, flap, clot) and
 // frames; m a frame (its BIT px at PX)
 const GIB_PICK = [0, 0, 0, 0, 0, 1, 2, 3, 3, 4, 4, 5, 5]; // which kinds fly out, by share: chunks most
@@ -6359,7 +7078,7 @@ const _gibP = new THREE.Vector3(), _gibV = new THREE.Vector3(), _gibC = new THRE
 const _gibS = new THREE.Vector3(), _gibW = new THREE.Vector3();
 // Out of a body (c), by hit (its entry and dir), from these bones (where they are now: standing, falling or lying):
 // blood, its bursts (each from somewhere else in it) and more thrown over the floor, a splash on your lens up close;
-// its bits, out of them every way, up, and away from you; the sound. → the bones' middle
+// its bits, out of them every way, up, and away from you; the sound
 function burstFrom(c, hit, bones) {
   c.imp.model.updateMatrixWorld(true);
   const mid = new THREE.Vector3(), now = clock.elapsedTime;
@@ -6372,41 +7091,39 @@ function burstFrom(c, hit, bones) {
   splashLens(mid);
   for (let k = 0; k < GIB_BITS; k++) {
     const from = bones[(Math.random() * bones.length) | 0].getWorldPosition(_gibP);
-    const a = Math.random() * 2 * Math.PI, out = 0.6 + Math.random() * 1.8; // (landing mostly within a couple of metres: a mess,
-    // not a scatter)
-    _gibV.set(Math.cos(a) * out, 1.5 + Math.random() * 3, Math.sin(a) * out).addScaledVector(hit.dir, 0.5 + Math.random() * 1.5);
+    const a = Math.random() * 2 * Math.PI, out = 0.4 + 2.4 * Math.random(); // (landing all over a couple of metres round it)
+    _gibV.set(Math.cos(a) * out, 1.2 + Math.random() * 2.5, Math.sin(a) * out).addScaledVector(hit.dir, 0.3 + Math.random() * 1.2);
     spawnGib(from, _gibV);
   }
   const fall = 1 + mid.distanceTo(camera.position) * 0.12; // (quieter the further off, as a demon's voice)
   playSquelch(1.2 / fall, 0.55);
   playSound('punch', 0.8 / fall, 0.1);
-  return mid;
 }
 const NOT_FINGERS = (b) => !/index|thumb|middle|ring|pinky|_end/i.test(b.name);
 // A zombie's or an officer's corpse, shredded as it died (see Gibs): its top half shot to pieces, its legs left
 function cutBody(c, hit) {
   c.cut = true;
+  c.voices?.forEach((v) => v.stop()); // (its head gone with it: not a sound more from it, its death cry, a growl, a moan;
+  // none, shredded by the shot that killed it)
   c.carcass = 0; // (its legs: a carcass of their own now)
   const mat = c.mesh.material, now = clock.elapsedTime;
   mat.userData.cut.value = 1; // (its inside shows, where it's open: see bloodOnBeforeCompile)
   c.imp.model.traverse((o) => { if (o.isMesh && o !== c.mesh) o.visible = false; }); // (an officer's rifle goes with its hands)
   c.imp.ownShadow = true; c.imp.lastKey = c.imp.shadowKey = undefined; // (redrawn, its sprite and shadow, if it had settled)
   burstFrom(c, hit, c.imp.bones.filter((b) => TOP_HALF.test(b.name) && NOT_FINGERS(b)));
-  // the stump gushes (from its waist, following it as its legs fall), and what's left of the top half lands in a heap
-  // by it, away from you
+  // the stump gushes (from its waist, following it as its legs fall)
   const spine = c.imp.bones.find((b) => /spine/i.test(b.name)), hips = c.imp.bones.find((b) => /hips/i.test(b.name)); // (the lowest)
   const waist = (spine ?? hips).getWorldPosition(new THREE.Vector3());
   startBleed({ npc: c, entry: waist, dir: _gibV.set(0, -1, 0) }, now, GIB_GUSH);
   if (spine && hips) Object.assign(bleeds.at(-1), { bone: spine, root: hips });
-  addMeatPile(waist.x + hit.dir.x * 0.4, waist.z + hit.dir.z * 0.4, (Math.random() * MEAT_KINDS.length) | 0, 0.75 + Math.random() * 0.15, Math.random() < 0.5);
 }
 // A carcass (see corpses: a whole body, or a cut one's legs) shot to pieces: all that's left of it
 function gibBody(c, hit) {
   c.gone = true;
+  c.voices?.forEach((v) => v.stop()); // (its head with the rest of it: see cutBody)
   corpses.splice(corpses.indexOf(c), 1);
   for (let k = bleeds.length - 1; k >= 0; k--) if ((bleeds[k].npc.corpse ?? bleeds[k].npc) === c) bleeds.splice(k, 1);
-  const mid = burstFrom(c, hit, c.imp.bones.filter((b) => NOT_FINGERS(b) && !(c.cut && TOP_HALF.test(b.name)))); // (its legs, if that's all)
-  addMeatPile(mid.x, mid.z, (Math.random() * MEAT_KINDS.length) | 0, (c.cut ? 0.75 : 0.9) + Math.random() * 0.15, Math.random() < 0.5);
+  burstFrom(c, hit, c.imp.bones.filter((b) => NOT_FINGERS(b) && !(c.cut && TOP_HALF.test(b.name)))); // (its legs, if that's all)
   c.imp.dispose(); c.bloodRT.dispose(); c.mesh.material.dispose();
 }
 const _gibL = [0, 0, 0], _gibD = [0, 0, 0];
@@ -6433,20 +7150,22 @@ function updateGibs(dt) {
         gibPos[k] = c.x + nx * r; gibPos[k + 2] = c.y + nz * r;
         if (vn < 0) { gibVel[k] -= 1.3 * vn * nx; gibVel[k + 2] -= 1.3 * vn * nz; }
       }
-      if (floorAt(gibPos[k], gibPos[k + 2]) > y0) { // the platform's or a step's side (it was below its top): a wall to it,
+      const roof = ceilingAt(gibPos[k], gibPos[k + 2], y0); // (up into the balcony, or a high step, from under it: off it)
+      if (gibPos[k + 1] > roof) { gibPos[k + 1] = roof - 0.01; gibVel[k + 1] = -0.3 * Math.abs(gibVel[k + 1]); } // (just under it)
+      if (floorAt(gibPos[k], gibPos[k + 2], y0) > y0) { // the platform's or a step's side (it was below its top): a wall to it,
         gibPos[k] = x0; gibPos[k + 2] = z0; gibVel[k] *= -0.3; gibVel[k + 2] *= -0.3; // not a floor to jump up onto
       }
       const f = Math.round((((gibAngle[i] / (2 * Math.PI)) % 1 + 1) % 1) * GIB_FRAMES) % GIB_FRAMES;
-      const ground = floorAt(gibPos[k], gibPos[k + 2]) + gibFoot[gibKind[i] * GIB_FRAMES + f] * 0.015 * gibSize[i]; // lying on its foot
+      const ground = floorAt(gibPos[k], gibPos[k + 2], y0) + gibFoot[gibKind[i] * GIB_FRAMES + f] * 0.015 * gibSize[i]; // lying on its foot
       if (gibPos[k + 1] < ground) {
         gibPos[k + 1] = ground;
-        if (!gibLanded[i]) { // its first landing: a splat, and a wet slap now and then (24 at once was a roar)
+        if (!gibLanded[i]) { // its first landing: a splat, and a wet slap now and then (7 a burst or so: 24 at once was a roar)
           gibLanded[i] = 1;
-          const under = floorAt(gibPos[k], gibPos[k + 2]); // (its stain on the floor under it: at its own height, it hung there)
+          const under = floorAt(gibPos[k], gibPos[k + 2], y0); // (its stain on the floor under it: at its own height, it hung there)
           spawnDecal(_gibS.set(gibPos[k], under, gibPos[k + 2]), null, _gibW.set(gibVel[k], gibVel[k + 1], gibVel[k + 2]), 0,
             GIB_BIT_STAIN[0] + Math.random() * (GIB_BIT_STAIN[1] - GIB_BIT_STAIN[0]));
           const d = Math.hypot(gibPos[k] - camera.position.x, gibPos[k + 2] - camera.position.z);
-          if (Math.random() < 0.3) playSquelch(0.35 / (1 + d * 0.25), 1.4);
+          if (Math.random() < 7 / GIB_BITS) playSquelch(0.35 / (1 + d * 0.25), 1.4);
         }
         if (gibVel[k + 1] < -1.2) { // a bounce: up a little, slowed, turning less
           gibVel[k + 1] *= -0.25; gibVel[k] *= 0.5; gibVel[k + 2] *= 0.5; gibSpin[i] *= 0.4;
@@ -6508,13 +7227,19 @@ renderer.setAnimationLoop((time) => {
   playerMoving = moving;
   if (moving) camera.position.addScaledVector(move.normalize(), (sprinting ? SPRINT : MOVE) * dt);
   // Jump: Space launches you at the speed that peaks at JUMP_HEIGHT; held, you hop again on landing
-  // the centre platform and its stairs: once your feet are (nearly) up to a top you stand on it, else it's a wall
+  // the platform, the balcony, their stairs: once your feet are (nearly) up to a top you stand on it, else it's a wall
+  // (or, all over your head, a roof)
   const floorY = standOn(camera.position, jumpY, 0.4);
-  youUp = floorY > STAIR_RISE; // (from the middle step: the zombies come up the stairs after you; the others hold off)
+  youOn = floorY <= STAIR_RISE ? null // (from the middle step: the zombies come up the stairs after you; the others hold off)
+    : floorY > PLATFORM_H || balconyGap(camera.position.x, camera.position.z) < platformGap(camera.position.x, camera.position.z) ? BALCONY : PLATFORM;
   const grounded = jumpY <= floorY;
   if (grounded && keys.Space) jumpV = Math.sqrt(2 * GRAVITY * JUMP_HEIGHT);
   jumpV -= GRAVITY * dt;
+  // (under the high steps, or a bridge over the platform: a jump stops at what you were wholly under, your body's width
+  // round you, not shoved out from under it)
+  const roof = ceilingAt(camera.position.x, camera.position.z, jumpY + BODY_H - 0.01, 0.4) - BODY_H;
   jumpY = Math.max(jumpY + jumpV * dt, floorY);
+  if (jumpY > roof) { jumpY = Math.max(roof, floorY); jumpV = Math.min(jumpV, 0); }
   const landing = jumpY === floorY && jumpV < -4; // came down from more than ~0.4 m
   if (jumpY === floorY && jumpV < 0) jumpV = 0;
   // Footsteps: one every STEP_LENGTH m walked on the ground (so quicker when sprinting), a heavier one on landing
@@ -6671,6 +7396,7 @@ renderer.setAnimationLoop((time) => {
   updatePool(ceilLightTiles, ceilLights, CEIL_REACH, CEIL_FADE, CEIL_INTENSITY);
   updatePool(spotPoolTiles, spotLights, SPOT_REACH, SPOT_FADE, SPOT_INTENSITY);
   camera.updateMatrixWorld();
+  sprites += updatePortals(dt, now); // (their lights set before the sprites see them)
 
   for (const npc of npcs) sprites += npc.imp.update(renderer, camera, dt);
   for (const s of skulls) sprites += s.imp.update(renderer, camera, dt);
@@ -6678,11 +7404,11 @@ renderer.setAnimationLoop((time) => {
   sprites += updateGun(dt, now);
   updateBlood(dt);
   updateCasings(dt);
-  updateMeat();
   updateGibs(dt);
   updateMuzzleFx(dt, now);
 
   const shaken = shakeCamera(dt, now);
+  portalLenses();
   drawBloodField();
   hurt = Math.max(hurt - dt / HURT_RECOVER, 0); // back into focus
   dof.uniforms.uHurt.value = hurt * hurt; // eased: clears fast at first, the last of it lingers less
@@ -6693,6 +7419,7 @@ renderer.setAnimationLoop((time) => {
   flushBlood(dt);
   composer.render(dt);
   hudFx.material.uniforms.uTime.value = now;
+  hudFx.material.uniforms.uLow.value = THREE.MathUtils.clamp(poly(HURT_VIGNETTE, 1 - THREE.MathUtils.clamp(playerHealth / PLAYER_HEALTH, 0, 1)), 0, 1);
   // your muzzle flash, for the blood on the lens: full while it's lit, dying off fast after
   hudFlash = gun && now < gun.flashUntil ? 1 : Math.max(hudFlash - dt * 14, 0);
   hudFx.material.uniforms.uFlash.value = hudFlash;
