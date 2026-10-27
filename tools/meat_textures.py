@@ -1,5 +1,5 @@
 """Authors pixel-art meat: small bits flung off bodies shot to pieces, tumbling, drawn by the game as quads that face
-you (see the gibs in index.html). Each kind BIT_FRAMES views a full turn end over end (about an axis of its own, so its
+you (see the gibs in src/gibs.js). Each kind BIT_FRAMES views a full turn end over end (about an axis of its own, so its
 grain turns with it), BIT px a frame:
   chunk  a lump of muscle            fatty  muscle with a rind of fat     bone  a lump of meat, a bloody stub of bone out of it
   gut    a curl of gut               flap   a torn flap of flesh         clot  a dark, wet clot of blood
@@ -19,7 +19,7 @@ hit:
 Downsampled to the pixel size: hard-edged (a subsample's coverage over half: a pixel), colour and normal averaged.
 
 No light direction is baked: the game lights each pixel by its normal, from the lights around the bit (see MEAT_* in
-index.html), with a wet glint where it's wet.
+src/gibs.js), with a wet glint where it's wet.
 
 Scale: PX m a pixel (as the sprites near you, ~the enemies' 128 px over 2.2 m); a bit's frame BIT px, its middle the
 bit's.

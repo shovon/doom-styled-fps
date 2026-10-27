@@ -2,7 +2,7 @@
 # the origin, the barrel along glTF −Z, up +Y; the slide (and what rides on it) as child "Slide", so it can cycle;
 # the spare magazine lying beside the gun dropped; textures at TEX px; one GLB. Run with:
 #   Blender -b --factory-startup --python tools/pistol.py -- <sketchfab download>/scene.gltf models/pistol/pistol.glb 512
-# It prints the muzzle (the comp's front, on the bore) and the slide's bounds (glTF axes), for PISTOL_* in index.html.
+# It prints the muzzle (the comp's front, on the bore) and the slide's bounds (glTF axes), for PISTOL_* in src/weapons.js.
 import bpy, sys, math, mathutils
 src, out, TEX = sys.argv[-3], sys.argv[-2], int(sys.argv[-1])
 SCALE = 0.1

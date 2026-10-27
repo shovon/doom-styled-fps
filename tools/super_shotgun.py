@@ -1,7 +1,7 @@
 # Sci-fi Super Shotgun (tnnv, CC-BY-4.0) → the game's layout: metres, trigger at the origin, barrels along glTF −Z,
 # the barrels + forend as child "Barrels" with its origin on the hinge, textures at TEX px, one GLB. Run with:
 #   Blender -b --factory-startup --python tools/super_shotgun.py -- <sketchfab download>/scene.gltf models/super_shotgun/super_shotgun.glb 512
-# It prints the hinge, the barrels' front and back and the body's bounds (glTF axes), for SHOTGUN_* in index.html.
+# It prints the hinge, the barrels' front and back and the body's bounds (glTF axes), for SHOTGUN_* in src/weapons.js.
 import bpy, sys, math, mathutils
 src, out, TEX = sys.argv[-3], sys.argv[-2], int(sys.argv[-1])
 TRIGGER = mathutils.Vector((0, -0.0769, -0.0131))  # Blender space, read off a side render
