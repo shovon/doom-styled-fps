@@ -4,7 +4,10 @@
     {
       "name": "static",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8173"],
+      "runtimeArgs": [
+        "-c",
+        "import http.server as h\nclass H(h.SimpleHTTPRequestHandler):\n    def end_headers(self):  # (no-cache: a reload re-checks every module, as it did the one inline script)\n        self.send_header('Cache-Control', 'no-cache')\n        super().end_headers()\nh.test(HandlerClass=H, port=8173)"
+      ],
       "port": 8173
     }
   ]

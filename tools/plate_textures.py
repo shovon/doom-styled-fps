@@ -340,7 +340,7 @@ wallpanel.seamless, wallpanel.size, wallpanel.half = True, WALL_N, True  # (half
 # twice the tiles', chunkier; its px figures above are in the 128 px it's drawn at)
 wallpanel.region, wallpanel.height = wallpanel_region, wallpanel_height
 
-HAZARD_SRGB = (226, 176, 18)  # the hazard stripes' yellow (the game's hazard band, round the platform's top: index.html)
+HAZARD_SRGB = (226, 176, 18)  # the hazard stripes' yellow (the game's hazard band, round the platform's top: src/platform.js)
 PAINT_WHITE_SRGB = (236, 236, 230)  # a white paint, a little warm
 WALL_STRIPE, WALL_STRIPE_W = 32, 8  # px (at 128 px a panel, 32 px/m): its yellow stripes' period, and their width (the
 # hazard band's: 0.25 m; spaced 1 m, a few on the white); the panel's width a whole number of them, so they run on
